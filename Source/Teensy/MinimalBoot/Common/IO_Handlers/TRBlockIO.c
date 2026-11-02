@@ -5,18 +5,15 @@
 //  only from the main loop: PollTRBlock from those two handlers' polling handlers, and SDFullInit.
 
 #include "../../../BlockDevice/TRBlockImage.h"
-
-#define TRBlock_FlushIdlemS  250
+#include "../../../DiskImage/WriteBack.h"
 
 static struct TRBlock TRBlockDev;
 static struct TRBlockImage TRBlockImg;
 static struct TRBlockBackend TRBlockBack;
 // An FsFile, not an SD.h File: File::flush() discards whether the sync reached the card
 static FsFile TRBlockFile;
-static bool TRBlockDirty;
-static uint32_t TRBlockLastWritemS;
+static struct ImageWriteBack TRBlockWriteBack;
 static char *TRBlockPath;
-static bool TRBlockFlushFailureLogged;
 static struct { uint32_t FirstSector, CardSerial; } TRBlockMounted;
 static const uint8_t *TRBlockBootImage;
 static uint32_t TRBlockBootSize;
@@ -29,24 +26,17 @@ FLASHMEM static bool TRBlockFileRead(void *Context, uint32_t Offset, uint8_t *Bl
 FLASHMEM static bool TRBlockFileWrite(void *Context, uint32_t Offset, const uint8_t *Block)
 {
    if (!TRBlockFile.seekSet(Offset) || TRBlockFile.write(Block, D64_SECTOR) != D64_SECTOR) return false;
-   TRBlockDirty = true;
-   TRBlockLastWritemS = millis();
+   ImageWriteBackWrote(&TRBlockWriteBack, millis());
    return true;
 }
 
 // GEOS never sends FLUSH, so a failed sync stays dirty for the idle flush to retry
 FLASHMEM static bool TRBlockFileFlush(void *Context)
 {
-   if (TRBlockFile.sync())
-   {
-      TRBlockDirty = TRBlockFlushFailureLogged = false;
-      return true;
-   }
-   TRBlockDirty = true;
-   TRBlockLastWritemS = millis();
-   if (!TRBlockFlushFailureLogged) Serial.printf("TR block image: writes are not reaching the card; retrying\n");
-   TRBlockFlushFailureLogged = true;
-   return false;
+   bool Reached = TRBlockFile.sync();
+
+   if (ImageWriteBackSynced(&TRBlockWriteBack, Reached, millis())) Serial.printf("TR block image: writes are not reaching the card; retrying\n");
+   return Reached;
 }
 
 FLASHMEM static bool TRBlockOpen()
@@ -77,7 +67,7 @@ FLASHMEM void TRBlockClose()
 {
    TRBlockBack.Context = NULL;
    if (TRBlockFile.isOpen() && !TRBlockFile.close()) Serial.printf("TR block image: last writes did not reach the card\n");
-   TRBlockDirty = TRBlockFlushFailureLogged = false;
+   ImageWriteBackForget(&TRBlockWriteBack);
 }
 
 FLASHMEM static uint32_t TRBlockCardSerial()
@@ -134,7 +124,7 @@ FLASHMEM void InitTRBlock()
 FLASHMEM void PollTRBlock()
 {
    TRBlockService(&TRBlockDev, &TRBlockBack);
-   if (TRBlockDirty && millis() - TRBlockLastWritemS > TRBlock_FlushIdlemS) TRBlockFileFlush(NULL);
+   if (ImageWriteBackDue(&TRBlockWriteBack, millis())) TRBlockFileFlush(NULL);
 }
 
 // One IO access to the page the mouse registers start: the mouse owns the offsets below the block device's.

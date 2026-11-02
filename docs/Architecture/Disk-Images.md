@@ -9,6 +9,7 @@ One engine reads and writes Commodore disk images for every feature that looks i
 | `d64.h`, `d64.c` | The engine: geometry, BAM, directory, files (read, write, append, scratch, rename, REL), format, validate, raw sector access. Portable C99 that also compiles as C++; no `malloc`, all state in caller structs. |
 | `DiskImage.h` | What the firmware and the host harnesses include. It places the code in flash (`FLASHMEM`) and the tables in `PROGMEM`, and pulls `d64.c` in once. |
 | `MenuDisk.h` | The TR menu's read-only view of an image (`D64.ino`): opening by the kind the file's extension names, and loading a file. |
+| `WriteBack.h` | When an open image's writes go to the card: see [Writes reach the card](#writes-reach-the-card). |
 
 The engine came from teensyrom-vdrive's `d64/` (commit `b74ce37`), where it is tested against VICE's `c1541`. The
 copy here differs only in what the firmware needs: the SPDX lines, the placement macros moving into `d64.h`, and its
@@ -66,10 +67,27 @@ Refusals come before the first write, so a refused image is unchanged:
 | `d64_dir_room`, only when no slot is free | a directory sector the BAM shows free (growing the directory could hand it out again), or no sector the directory can grow into |
 | `d64_blocks_allocatable` | fewer sectors than the file and its info block need. It counts, per track, the smaller of the BAM count and the free bits: exactly what the allocator can hand out, so a BAM whose count disagrees with its bitmap is no longer refused but cannot run the write out of room partway. |
 
+## Writes reach the card
+
+A caller that keeps an image file open writes sectors into it as they come and syncs the file itself. `WriteBack.h`
+is the policy for when, so that every such caller does it the same way:
+
+* `ImageWriteBackWrote` after each sector written; `ImageWriteBackDue` says when the writes have been idle for
+  `IMAGE_WRITEBACK_IDLE_MS` (a quarter second), which is when the caller's poll syncs.
+* `ImageWriteBackSynced` records whether the sync reached the card. A sync the card failed leaves the image dirty, so
+  it is tried again after the next idle period instead of being taken as done, and only the first failure in a row
+  asks to be reported. The caller needs a sync that says whether it worked: SdFat's `FsFile::sync()` does, SD.h's
+  `File::flush()` does not.
+* `ImageWriteBackForget` when the image is closed.
+
+The TR block device (`TRBlockIO.c`) uses it with an `FsFile`. VDrive takes it when it moves onto this tree: its
+units keep their own dirty flag and idle timer today, and flush through `File::flush()`, which drops a failed sync.
+
 ## Tests
 
 `Source/Teensy/tests/disk-image.test.js` builds the engine with the harness flags as C and as C++, saves and reads a
 file on a blank image of each kind, and checks the size table above. `trblock.test.js` runs the block device on each
 kind, a 40-track D64 and images with error bytes included. `geos-disk-patch.test.js` and `geos-boot.test.js` run the
-GEOS installer and boot-file reader on synthetic boot disks. `menu-disk.test.js` lists directories and loads files the
-way the TR menu does, from each kind, short and odd-sized images, and broken chains.
+GEOS installer and boot-file reader on synthetic boot disks. `write-back.test.js` steps the write-back policy through
+idle periods, failed syncs and a close. `menu-disk.test.js` lists directories and loads files the way the TR menu does,
+from each kind, short and odd-sized images, and broken chains.
