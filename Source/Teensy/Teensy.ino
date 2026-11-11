@@ -616,6 +616,11 @@ FLASHMEM void SetEEPDefaults()
    EEPROM.write(eepAdMIDISettings, 0xff);  //see RegMIDISettingsMasks
    EEPROM.write(eepAdMIDISettings2, 0x0f); //see RegMIDISettingsMasks2
    
+#ifdef VDrive_Any
+   EEPROM.write(eepAdVDriveDevs, 0);   //VDrive device numbers: 0 = defaults (8/9)
+   EEPROM.write(eepAdVDriveDevs+1, 0);
+#endif
+
    //future use:
    for(uint32_t EEPByteNum = 0; EEPByteNum<eepAdUnusedSize ; EEPByteNum++)
       EEPROM.write(eepAdUnused+EEPByteNum, 0);

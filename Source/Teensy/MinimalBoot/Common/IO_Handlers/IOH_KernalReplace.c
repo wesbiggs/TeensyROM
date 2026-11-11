@@ -344,8 +344,16 @@ FLASHMEM void FreeKernalBin()
 
 void FnetLoopPollStart(); //Teensy.ino
 
+#ifdef Fab04_VDrive
+bool (*KernalImageSource)(uint8_t *Bin) = NULL; //fills Bin (8192 bytes) instead of the <Shift-K> file, false: nothing to serve (VDrive, set by KERNALPreStart())
+static bool KernalFastOnly = false; //VDrive: the image is in KernalFast and KernalBin was freed after the copy (InitHndlr_KernalReplace still hooks it)
+#endif
+
 FLASHMEM void InitHndlr_KERNALReplace_PreStart() //not called automatically via init; called earlier, manually, from KERNALPreStart()
 {
+#ifdef Fab04_VDrive
+   KernalFastOnly = false;
+#endif
 #ifdef Fab04_GlobalKernalReplace
    fKernRepl = NULL;  //default, make sure off during loading
    if (KernalBin == NULL) KernalBin = (uint8_t*)malloc(8192);
@@ -360,6 +368,18 @@ FLASHMEM void InitHndlr_KERNALReplace_PreStart() //not called automatically via 
       return;
    }
 
+#ifdef Fab04_VDrive
+   if (KernalImageSource != NULL)
+   {
+      if (!KernalImageSource(KernalBin))
+      {
+         FreeKernalBin();
+         return;
+      }
+   }
+   else
+#endif
+   {
    //load kernal image into RAM:
    char Filename[MaxPathLength];
    EEPreadStr(eepAdKERNALBinName, Filename);
@@ -397,8 +417,12 @@ FLASHMEM void InitHndlr_KERNALReplace_PreStart() //not called automatically via 
    //Serial.printf("Read %lu Bytes in %lumS\n", CharNum, millis()-StartmS);
    Serial.printf("Read %lu Bytes\nKernal replace Enabled\n", CharNum);
    LoadFile.close();
+   }
 #ifndef KERNAL_NO_DTCM
    memcpy(KernalFast, KernalBin, 8192); //fast copy for the bus ISR
+#endif
+#if defined(Fab04_VDrive) && !defined(KERNAL_NO_DTCM)
+   if (KernalImageSource != NULL) { FreeKernalBin(); KernalFastOnly = true; } //VDrive serves KernalFast only: the 8 KB heap copy would cost the REU a bank
 #endif
    KSenseApplyMode();
    KDS_State = KDS_Idle;
@@ -428,7 +452,11 @@ FLASHMEM void InitHndlr_KernalReplace()
    //Only after a PRG load (the handshake owns fBusSnoop) whose PreStart loaded a kernal. PreStart
    //runs on PRG launches only, but a generic CRT inherits Kernal Replace as its Special IO too:
    //hooked there, KernalCheck reads an unloaded KernalBin and drives GAME/EXROM over the cart's own.
+#ifdef Fab04_VDrive
+   if (fBusSnoop != &HandshakeSnoop || (KernalBin == NULL && !KernalFastOnly)) return;
+#else
    if (fBusSnoop != &HandshakeSnoop || KernalBin == NULL) return;
+#endif
    KDS_State = KDS_Idle;  //KernalCheck is unhooked during the handshake: no sense can be in flight
    KDS_Read01Valid = false;
    PendingfBusSnoop = KernalCheckArm(); //not fBusSnoop directly -- may still be mid PRG-load handshake, see HandshakeSnoop

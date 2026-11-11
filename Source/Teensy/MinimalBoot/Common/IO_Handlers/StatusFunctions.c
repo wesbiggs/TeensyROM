@@ -551,6 +551,14 @@ FLASHMEM void HotKeySetLaunch()
 FLASHMEM void KERNALPreStart()
 {
    //called before BASIC init and program load/launch
+#ifdef Fab04_VDrive
+   if (VDrive_ProbeStep()) return; //a step of the menu's bus probe after a VDrive PreStart (MainMenu.asm, VDriveProbe)
+#endif
+#ifdef VDrive_Agent
+   //the agent's drive (IOH_VDriveAgent.c): SD/USB probing now, while the C64 still waits; it serves no KERNAL
+   if (VDrive_AgentPreStart((IO1[rWRegCurrMenuWAIT] == rmtTeensy && MenuSource[SelItemFullIdx].IOHndlrAssoc != IOH_None) ?
+                            MenuSource[SelItemFullIdx].IOHndlrAssoc : IO1[rwRegNextIOHndlr])) return;
+#endif
 #ifdef Fab04_KernalReplace
 
 #ifdef Fab04_GlobalKernalReplace
@@ -567,11 +575,28 @@ FLASHMEM void KERNALPreStart()
    {
       //Serial.println("IO Handler set by Teensy Menu\n");
       NextIOHndlr = MenuSource[SelItemFullIdx].IOHndlrAssoc;
+#ifdef Fab04_VDrive
+      NextIOHndlr = VDriveSwift_Remap(NextIOHndlr);   //SwiftLink programs keep the virtual drive
+#endif
    }
 
-   if (NextIOHndlr == IOH_KernalReplace)
+   if (NextIOHndlr == IOH_KernalReplace
+#ifdef Fab04_VDrive
+       || VD_IsKernalHandler(NextIOHndlr)
+#endif
+      )
    {
+#ifdef Fab04_VDrive
+      KernalImageSource = VD_IsKernalHandler(NextIOHndlr) ? &VD_KernalImage : NULL; //VDrive: its own image (IOH_VDrive.c), not the <Shift-K> file
+      if (VD_IsKernalHandler(NextIOHndlr)) VDrive_NoteLaunch(); //the menu source and image path for the auto-mount, before FreeDriveDirMenu() resets them
+#ifdef Fab04_REU
+      if (NextIOHndlr == IOH_VDriveREU || NextIOHndlr == IOH_VDriveSwiftREU) FreeDriveDirMenu(); //the REU's AllocRAMBanks frees it anyway; first, so the drive's open Files fill its hole instead of pinning it under the heap top (docs/DESIGN.md 50)
+#endif
+#endif
       InitHndlr_KERNALReplace_PreStart(); //separate function so it doesn't get called twice
+#ifdef Fab04_VDrive
+      if (VD_IsKernalHandler(NextIOHndlr)) VDrive_PreStart(); //SD/USB probing now, while the C64 still waits
+#endif
       //Serial.println("Bye from KERNALPreStart");
    }
    //else

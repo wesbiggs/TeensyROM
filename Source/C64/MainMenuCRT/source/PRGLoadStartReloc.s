@@ -96,6 +96,19 @@ MsgRunning:
    cmp #rihsReady
    bne -
    
+   ;VDrive agent (teensyrom-vdrive, docs/DESIGN.md 53): let it hook the KERNAL's vectors now that the program is in memory
+   lda $df09
+   cmp #$d6
+   bne +
+   lda $df0a
+   cmp #$64
+   bne +
+   lda $de14
+   cmp #$20
+   bne +
+   lda #$a5
+   jsr $de14
++
 smcSkipPrintRunning:
    lda #0    ;set to non-zero to skip printing MsgRunning
    bne +

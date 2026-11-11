@@ -120,6 +120,12 @@ struct stcIOHandlers
    #ifdef Fab04_KernalReplace
       #include "IO_Handlers/IOH_KernalReplace.c"
    #endif    
+   #ifdef VDrive_Any
+      #include "IO_Handlers/IOH_VDrive.c"
+   #endif    
+   #ifdef VDrive_Agent
+      #include "IO_Handlers/IOH_VDriveAgent.c"   //needs IOH_VDrive.c
+   #endif    
       #include "IO_Handlers/IOH_TeensyROM.c" 
    #ifdef Fab04_Freezers
       #include "IO_Handlers/IOH_SuperSnapshotV5.c"
@@ -129,6 +135,13 @@ struct stcIOHandlers
    #endif
       #include "IO_Handlers/IOH_TR_BASIC.c" 
       #include "IO_Handlers/IOH_Swiftlink.c"
+   #ifdef Fab04_VDrive
+      #include "IO_Handlers/IOH_VDriveSwift.c"   //needs IOH_VDrive.c and IOH_Swiftlink.c above
+   #ifdef Fab04_REU
+      #include "IO_Handlers/IOH_VDriveREU.c"        //needs IOH_VDrive.c and IOH_REU.c above
+      #include "IO_Handlers/IOH_VDriveSwiftREU.c"   //needs IOH_VDriveSwift.c and IOH_VDriveREU.c above
+   #endif
+   #endif
       #include "IO_Handlers/IOH_ASID.c"
 #endif
    #include "IO_Handlers/IOH_None.c"
@@ -158,6 +171,17 @@ stcIOHandlers* IOHandler[] =  //Synch order/qty with enum enumIOHandlers
       &IOHndlr_MIDI_NamesoftIRQ,   //IOH_MIDI_NamesoftIRQ,
    #ifdef Fab04_REU
       &IOHndlr_REU,                //IOH_REU,
+   #endif  
+   #ifdef Fab04_VDrive
+      &IOHndlr_VDrive,             //IOH_VDrive,
+      &IOHndlr_VDriveSwift,        //IOH_VDriveSwift,
+   #ifdef Fab04_REU
+      &IOHndlr_VDriveSwiftREU,     //IOH_VDriveSwiftREU,
+      &IOHndlr_VDriveREU,          //IOH_VDriveREU,
+   #endif
+   #endif  
+   #ifdef VDrive_Agent
+      &IOHndlr_VDriveAgent,        //IOH_VDriveAgent,
    #endif  
    #ifdef Fab04_KernalReplace
       &IOHndlr_KernalReplace,      //IOH_KernalReplace,

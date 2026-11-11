@@ -41,6 +41,10 @@ void IOHandlerNextInit()
    IOHandlerInit(IO1[rwRegNextIOHndlr]);
 }
 
+#ifdef VDrive_Any
+   //menu programs keep the virtual drive: SwiftLink / REU ones get the matching VDrive Special IO (VDriveSwift_Remap)
+   #define IOHandlerInit(h) IOHandlerInit(VDriveSwift_Remap(h))
+#endif
 void IOHandlerSelectInit()
 { //called after cart loaded, PRG x-fer finished, or exit to basic (rsIOHWSelInit)
    PendingfBusSnoop = NULL; //clean slate for whatever InitHndlr below is about to stage
@@ -52,6 +56,9 @@ void IOHandlerSelectInit()
    }
    else IOHandlerNextInit();
 }
+#ifdef VDrive_Any
+   #undef IOHandlerInit
+#endif
 
 void IOHandlerInit(uint8_t NewIOHandler)
 { //called from above and directly from SetUpMainMenuROM

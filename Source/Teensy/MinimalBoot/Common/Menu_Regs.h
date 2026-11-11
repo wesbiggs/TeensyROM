@@ -443,6 +443,17 @@ enum enumIOHandlers //Synch order/qty with IOHandler[] (IOHandlers.h)
    #ifdef Fab04_REU
       IOH_REU,
    #endif 
+   #ifdef Fab04_VDrive
+      IOH_VDrive,
+      IOH_VDriveSwift,
+   #ifdef Fab04_REU
+      IOH_VDriveSwiftREU,
+      IOH_VDriveREU,
+   #endif
+   #endif  
+   #ifdef VDrive_Agent
+      IOH_VDriveAgent,
+   #endif  
    #ifdef Fab04_KernalReplace
       IOH_KernalReplace,
    #endif  
