@@ -192,6 +192,8 @@ bool (*fBusSnoop)(uint16_t Address, bool R_Wn) = NULL;    //Bus snoop routine, r
 bool (*PendingfBusSnoop)(uint16_t Address, bool R_Wn) = NULL;  //staged by an IO handler's InitHndlr instead of touching fBusSnoop directly
 volatile bool HandshakeReady = false;    //true once IOHandlerInit has completed the current IO handler swap
 
+//#define LATE_ISR_TRACE  //debug: count late phi2 interrupts (ISRs.c) and print them on the serial console (Teensy.ino), reset at each Kernal Replace/VDrive launch
+
 #ifdef Dbg_SerLog 
    #define BigBufSize          1000
 #else

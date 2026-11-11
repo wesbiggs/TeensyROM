@@ -48,6 +48,15 @@ stcIOHandlers IOHndlr_KernalReplace =
 #endif
 
 uint8_t HIRAM_State;
+//The image the bus ISR serves from lives in fast RAM1 (DTCM), not the malloc'ed copy in cached RAM2: a cold cache line there cost
+//~100ns+ inside the time-critical window and the first byte of a rarely used run was answered late. (Also: the 6510 does not put
+//the value of a $00/$01 write on the external data bus, so HIRAM cannot be tracked from the writes; it has to be sensed.)
+//#define KERNAL_NO_DTCM //experiment: serve straight from KernalBin (cached RAM2), saves 8 KB of RAM1
+#ifdef KERNAL_NO_DTCM
+#define KernalFast KernalBin
+#else
+uint8_t KernalFast[8192];
+#endif
 
 enum enumHIRAM_States
 {
@@ -229,7 +238,7 @@ FASTRUN bool KernalCheck(uint16_t Address, bool R_Wn)
    CORE_PIN19_PORTCLEAR = ~RegAddrBits & GP6_AddrMask;
    
    //prepare the kernal byte to be pushed onto the bus (if needed)
-   uint8_t Data = KernalBin[Address & 0x1fff];
+   uint8_t Data = KernalFast[Address & 0x1fff];
    uint32_t RegDataBits = (Data & 0x0F) | ((Data & 0xF0) << 12);
    CORE_PIN10_PORTSET = RegDataBits;
    CORE_PIN10_PORTCLEAR = ~RegDataBits & GP7_DataMask;
@@ -252,7 +261,6 @@ FASTRUN bool KernalCheck(uint16_t Address, bool R_Wn)
       while (ARM_DWT_CYCCNT - begin < Cyc_KernProp);
       
       HIRAM_State = (GP9_ROMH(ReadGPIO9)==0 ? HIRAM_State_ROM : HIRAM_State_RAM); //read ROMH to determine if it's a Kernal or RAM access
-      
       SetAddrPortDirIn;//set address ports to input
       SetAddrBufsIn;   //set address buffers to input
       SetExROMDeassert;
@@ -389,6 +397,9 @@ FLASHMEM void InitHndlr_KERNALReplace_PreStart() //not called automatically via 
    //Serial.printf("Read %lu Bytes in %lumS\n", CharNum, millis()-StartmS);
    Serial.printf("Read %lu Bytes\nKernal replace Enabled\n", CharNum);
    LoadFile.close();
+#ifndef KERNAL_NO_DTCM
+   memcpy(KernalFast, KernalBin, 8192); //fast copy for the bus ISR
+#endif
    KSenseApplyMode();
    KDS_State = KDS_Idle;
    KDS_Read01Valid = false;
@@ -403,6 +414,9 @@ FLASHMEM void InitHndlr_KERNALReplace_PreStart() //not called automatically via 
    fBusSnoop = KernalCheckArm();
 #endif
    FnetLoopPollStart(); //Ethernet poll off the PIT timer from now on (see FnetLoopPollService in Teensy.ino)
+#ifdef LATE_ISR_TRACE  //late-ISR counters (ISRs.c) count from the launch on
+   { extern volatile uint32_t LateIsrCnt, LateIsrBkt[4], TraceStartMs, TraceLoops; LateIsrCnt = 0; for (int i = 0; i < 4; i++) LateIsrBkt[i] = 0; TraceStartMs = millis(); TraceLoops = 0; }
+#endif
 }
 
 FLASHMEM void InitHndlr_KernalReplace()

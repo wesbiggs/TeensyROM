@@ -55,6 +55,10 @@ void DMAWaitAssertReady()
    DMA_State = DMA_AutoRun ? DMA_S_TransferExecuting : DMA_S_TransferReady;
 }
 
+#ifdef LATE_ISR_TRACE
+volatile uint32_t LateIsrCnt = 0, LateIsrBkt[4] = {0,0,0,0}, LateIsrLastMs = 0; //phi2 gaps >1.1us, >1.5us, >3us, >100us (gaps >0.5s are boot artefacts, ignored)
+#endif
+
 //Phi2 rising edge:
 FASTRUN void isrPHI2() 
 {
@@ -64,6 +68,13 @@ FASTRUN void isrPHI2()
    
    if (CycSinceLast > nSToCyc(nS_MaxAdj)) // If we're late, adjust...
    {
+#ifdef LATE_ISR_TRACE
+      if (CycSinceLast > 898 && CycSinceLast < 408000000)
+      {
+         LateIsrCnt++; LateIsrLastMs = millis();
+         LateIsrBkt[CycSinceLast > 81600 ? 3 : CycSinceLast > 2448 ? 2 : CycSinceLast > 1224 ? 1 : 0]++;
+      }
+#endif
       StartCycCnt += nSToCyc(nS_MaxAdj) - CycSinceLast; 
       #ifdef DbgCycAdjLog      
          if (BigBuf != NULL)
