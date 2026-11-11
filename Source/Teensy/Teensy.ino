@@ -55,6 +55,9 @@ uint8_t RAM_Image[RAM_ImageSize]; //Main RAM1 file storage buffer
 volatile uint8_t BtnPressed = false; 
 volatile uint8_t EmulateVicCycles = false;
 uint8_t CurrentIOHandler = IOH_None;
+#ifdef LATE_ISR_TRACE
+volatile uint32_t TraceStartMs = 0, TraceLoops = 0; //startup LATE-ISR trace, set at Kernal Replace/VDrive PreStart
+#endif
 #ifdef Fab04_KernalReplace
 volatile bool FnetLoopPoll = false; //Ethernet stack polled from loop(), PIT timer masked (see FnetLoopPollService)
 volatile bool FnetPollHold = false; //set by Kernal Replace PreStart once a KERNAL is served; cleared with the main menu
@@ -388,6 +391,50 @@ void loop()
    if (IO1[rwRegPwrUpDefaults2] & rpud2TRContEnabled)
       if (USBHostSerial.available()) ServiceSerial(&USBHostSerial);
 
+#ifdef LATE_ISR_TRACE
+   {  //report late phi2 interrupts (after the replaced KERNAL is served), at most every 2s
+      extern volatile uint32_t LateIsrCnt, LateIsrBkt[4], LateIsrLastMs;
+      static uint32_t lastCnt = 0, lastRepMs = 0;
+      if (LateIsrCnt == 0) lastCnt = 0; //counters were reset at a program launch
+      if (LateIsrCnt != lastCnt && millis() - lastRepMs > 2000)
+      {
+         lastRepMs = millis(); lastCnt = LateIsrCnt;
+         Serial.printf("LATE-ISR >1.1us:%lu >1.5us:%lu >3us:%lu >100us:%lu  last at %lu ms (now %lu)\n",
+            LateIsrBkt[0], LateIsrBkt[1], LateIsrBkt[2], LateIsrBkt[3], LateIsrLastMs, millis());
+      }
+   }
+   {  //first 20 s after the handler's PreStart: every 250 ms print the late-ISR counters with the PIT/ENET state
+      extern volatile uint32_t LateIsrCnt, LateIsrBkt[4], LateIsrLastMs;
+      static uint32_t lastStart = 0, lastTraceMs = 0, lastLoopMs = 0, maxLoopGap = 0, prevCnt = 0, pollOnMs = 0;
+      static bool prevPoll = false;
+      if (TraceStartMs != 0)
+      {
+         uint32_t now = millis(), since = now - TraceStartMs;
+         if (TraceStartMs != lastStart)  //new launch: start the per-launch state over
+         {
+            lastStart = TraceStartMs; lastTraceMs = lastLoopMs = maxLoopGap = prevCnt = pollOnMs = 0; prevPoll = false;
+            Serial.printf("TRACE start: PIT:%d ENET:%d looppoll:%d hold:%d\n", NVIC_IS_ENABLED(IRQ_PIT) ? 1 : 0, NVIC_IS_ENABLED(IRQ_ENET) ? 1 : 0, FnetLoopPoll ? 1 : 0, FnetPollHold ? 1 : 0);
+         }
+         if (since < 20000)
+         {
+            TraceLoops++;
+            if (lastLoopMs && now - lastLoopMs > maxLoopGap) maxLoopGap = now - lastLoopMs; //longest time loop() was away
+            lastLoopMs = now;
+            if (FnetLoopPoll && !prevPoll) pollOnMs = since;
+            prevPoll = FnetLoopPoll;
+            if (now - lastTraceMs >= 250)
+            {
+               lastTraceMs = now;
+               Serial.printf("TRACE +%5lu ms  late(total %3lu, new %3ld) >1.1:%lu >1.5:%lu >3:%lu >100us:%lu  PIT:%d ENET:%d looppoll:%d (on at +%lu) loops:%lu maxgap:%lums ioh:%d\n",
+                  since, LateIsrCnt, (long)(LateIsrCnt - prevCnt), LateIsrBkt[0], LateIsrBkt[1], LateIsrBkt[2], LateIsrBkt[3],
+                  NVIC_IS_ENABLED(IRQ_PIT) ? 1 : 0, NVIC_IS_ENABLED(IRQ_ENET) ? 1 : 0, FnetLoopPoll ? 1 : 0, pollOnMs, TraceLoops, maxLoopGap, CurrentIOHandler);
+               prevCnt = LateIsrCnt; maxLoopGap = 0;
+            }
+         }
+         else TraceStartMs = 0;
+      }
+   }
+#endif
 #ifdef Fab04_KernalReplace
    if (FnetPollHold || FnetLoopPoll) FnetLoopPollService();
 #endif
