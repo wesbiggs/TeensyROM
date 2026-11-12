@@ -206,6 +206,16 @@ void SendBrowserCommandsImmediate();
 void SendASCIIStrImmediateLN(const char* CharsToSend);
 void UnPausePage();
 #include "Swift_RxQueue.c"
+#ifdef USB_MIDI_SERIAL_KEYBOARD
+   #include "UsbKbd.c"
+   #define HostConnected() (client.connected() || UsbKbdConnected)
+#else
+   #define HostConnected() client.connected()
+   #define UsbKbdConnected false
+   #define UsbKbd_Feed(Byte) ((void)0)
+   #define UsbKbd_Poll() ((void)0)
+   #define UsbKbd_End() ((void)0)
+#endif
 #include "Swift_ATcommands.c"
 #include "Swift_Browser.c"
 
@@ -292,6 +302,7 @@ void FreeSwiftlinkBuffs()
    for(uint8_t cnt=0; cnt<RxQueueNumBlocks; cnt++) {free(RxQueue[cnt]); RxQueue[cnt]=NULL;}
    free(TxMsg); TxMsg = NULL;   
    free(SwiftTxOut); SwiftTxOut = NULL;
+   UsbKbd_End();
 }
 
 FLASHMEM bool ForceEthernetInit(void (*MsgOut)(const char *))
@@ -408,6 +419,7 @@ void InitHndlr_SwiftLink()
    ResetSwiftLink();
    
    if(client.connected()) ClearClientStop();  //clear receive buffer and drop any current client connection   
+   UsbKbd_End();
    PrevURLQueueNum = 0;
    PlusCount=0;
    ConnectedToHost = false;
@@ -558,9 +570,9 @@ void SendSwiftTxOut()
 void PollingHndlr_SwiftLink()
 {
    //detect connection change
-   if (ConnectedToHost != client.connected())
+   if (ConnectedToHost != HostConnected())
    {
-      ConnectedToHost = client.connected();
+      ConnectedToHost = HostConnected();
       SwiftTxOutLen = 0; //Tx bytes for the old connection must not reach a new one
       if (BrowserMode)
       {
@@ -584,6 +596,8 @@ void PollingHndlr_SwiftLink()
       }
    }
    
+   if (UsbKbdConnected) UsbKbd_Poll();
+
    //if client data available, add to Rx Queue
    #ifdef DbgMsgs_SW
       if(client.available())
@@ -620,12 +634,16 @@ void PollingHndlr_SwiftLink()
    //if Tx data available, get it from C64 (while SwiftTxOut is full, Tx stays not empty: the C64 waits until the stack has taken some)
    if ((SwiftRegStatus & SwiftStatusTxEmpty) == 0 && SwiftTxOutLen < SwiftTxOutSize)
    {
-      if (client.connected() && !BrowserMode) //send Tx data to host
+      if (HostConnected() && !BrowserMode) //send Tx data to host
       {
          //Printf_dbg_sw("send %02x: %c\n", SwiftTxBuf, SwiftTxBuf);
-         if (SwiftTxOutLen == 0) SwiftTxOutFirstMicros = micros();
-         SwiftTxOutLastMicros = micros();
-         SwiftTxOut[SwiftTxOutLen++] = SwiftTxBuf; //sent by SendSwiftTxOut()
+         if (UsbKbdConnected) UsbKbd_Feed(SwiftTxBuf); //no TCP stack to wait for: Tx is empty again at once
+         else
+         {
+            if (SwiftTxOutLen == 0) SwiftTxOutFirstMicros = micros();
+            SwiftTxOutLastMicros = micros();
+            SwiftTxOut[SwiftTxOutLen++] = SwiftTxBuf; //sent by SendSwiftTxOut()
+         }
          //client.flush(); //adds ~100mS!
          if(SwiftTxBuf=='+')
          {
@@ -712,6 +730,7 @@ void PollingHndlr_SwiftLink()
    {
       PlusCount=0;
       ClearClientStop();
+      UsbKbd_End();
 
       FlushRxQueue();
       SwiftRegStatus |= SwiftStatusDCD; //indicate disconnected before sending message

@@ -165,6 +165,11 @@ FLASHMEM ATRespCode AT_DT(char* CmdArg)
 
    SwiftRegStatus |= SwiftStatusDCD; //disconnected, in case CD is already asserted prior to ATDT(?)
    //ConnectedToHost = false;
+
+#ifdef USB_MIDI_SERIAL_KEYBOARD
+   //PETSKEY Remote's keys go out as a USB keyboard on the device port: no Ethernet needed (UsbKbd.c)
+   if (UsbKbd_IsUsbHost(CmdArg)) return UsbKbd_Start() ? ATRC_CONNECT : ATRC_ERROR;
+#endif
    
    //initialize ethernet connection
    ATRespCode resp = AT_C(NULL);
