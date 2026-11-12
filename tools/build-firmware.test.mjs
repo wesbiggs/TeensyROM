@@ -438,6 +438,39 @@ test('the minimal and main images are built as the same USB type', () => {
     source.match(new RegExp(`build\\('${image}', \\{[^}]*?fqbn: '[^']*\\busb=(\\w+)`))?.[1];
   assert.equal(usbType('minimal'), 'serialmidi');
   assert.equal(usbType('main'), 'serialmidi');
+  // --usb-keyboard overrides both through build.usbtype, from the one variable
+  const override = (image) =>
+    source.match(new RegExp(`build\\('${image}', \\{[^}]*?usbType: (\\w+)`))?.[1];
+  assert.equal(override('minimal'), 'firmwareUsbType');
+  assert.equal(override('main'), 'firmwareUsbType');
+});
+
+// The USB keyboard build is a different USB device, so like --no-extensions it gets a name
+// of its own; and it changes only the firmware images, which --host-sketch does not build.
+test('a --usb-keyboard build writes its own filename, and is refused with --host-sketch', {
+  skip: process.platform === 'win32' && 'needs /bin/echo as a stand-in for arduino-cli',
+}, () => {
+  const dir = stubSdk();
+  const out = path.join(dir, 'out');
+  fs.mkdirSync(out, { recursive: true });
+  const attempt = (...args) => spawnSync(process.execPath, [script, '--target', 'tr', '--usb-keyboard',
+    '--arduino-data', path.join(dir, 'sdk'), '--out', out, ...args],
+    { encoding: 'utf8', timeout: 60_000, env: { ...process.env, ARDUINO_CLI: '/bin/echo', GIT_DIR: path.join(dir, 'not-a-repo') } });
+  try {
+    fs.writeFileSync(path.join(out, `TeensyROM_${trVersion}_full.hex`), '');
+    const planned = attempt('--skip-minimal-build', '--skip-teensy-build', '--yes');
+    assert.doesNotMatch(planned.stderr, /already exists/);
+    fs.writeFileSync(path.join(out, `TeensyROM_${trVersion}_usbkbd_full.hex`), '');
+    assert.match(attempt('--skip-minimal-build', '--skip-teensy-build', '--yes').stderr,
+      new RegExp(`TeensyROM_${trVersion.replace(/\./g, '\\.')}_usbkbd_full\\.hex already exists`));
+
+    const hosted = spawnSync(process.execPath, [script, '--target', 'tr-plus', '--usb-keyboard',
+      '--host-sketch', path.join(repoRoot, 'Source/Teensy/ExampleHost')], { encoding: 'utf8', timeout: 20_000 });
+    assert.equal(hosted.status, 1, hosted.stdout + hosted.stderr);
+    assert.match(hosted.stderr, /--usb-keyboard changes the firmware images/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // The example host is documentation that compiles, so the four contract points it is

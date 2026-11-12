@@ -32,7 +32,8 @@
 
 //Same USB type as the main image, so both present one USB device (Min_UsbNames.c).
 //   Here, not in Common/: the extension image builds from this folder without this file, USB off.
-#ifndef USB_MIDI_SERIAL
+//   USB_MIDI_SERIAL_KEYBOARD: the same plus a keyboard (build-firmware.mjs --usb-keyboard)
+#if !defined(USB_MIDI_SERIAL) && !defined(USB_MIDI_SERIAL_KEYBOARD)
    #error MinimalBoot requires Tools > USB Type: "Serial + MIDI" (same as the main TeensyROM image)
 #endif
 

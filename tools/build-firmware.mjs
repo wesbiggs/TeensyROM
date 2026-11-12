@@ -41,6 +41,12 @@
 //   --host-code-kib 64|96  with --host-sketch only: how much ITCM the host's code may
 //            fill. The default, 64, is what the stock host is linked at. 96 lets a
 //            third-party host's code grow up to the module window at 0x18000.
+//   --usb-keyboard  the "TeensyROM + USB keyboard" build: minimal and main present Serial +
+//            MIDI plus a boot keyboard on the Teensy's USB device port, which PETSKEY
+//            Remote types into with ATDT USB (UsbKbd.c). A different USB device (its own
+//            product ID), so it lands under <name>_usbkbd_full.hex, never the shipping
+//            name. The core's usb_desc.h gains the type in the private copy only
+//            (lib/usb-keyboard.mjs). Refused with --host-sketch, which builds no firmware.
 //   --tag <name>  a special build. The name goes on the version string in every image
 //            ("TeensyROM+ v0.9-pr65" on the C64 banner and in the serial version reply) and
 //            into the output names (TeensyROM+_0.9-pr65_full.hex). Letters, digits, '.'
@@ -81,6 +87,7 @@ import { scanArgs } from './lib/cli-args.mjs';
 import { DIRTY_PATHSPEC, ROW_WIDTH, dirtyFromStatus, chooseEpoch, validateTag, bannerSuffix, fileSuffix,
          suffixDefine, versionBase, pagesWithoutWord } from './lib/build-tag.mjs';
 import { definesMacro } from './lib/source-text.mjs';
+import { patchUsbDescForKeyboard, USB_KEYBOARD_TYPE } from './lib/usb-keyboard.mjs';
 import { heavyLibcLinked } from './lib/heavy-libc.mjs';
 import { combineHex, FLASH_BASE, MAIN_BASE, VM_BASE } from './lib/hex.mjs';
 import { buildHostPackage, parseHostPackage, hostDescriptor, hostNameForDisplay, describeCodeFloor,
@@ -108,6 +115,7 @@ const { option, flag } = scanArgs(process.argv.slice(2), {
   flags: [
     '--yes', '--force', '--keep-work', '--skip-teensy-build', '--skip-minimal-build',
     '--skip-combine', '--skip-extension-build', '--no-extensions', '--with-extensions', '--ccache',
+    '--usb-keyboard',
   ],
 });
 
@@ -176,6 +184,12 @@ const hostSketch = path.resolve(hostSketchOption ?? path.join(root, 'Source/Teen
 // byte for byte, so building it again here only produces a second copy of the release hex
 // under a name that suggests the two belong together.
 const hostOnly = hostSketchOption !== null;
+const usbKeyboard = flag('--usb-keyboard');
+if (usbKeyboard && hostOnly) {
+  throw new Error('--usb-keyboard changes the firmware images, and --host-sketch builds neither of them');
+}
+// Minimal and main both, so a board passing through minimal stays one USB device
+const firmwareUsbType = usbKeyboard ? USB_KEYBOARD_TYPE : undefined;
 // The overlay is read here rather than where it is used, because the extension image is
 // built last: a host sketch that is a file, or holds no .ino or two, was otherwise refused
 // only after the minimal and main images had compiled, and a path that was not a directory
@@ -341,7 +355,7 @@ if (!fab04Features && fab04Active) {
 // nor passes for the release image.
 const outputStem = `${target === 'tr-plus' ? 'TeensyROM+' : 'TeensyROM'}_${trVersion}${fileSuffix({ tag: trTag, dirty })}`;
 const finalOutput = hostOnly ? null : path.join(outDir,
-  `${outputStem}${fab04Features && !withExtensions ? '_noext' : ''}_full.hex`);
+  `${outputStem}${fab04Features && !withExtensions ? '_noext' : ''}${usbKeyboard ? '_usbkbd' : ''}_full.hex`);
 const hostOutput = withExtensions && !skipExtensionBuild
   ? path.join(outDir, `${outputStem}_${path.basename(hostSketch)}.TRH`) : null;
 for (const output of [finalOutput, hostOutput]) {
@@ -399,6 +413,11 @@ for (const entry of fs.readdirSync(sdk, { withFileTypes: true })) {
 }
 const privateCore = path.join(privateData, 'packages/teensy/hardware/avr', TEENSY_CORE_VERSION, 'cores/teensy4');
 const linkers = path.join(root, 'tools/BootLinkerFiles');
+if (usbKeyboard && !(skipMinimalBuild && skipTeensyBuild)) {
+  const usbDesc = path.join(privateCore, 'usb_desc.h');
+  write(usbDesc, patchUsbDescForKeyboard(read(usbDesc)));
+  console.log(`USB type ${USB_KEYBOARD_TYPE} added to the private core's usb_desc.h`);
+}
 
 const cli = resolveArduinoCli(path.join(root, 'tools/.cache'));
 const env = {
@@ -461,8 +480,8 @@ function build(name, { inoPath, fqbn, suffix, elfStem, ld, bootdata, usbType, ex
 
   const compileArgs = ['compile', '--fqbn', fqbn, '--build-path', buildDir, ...compilerPathProps,
     '--build-property', `build.flags.defs=${defs}`];
-  // The extension image needs USB fully off, which is not one of the core's
-  // `usb=` FQBN menu choices. The FQBN still says usb=serial; this wins.
+  // The extension image needs USB fully off, and --usb-keyboard a type of its own; neither
+  // is one of the core's `usb=` FQBN menu choices. The FQBN's usb= stays; this wins.
   if (usbType) compileArgs.push('--build-property', `build.usbtype=${usbType}`);
   compileArgs.push(inoPath);
 
@@ -525,6 +544,7 @@ if (!skipMinimalBuild && !hostOnly) {
     fqbn: 'teensy:avr:teensy41:usb=serialmidi,speed=600,opt=o2std,keys=en-us',
     suffix: 'orig',
     elfStem: 'MinimalBoot',
+    usbType: firmwareUsbType,
     ld: withExtensions ? minimalLinkerScript(linkers) : undefined,
     extraDefs: withExtensions ? VM_EXTENSIONS_DEFINE : '',
     // Minimal sizes its RAM1 image buffer to leave just over this for the stack, the floor
@@ -541,6 +561,7 @@ if (!skipTeensyBuild && !hostOnly) {
     fqbn: 'teensy:avr:teensy41:usb=serialmidi,speed=600,opt=o2std,keys=en-us',
     suffix: 'upper',
     elfStem: 'Teensy',
+    usbType: firmwareUsbType,
     ld: withExtensions ? mainLinkerScript(linkers) : undefined,
     extraDefs: withExtensions ? VM_EXTENSIONS_DEFINE : '',
     checkHeavyLibc: true,
