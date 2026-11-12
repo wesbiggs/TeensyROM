@@ -50,7 +50,7 @@
    EthernetUDP udp;
    EthernetClient client;
 
-   #ifndef USB_MIDI_SERIAL
+   #if !defined(USB_MIDI_SERIAL) && !defined(USB_MIDI_SERIAL_KEYBOARD)  //the second: build-firmware.mjs --usb-keyboard
       #error TeensyROM requires Tools > USB Type: "Serial + MIDI" in the Arduino IDE
    #endif
    #define usbDevMIDI usbMIDI
@@ -131,6 +131,9 @@ struct stcIOHandlers
       #include "IO_Handlers/IOH_TR_BASIC.c" 
       #include "IO_Handlers/IOH_Swiftlink.c"
       #include "IO_Handlers/IOH_ASID.c"
+   #ifdef USB_MIDI_SERIAL_KEYBOARD
+      #include "IO_Handlers/IOH_UsbKbd.c"
+   #endif
 #endif
    #include "IO_Handlers/IOH_None.c"
    #include "IO_Handlers/IOH_EpyxFastLoad.c"
@@ -197,6 +200,9 @@ stcIOHandlers* IOHandler[] =  //Synch order/qty with enum enumIOHandlers
    &IOHndlr_ZaxxonSuper,        //IOH_ZaxxonSuper,
    &IOHndlr_GMod2,              //IOH_GMod2,
    &IOHndlr_MagicDesk2,         //IOH_MagicDesk2,
+#if !defined(MinimumBuild) && defined(USB_MIDI_SERIAL_KEYBOARD)
+   &IOHndlr_UsbKbd,             //IOH_UsbKbd,
+#endif
 };
 static_assert(sizeof(IOHandler) / sizeof(IOHandler[0]) == IOH_Num_Handlers,
               "IOHandler[] / enumIOHandlers count mismatch");

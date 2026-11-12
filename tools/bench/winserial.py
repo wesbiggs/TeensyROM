@@ -10,13 +10,15 @@ import ctypes
 import re
 import threading
 
-# The firmware's USB identities, from Teensyduino 1.61's cores/teensy4/usb_desc.h. Serial
-# + MIDI (USB_MIDI_SERIAL) is what build-firmware.mjs builds both the main and the minimal
-# image as, so a board keeps one COM port through both. Serial (USB_SERIAL) is what the
-# minimal image was before that, on a COM port of its own, and what any Teensy running a
-# serial sketch is, which is why it sorts second.
-USB_DEVICES = ('VID_16C0&PID_0489', 'VID_16C0&PID_0483')
-LOOKED = 'COM ports of USB devices 16C0:0489 and 16C0:0483'
+# The firmware's USB identities. Serial + MIDI + keyboard (USB_MIDI_SERIAL_KEYBOARD, which
+# tools/lib/usb-keyboard.mjs adds to the core's usb_desc.h) is what build-firmware.mjs builds
+# both the main and the minimal image as, so a board keeps one COM port through both.
+# Serial + MIDI (USB_MIDI_SERIAL, Teensyduino 1.61's cores/teensy4/usb_desc.h) is both
+# images on firmware from before the keyboard, and an Arduino IDE build. Serial
+# (USB_SERIAL) is what the minimal image was before that, on a COM port of its own, and
+# what any Teensy running a serial sketch is, which is why it sorts last.
+USB_DEVICES = ('VID_16C0&PID_048E', 'VID_16C0&PID_0489', 'VID_16C0&PID_0483')
+LOOKED = 'COM ports of USB devices 16C0:048E, 16C0:0489 and 16C0:0483'
 ENUM_USB = r'SYSTEM\CurrentControlSet\Enum\USB'
 SERIALCOMM = r'HARDWARE\DEVICEMAP\SERIALCOMM'
 

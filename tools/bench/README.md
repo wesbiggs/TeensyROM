@@ -29,8 +29,8 @@ under the Teensy's serial number instead.)
 
 The port is `$TR_PORT`, else the first `/dev/cu.usbmodem*` on macOS or
 `/dev/ttyACM*` on Linux. On Windows it is the first COM port of a TeensyROM's USB
-device (`16C0:0489`, or `16C0:0483` for a minimal image from before it became
-Serial + MIDI), found in the registry; set `$TR_PORT` (`COM5`, any case) to pick
+device (`16C0:048E`; `16C0:0489` for firmware from before the USB keyboard, or
+`16C0:0483` for a minimal image from before it became Serial + MIDI), found in the registry; set `$TR_PORT` (`COM5`, any case) to pick
 another. Do not hardcode it. After a reboot `$TR_PORT` is a
 preference rather than a pin: the USB serial number changes across some firmware
 changes, so a board that does not come back under its old name is picked up from

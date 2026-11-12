@@ -464,6 +464,9 @@ FLASHMEM void SetUpMainMenuROM()
    FreeGeoRAM();
    TRBlockUnmount();
    FreeSwiftlinkBuffs();
+#ifdef IOH_UsbKbd_Selectable
+   UsbKbd_End();
+#endif
    RedirectEmptyDriveDirMenu();
    free((void*)MIDIRxBuf); MIDIRxBuf=NULL;
    IOHandlerInit(IOH_TeensyROM);  

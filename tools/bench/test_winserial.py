@@ -28,10 +28,13 @@ GONE = None    # in FakeKernel32.arriving: the board drops off USB
 # A bench as the registry describes it. Windows keeps a device's PortName after it has
 # gone; only SERIALCOMM says which ports are there now.
 BENCH = {
-    # Current firmware: the serial interface has the port and the MIDI one has none.
-    # COM3 is a board that was plugged in once.
-    'VID_16C0&PID_0489&MI_00': {'6&1a2b&0&0000': 'COM7', '6&3c4d&0&0000': 'COM3'},
-    'VID_16C0&PID_0489&MI_02': {'6&1a2b&0&0002': None},
+    # Current firmware: the serial interface has the port and the MIDI and keyboard ones
+    # have none. COM3 is a board that was plugged in once.
+    'VID_16C0&PID_048E&MI_00': {'6&1a2b&0&0000': 'COM7', '6&3c4d&0&0000': 'COM3'},
+    'VID_16C0&PID_048E&MI_02': {'6&1a2b&0&0002': None},
+    'VID_16C0&PID_048E&MI_03': {'6&1a2b&0&0003': None},
+    # Firmware from before the keyboard, Serial + MIDI, on a board that is not plugged in.
+    'VID_16C0&PID_0489&MI_00': {'6&5e6f&0&0000': 'COM8'},
     # The minimal image on firmware from before it became Serial + MIDI.
     'VID_16C0&PID_0483': {'12345670': 'COM12'},
     # The Teensy bootloader, which has no port.
@@ -213,6 +216,14 @@ class FakeRegistry:
 class Discovery(unittest.TestCase):
     def test_only_a_teensyrom_that_is_there_is_found_current_firmware_first(self):
         self.assertEqual(winserial.ports(FakeRegistry(PRESENT)), ['COM7', 'COM12'])
+
+    def test_current_firmware_sorts_before_serial_midi_and_then_serial(self):
+        reg = FakeRegistry(
+            {'a': 'COM2', 'b': 'COM3', 'c': 'COM4'},
+            {'VID_16C0&PID_0483': {'x': 'COM2'},
+             'VID_16C0&PID_0489&MI_00': {'y': 'COM3'},
+             'VID_16C0&PID_048E&MI_00': {'z': 'COM4'}})
+        self.assertEqual(winserial.ports(reg), ['COM4', 'COM3', 'COM2'])
 
     def test_ports_sort_by_number_and_not_by_name(self):
         reg = FakeRegistry(
@@ -402,7 +413,7 @@ class LinkOnWindows(unittest.TestCase):
 
     def test_no_teensyrom_names_what_was_looked_for(self):
         self.reg = FakeRegistry(None)
-        with self.assertRaisesRegex(SystemExit, 'COM ports of USB devices 16C0:0489'):
+        with self.assertRaisesRegex(SystemExit, 'COM ports of USB devices 16C0:048E, 16C0:0489'):
             trlink.find_port()
 
     def test_stream_echoes_until_the_port_drops_and_says_it_did(self):

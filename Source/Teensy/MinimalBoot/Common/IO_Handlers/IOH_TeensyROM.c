@@ -720,8 +720,15 @@ void IO1Hndlr_TeensyROM(uint8_t Address, bool R_Wn)
             IO1[rRegNumItemsOnPage] = (NumItemsFull > Data*MaxItemsPerPage ? MaxItemsPerPage : NumItemsFull-(Data-1)*MaxItemsPerPage);
             break;
          case rwRegNextIOHndlr:
+#ifdef IOH_UsbKbd_Selectable
+            //the menu steps the number by one; USB Keyboard comes after the last selectable one
+            if (Data == LastSelectableIOH + 1 || (Data & 0x80)) Data = IOH_UsbKbd;
+            else if (Data == IOH_UsbKbd - 1) Data = LastSelectableIOH;
+            else if (Data > LastSelectableIOH && Data != IOH_UsbKbd) Data = 0;
+#else
             if (Data & 0x80) Data = LastSelectableIOH; //wrap around to last item if negative
             else if (Data > LastSelectableIOH) Data = 0; //wrap around to first item if above max
+#endif
             IO1[rwRegNextIOHndlr]= Data;
             eepAddrToWrite = eepAdNextIOHndlr;
             eepDataToWrite = Data;

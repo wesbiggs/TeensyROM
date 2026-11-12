@@ -82,6 +82,7 @@ import { DIRTY_PATHSPEC, ROW_WIDTH, dirtyFromStatus, chooseEpoch, validateTag, b
          suffixDefine, versionBase, pagesWithoutWord } from './lib/build-tag.mjs';
 import { definesMacro } from './lib/source-text.mjs';
 import { patchUsbIrqMasking } from './lib/usb-irq-mask.mjs';
+import { patchUsbDescForKeyboard, USB_KEYBOARD_TYPE } from './lib/usb-keyboard.mjs';
 import { patchUsbRegisterWindow, USB_REGISTER_WINDOW_FILES } from './lib/usb-register-window.mjs';
 import { heavyLibcLinked } from './lib/heavy-libc.mjs';
 import { masksInFlash, FLASH_START, FLASH_END } from './lib/flash-masks.mjs';
@@ -179,6 +180,8 @@ const hostSketch = path.resolve(hostSketchOption ?? path.join(root, 'Source/Teen
 // byte for byte, so building it again here only produces a second copy of the release hex
 // under a name that suggests the two belong together.
 const hostOnly = hostSketchOption !== null;
+// Minimal and main both, so a board passing through minimal stays one USB device
+const firmwareUsbType = USB_KEYBOARD_TYPE;
 // The overlay is read here rather than where it is used, because the extension image is
 // built last: a host sketch that is a file, or holds no .ino or two, was otherwise refused
 // only after the minimal and main images had compiled, and a path that was not a directory
@@ -410,6 +413,11 @@ const privateCore = path.join(privateData, 'packages/teensy/hardware/avr', TEENS
   }
 }
 const linkers = path.join(root, 'tools/BootLinkerFiles');
+if (!hostOnly && !(skipMinimalBuild && skipTeensyBuild)) {
+  const usbDesc = path.join(privateCore, 'usb_desc.h');
+  write(usbDesc, patchUsbDescForKeyboard(read(usbDesc)));
+  console.log(`USB type ${USB_KEYBOARD_TYPE} added to the private core's usb_desc.h`);
+}
 
 const cli = resolveArduinoCli(path.join(root, 'tools/.cache'));
 const env = {
@@ -473,8 +481,9 @@ function build(name, { inoPath, fqbn, suffix, elfStem, ld, bootdata, usbType, ex
 
   const compileArgs = ['compile', '--fqbn', fqbn, '--build-path', buildDir, ...compilerPathProps,
     '--build-property', `build.flags.defs=${defs}`];
-  // The extension image needs USB fully off, which is not one of the core's
-  // `usb=` FQBN menu choices. The FQBN still says usb=serial; this wins.
+  // The extension image needs USB fully off, and minimal and main a type of their own
+  // (lib/usb-keyboard.mjs); neither is one of the core's `usb=` FQBN menu choices. The
+  // FQBN's usb= stays; this wins.
   if (usbType) compileArgs.push('--build-property', `build.usbtype=${usbType}`);
   compileArgs.push(inoPath);
 
@@ -542,13 +551,14 @@ if (withExtensions && !hostOnly) {
 if (!skipMinimalBuild && !hostOnly) {
   minimalImage = build('minimal', {
     inoPath: path.join(root, 'Source/Teensy/MinimalBoot/MinimalBoot.ino'),
-    // Serial + MIDI like main, though minimal never uses MIDI: both images then present
-    // the same USB device (16C0:0489, same interfaces, same name strings), so a board
+    // Serial + MIDI + keyboard like main, though minimal uses neither: both images then present
+    // the same USB device (16C0:048E, same interfaces, same name strings), so a board
     // passing through minimal keeps its COM port and DAWs keep its MIDI port. A serial-only
     // minimal comes up as a different device. MinimalBoot.ino #errors on anything else.
     fqbn: 'teensy:avr:teensy41:usb=serialmidi,speed=600,opt=o2std,keys=en-us',
     suffix: 'orig',
     elfStem: 'MinimalBoot',
+    usbType: firmwareUsbType,
     ld: withExtensions ? minimalLinkerScript(linkers) : undefined,
     extraDefs: withExtensions ? VM_EXTENSIONS_DEFINE : '',
     // Minimal sizes its RAM1 image buffer to leave just over this for the stack, the floor
@@ -565,6 +575,7 @@ if (!skipTeensyBuild && !hostOnly) {
     fqbn: 'teensy:avr:teensy41:usb=serialmidi,speed=600,opt=o2std,keys=en-us',
     suffix: 'upper',
     elfStem: 'Teensy',
+    usbType: firmwareUsbType,
     ld: withExtensions ? mainLinkerScript(linkers) : undefined,
     extraDefs: withExtensions ? VM_EXTENSIONS_DEFINE : '',
     checkHeavyLibc: true,

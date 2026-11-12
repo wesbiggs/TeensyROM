@@ -466,6 +466,11 @@ test('the minimal and main images are built as the same USB type', () => {
     source.match(new RegExp(`build\\('${image}', \\{[^}]*?fqbn: '[^']*\\busb=(\\w+)`))?.[1];
   assert.equal(usbType('minimal'), 'serialmidi');
   assert.equal(usbType('main'), 'serialmidi');
+  // build.usbtype overrides both with the keyboard type, from the one variable
+  const override = (image) =>
+    source.match(new RegExp(`build\\('${image}', \\{[^}]*?usbType: (\\w+)`))?.[1];
+  assert.equal(override('minimal'), 'firmwareUsbType');
+  assert.equal(override('main'), 'firmwareUsbType');
 });
 
 // The example host is documentation that compiles, so the four contract points it is
