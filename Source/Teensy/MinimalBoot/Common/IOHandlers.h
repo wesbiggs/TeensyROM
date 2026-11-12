@@ -50,7 +50,7 @@
    EthernetUDP udp;
    EthernetClient client;
 
-   #ifndef USB_MIDI_SERIAL
+   #if !defined(USB_MIDI_SERIAL) && !defined(USB_MIDI_SERIAL_KEYBOARD)  //the second: build-firmware.mjs --usb-keyboard
       #error TeensyROM requires Tools > USB Type: "Serial + MIDI" in the Arduino IDE
    #endif
    #define usbDevMIDI usbMIDI
