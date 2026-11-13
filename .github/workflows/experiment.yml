@@ -1,4 +1,4 @@
-name: Experiment build (TR+, manual)
+name: Experiment build (manual)
 
 # Manual only, and no `contents: write` permission: this can never publish a Release,
 # regardless of what changes in the build step below. TR+ always includes MPE once MPE is
@@ -7,6 +7,16 @@ name: Experiment build (TR+, manual)
 # doing what its name says.
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'Board'
+        type: choice
+        options: [tr-plus, tr]
+        default: tr-plus
+      usb_keyboard:
+        description: 'TeensyROM + USB keyboard build (--usb-keyboard, docs/USB_Keyboard.md)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -37,10 +47,16 @@ jobs:
           arduino-cli core install teensy:avr@1.61.0
           arduino-cli lib install CRC32@2.0.1
 
-      - name: Build TR+ (experimental)
-        run: npm run build:tr-plus
+      - name: Build ${{ inputs.target }} (experimental)
+        env:
+          TARGET: ${{ inputs.target }}
+          USB_KEYBOARD: ${{ inputs.usb_keyboard }}
+        run: |
+          ARGS=(--target "$TARGET")
+          if [ "$USB_KEYBOARD" = "true" ]; then ARGS+=(--usb-keyboard); fi
+          node tools/build-firmware.mjs "${ARGS[@]}"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: tr-plus-experiment
+          name: ${{ inputs.target }}-experiment${{ inputs.usb_keyboard && '-usbkbd' || '' }}
           path: build/firmware/*.hex
