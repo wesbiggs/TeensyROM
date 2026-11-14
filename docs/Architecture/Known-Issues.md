@@ -19,6 +19,7 @@ Detail for every item below is in its own full section further down — search t
 
 **DMA timing:**
 - A DMA transfer (a C64 REU transfer or a host write) can lose its first byte, more often next to another transfer; `tools/bench/reuspans.py` reproduces it
+- An asynchronous DMA start (`PerformDMA()`, `HoldC64()`) can assert ahead of a CPU write while a bus snoop (Kernal Replace) takes cycles, since `isrPHI2()` returns before its safe-freeze state machine sees them; found by reading the code, not reproduced. Detail: [DMA-Timing-Known-Issues.md](DMA-Timing-Known-Issues.md) #17
 
 **Design/process gaps:**
 - No consistent allocation-failure (OOM) policy across handlers — leaning REBOOT

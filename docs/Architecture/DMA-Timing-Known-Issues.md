@@ -94,6 +94,77 @@ C128 unreliability (see [Known-Issues.md](Known-Issues.md)'s "Large-CRT
 bank-swap DMA reliability" entry) through one shared root cause — unconfirmed,
 but the most direct link between the two mechanisms found so far.
 
+## Investigation
+
+### 17. An asynchronous DMA start can assert ahead of a CPU write while a bus snoop takes cycles `[Investigation]`
+`isrPHI2()` picks the moment to assert /DMA for `DMA_S_StartAsynch` by the safe-freeze
+rule (Gideon Zweijtzer's paper): watch R/W cycle by cycle and assert on the first read
+that directly follows a write. After a write, the next read is an opcode or vector
+fetch, and the cycle after that is a read too, so the 6510, which only halts on reads,
+cannot be in the middle of a write sequence. That rule needs to see **every** cycle.
+But the state machine sits at the end of the ISR, after
+
+```c
+if (fBusSnoop != NULL) if (fBusSnoop(Address, R_Wn)) return;
+```
+
+(and the same line for `fKernRepl` under `Fab04_GlobalKernalReplace`).
+`KernalCheck()` returns true for every CPU read of `$E000-$FFFF` with BA high, whether
+it serves the byte or `HIRAM_State` is RAM; `KernalCheckDMA()` passes through to it. So
+while a program runs KERNAL code under Kernal Replace, most cycles never reach the
+state machine. It can see a write (`DMA_S_StartAsynch_Wait_LWr`), miss the KERNAL
+fetches after it, and take a *later* read for "the read after the write".
+
+Example: a `JSR` in the KERNAL. The opcode and low-byte fetches are `$E000+` reads
+(skipped); the third cycle is a dummy read of the stack page (seen: assert); the next
+two cycles push the return address. The 6510 does not halt on writes, and with /DMA low
+its bus is cut off (AEC), so both pushes are lost and the `RTS` later returns to
+whatever the stack held. The KERNAL IRQ handler and the screen editor's input loop run
+all the time, so the window comes round often.
+
+**Who is exposed:** any asynchronous start (`PerformDMA()`, `HoldC64()`) issued from
+thread mode while a snoop is hooked and the C64 is running code that writes: remote
+`ReadC64Mem`/`WriteC64Mem` under Kernal Replace, or any hold of a running program.
+A C64 that waits in a read-only loop (polling an IO register) is not: its start comes
+from a bad-line read or `DMA_TIMEOUT_CYCLES`, both safe.
+
+**Status:** found by reading the code, not reproduced on hardware as a failure of its
+own. It came up while chasing a crash in a fork that holds a running C64 to write
+`$D020` (teensyrom-vdrive's Alt-button border flash). That crash turned out not to need
+a change here: the same flash, without any ISR change, runs clean on hardware.
+Remote DMA reads of a running program have been seen to crash or corrupt some programs
+(over TCP too), and this gap may be one cause; that is not shown.
+
+**A fix that was tried, and why it is not proposed:** on a snooped cycle with an
+asynchronous start pending, step the machine anyway, with the same three cases as the
+ISR's own switch, after waiting for Phi2 to fall (and only if Phi2 was still high on
+return from the snoop; otherwise drop a pending `Wait_LWr` back to `Wait_LRd`, which can
+only delay a start):
+
+```c
+if (fBusSnoop != NULL) if (fBusSnoop(Address, R_Wn))
+{
+   if (DMA_State > DMA_S_BeginStartStates) DmaSnoopedCycle(R_Wn); // StartAsynch / Wait_LRd / Wait_LWr only
+   return;
+}
+```
+
+It compiled with the same register saves in `isrPHI2` and a byte-identical
+`KernalCheck`, but it moved code inside `isrPHI2` (an alignment `nop` gone, two
+branches shortened). On hardware (TR+ in an NTSC C128), the build with it broke **Exit
+to C128 BASIC**: the screen filled with garbage before the C128's own colours appeared,
+where no DMA start should have been pending. The same build without the edit worked. Why is not
+known (layout-dependent timing in the ROML/ROMH path is the suspect), so the edit is
+not offered as a fix until that is understood.
+
+**Next step:** reproduce it first. A C64 program that spends its time in KERNAL
+code (the BASIC prompt is enough) under Kernal Replace, a host issuing repeated short
+`ReadC64Mem`s, and a check that catches a lost stack write (or a crash count against
+the same run with Kernal Replace off). Then, with a reproduction, try the smallest
+change: only the demotion (`Wait_LWr` to `Wait_LRd` on a snooped cycle), which never
+asserts from a snooped cycle; and check `isrPHI2`'s disassembly and a C128 boot
+(Exit to C128 BASIC, a 128-mode program) with it.
+
 ## Validation
 
 ### 2. PAL branch of the timing fix is unverified on real PAL hardware `[Validation]`
