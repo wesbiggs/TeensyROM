@@ -53,6 +53,7 @@ What gets built, and how, is `tools/c64-projects.json`; the format is described 
 | `MIDI2SID` | MIDI-to-SID synthesizer application |
 | `SimpSwiftTerm` | Simple SwiftLink terminal program |
 | `TODCheck` | CIA Time-of-Day clock check utility |
+| `Minesweeper` | Minesweeper, played with a USB mouse (Special IO GeoRAM or REU+USB Mouse/Disk) or a joystick in port 2 |
 | `TRCustomBasicCommands` | Custom TR BASIC command extensions (built with KickAssembler) |
 | `v1541Wrapper` | Virtual 1541 wrapper (not currently used by the firmware; its header is still kept current) |
 | `BASIC` | Standalone BASIC `.prg` utilities: nothing to assemble, each is converted to a header |
