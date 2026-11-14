@@ -312,3 +312,21 @@ test('clicking a level label starts that level, and the face starts a new game',
   click(20, 3);
   assert.equal(g.state, STATE.READY);
 });
+
+test('the keys pick a level and start a new game', () => {
+  const g = new Game();
+  const key = (petscii) => {
+    g.ram.set([0xa9, petscii, 0x60], 0xffe4); // GETIN: lda #key, rts
+    g.call(S.API_READKEYS);
+  };
+  key(0x87); // F5
+  assert.deepEqual([g.rows, g.cols], [16, 30]);
+  key(0x85); // F1
+  assert.deepEqual([g.rows, g.cols], [9, 9]);
+  for (const k of [0x4e, 0x0d]) { // N, Return
+    g.at(S.API_LEFT, 4, 4);
+    assert.equal(g.state, STATE.PLAYING);
+    key(k);
+    assert.equal(g.state, STATE.READY, `key $${k.toString(16)} did not start a new game`);
+  }
+});

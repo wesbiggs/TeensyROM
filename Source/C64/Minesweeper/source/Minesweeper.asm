@@ -134,6 +134,7 @@ API_RIGHT     = $0819
 API_MIDDLE    = $081c
 API_FINDMOUSE = $081f
 API_READMOUSE = $0822
+API_READKEYS  = $0825
 
         * = $0801
         !word .basicEnd, 2026
@@ -151,7 +152,8 @@ API_READMOUSE = $0822
         jmp Chord
         jmp FindMouse
         jmp ReadMouse
-!if * != API_READMOUSE + 3 { !error "the API table moved" }
+        jmp ReadKeys
+!if * != API_READKEYS + 3 { !error "the API table moved" }
 
 Start
         lda #DKGREY
@@ -426,7 +428,7 @@ ReadKeys
         bpl -
         cmp #$0d
         beq .new
-        cmp #'n'
+        cmp #'N'                ; GETIN's PETSCII for the unshifted key: ACME's 'n' is ASCII $6E
         beq .new
         cmp #' '
         bne .out
