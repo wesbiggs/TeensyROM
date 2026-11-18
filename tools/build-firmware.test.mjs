@@ -42,6 +42,11 @@ test('custom host code budget cannot silently change the stock host', () => {
   }
 });
 
+test('mbedTLS cannot be let into the stock images or the stock host', () => {
+  assert.match(build('--target', 'tr-plus', '--host-tls').stderr, /--host-tls requires an explicit --host-sketch/);
+  assert.match(build('--target', 'tr', '--host-tls').stderr, /--host-tls requires an explicit --host-sketch/);
+});
+
 test('extensions are refused on a target whose DMA cannot blank the screen', () => {
   const result = build('--target', 'tr', '--with-extensions');
   assert.equal(result.status, 1);

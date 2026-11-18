@@ -368,8 +368,10 @@ FLASHMEM static void Fetch()
    {
       File f = SD.open(UrlPath, FILE_READ);
       if (!f) ReturnToMenu(UrlFile, 0);
+      // A card read error comes back as SdFat's -1 cast to size_t.
       size_t n = f.read(line, LineSize - 1);
       f.close();
+      if (n > LineSize - 1) ReturnToMenu(UrlFile, 1);
       line[n] = 0;
       line[strcspn(line, "\r\n")] = 0;
    }
@@ -382,7 +384,8 @@ FLASHMEM static void Fetch()
    if (!caPem) ReturnToMenu(CaFile, 0);
    int ret = mbedtls_x509_crt_parse(&ca, caPem, caLen);
    mbedtls_free(caPem);
-   if (ret != 0) ReturnToMenu(CaParse, -ret);
+   // A positive ret is the number of certificates in the file that did not parse.
+   if (ret != 0) ReturnToMenu(CaParse, ret < 0 ? -ret : ret);
 
    if (!TrngInit()) ReturnToMenu(Trng, TRNG_MCTL);
    mbedtls_ctr_drbg_context drbg;

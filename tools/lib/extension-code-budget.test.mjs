@@ -129,6 +129,43 @@ test('the SD card libraries run from flash but for the SDIO driver, on either pa
   }
 });
 
+// ld's archive:member form: the pattern before the ':' matches the archive's path and the
+// one after it the member's name. arduino-cli links a library through such an archive
+// (objs.a) once its link command would grow too long.
+const memberMatches = (matches, pattern, archive, member) => {
+  const sep = pattern.indexOf(':');
+  return sep > 0 && matches(pattern.slice(0, sep), archive) && matches(pattern.slice(sep + 1), member);
+};
+const memberPlacedInFlash = (patterns, archive, member) =>
+  [(pattern, name) => fnmatchRegExp(pattern).test(name), libibertyFnmatch]
+    .map((matches) => patterns.some(({ file, staying }) => memberMatches(matches, file, archive, member) &&
+      !staying.some((pattern) => memberMatches(matches, pattern, archive, member))));
+
+test('an archived library runs from flash too, and its SDIO driver still does not', () => {
+  const patterns = flashTextPatterns(extensionLinkerScript(linkers));
+  for (const archive of ['/b/ext/libraries/SdFat/objs.a', '/b/ext/libraries/SdFat/SdCard/objs.a',
+    'C:\\b\\ext\\libraries\\SdFat\\SdCard\\objs.a', '/b/ext/libraries/SD/objs.a', '/b/ext/libraries/SPI/objs.a']) {
+    assert.deepEqual(memberPlacedInFlash(patterns, archive, 'x.cpp.o'), [true, true], archive);
+  }
+  for (const archive of ['/b/ext/libraries/SdFat/SdCard/objs.a', 'C:\\b\\ext\\libraries\\SdFat\\SdCard\\objs.a']) {
+    assert.deepEqual(memberPlacedInFlash(patterns, archive, 'SdioTeensy.cpp.o'), [false, false], archive);
+  }
+  for (const archive of ['/b/ext/sketch/objs.a', '/b/ext/libraries/SdFatX/objs.a', '/b/ext/libraries/FNET/stack/objs.a']) {
+    assert.deepEqual(memberPlacedInFlash(patterns, archive, 'x.cpp.o'), [false, false], archive);
+  }
+});
+
+test('a --host-tls library moves its code and constants to flash, and only when asked', () => {
+  const stock = extensionLinkerScript(linkers);
+  const tls = extensionLinkerScript(linkers, 64, { flashLibraries: ['FNET'] });
+  const fnet = '\t\t*[\\\\/]libraries[\\\\/]FNET[\\\\/]*';
+  assert.equal(stock, extensionLinkerScript(linkers, 64, { flashLibraries: [] }));
+  assert.doesNotMatch(stock, /FNET/);
+  const added = progmemBlock(tls).split('\n').filter((line) => !progmemBlock(stock).split('\n').includes(line));
+  assert.deepEqual(added, [`${fnet}(.text* .rodata*)`, `${fnet}:*(.text* .rodata*)`]);
+  assert.equal(tls.replace(added.map((line) => line + '\n').join(''), ''), stock);
+});
+
 test('the two readings part on the order of a class, which is why the escaped \\ comes first', () => {
   assert.deepEqual([libibertyFnmatch('*[/\\\\]x', '/a/x'), fnmatchRegExp('*[/\\\\]x').test('/a/x')], [false, true]);
   assert.deepEqual([libibertyFnmatch('*[\\\\/]x', '/a/x'), fnmatchRegExp('*[\\\\/]x').test('/a/x')], [true, true]);
