@@ -129,7 +129,9 @@ readToken:
 
 ; Every write the host must see is repeated until it shows it saw it, and a
 ; register that decides anything is read twice: a late PHI2 interrupt loses a
-; write or garbles a read, and packets carry their own CRC.
+; write or garbles a read, and packets carry their own CRC. The one exception
+; is the start after RESTORE: the status already reads running, so nothing
+; shows whether the host saw it, and a lost one leaves the screen unrepainted.
 main:
         lda #HOSTBANK
         sta $DE00
