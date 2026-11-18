@@ -27,6 +27,7 @@ const DEPENDENCIES = [
     pins: [
       ['.github/workflows/build.yml', /lib install CRC32@([\d.]+)/],
       ['.github/workflows/experiment.yml', /lib install CRC32@([\d.]+)/],
+      ['.github/workflows/webget.yml', /lib install CRC32@([\d.]+)/],
       ['Source/BuildInfo.md', /CRC32 at version ([\d.]+)/],
     ],
     latest: () => arduinoCliJson(['lib', 'search', 'CRC32']).libraries.find((l) => l.name === 'CRC32').latest.version,
@@ -36,6 +37,7 @@ const DEPENDENCIES = [
     pins: [
       ['.github/workflows/build.yml', /core install teensy:avr@([\d.]+)/],
       ['.github/workflows/experiment.yml', /core install teensy:avr@([\d.]+)/],
+      ['.github/workflows/webget.yml', /core install teensy:avr@([\d.]+)/],
       ['tools/build-firmware.mjs', /TEENSY_CORE_VERSION = '([\d.]+)'/],
       ['Source/BuildInfo.md', /\* Teensyduino ([\d.]+)/],
       ['docs/Architecture/Build-System.md', /Current pinned\/recommended version is \*\*([\d.]+)\*\*/],

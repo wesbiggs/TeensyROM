@@ -3,7 +3,7 @@
 //
 // Build the WebGet extension host and everything a card needs to run it:
 //
-//   npm run build:webget [-- --label <name>] [-- --ccache]
+//   npm run build:webget [-- [--label <name>] [--ccache]]
 //
 // writes build/webget/WebGet_<label>/, laid out as it goes on the SD card, and
 // WebGet_<label>.zip beside it:

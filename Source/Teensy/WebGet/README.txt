@@ -71,8 +71,10 @@ with these codes (value 0 means none):
   $00  saved; value is the number of bytes
   $03  not a URL WebGet understands
   $09  could not connect; value is the milliseconds it took
+  $0A  the secure connection could not be set up; value is the mbedTLS error
   $0B  the secure connection failed; value is the mbedTLS error
   $0C  the site's certificate was not trusted
+  $0D  the request could not be sent
   $0E  the server's response was not understood
   $0F  the server refused; value is the HTTP status, such as 404
   $10  the file could not be written to the SD card
