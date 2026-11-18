@@ -9,7 +9,9 @@
 //   /tls/url.txt   one line, https://host[:port]/path
 //   /tls/ca.pem    the PEM root certificate(s) that may sign the server's chain
 //
-// It writes the response body to /tls/download.tmp and renames it to
+// It follows up to five redirects to other https:// URLs, so url.txt can hold a
+// stable link such as a GitHub release download, whose signed target expires in
+// minutes. It writes the response body to /tls/download.tmp and renames it to
 // /tls/download.bin only once the whole body has arrived. The result comes back
 // on the C64 menu as `extension host returned ($50/<detail>)`, where detail is
 // (stage << 24) | value; stage 0 is success with value = bytes written. The
@@ -21,10 +23,8 @@
 //   python3 tools/bench/hostinstall.py build/firmware/TeensyROM+_<ver>_TlsHost.TRH
 //
 // Known limits of the mbedTLS 2.12.0 that Teensyduino 1.61.0 bundles inside FNET:
-// TLS 1.2 only; MBEDTLS_SSL_MAX_CONTENT_LEN is fixed at 10 KiB in its config.h,
-// so a server that ignores the 4 KiB max_fragment_length request and sends a
-// full 16 KiB record fails the read; and MBEDTLS_HAVE_TIME is off, so certificate
-// validity dates are not checked.
+// TLS 1.2 only, and MBEDTLS_HAVE_TIME is off, so certificate validity dates are
+// not checked. HostTlsConfig.h raises its 10 KiB record limit to TLS's 16 KiB.
 
 #include <SD.h>
 #include <EEPROM.h>
@@ -69,6 +69,7 @@ enum Stage : uint8_t {
    Done = 0, SdInit, UrlFile, UrlParse, CaFile, CaParse, Trng, DrbgSeed, NetInit,
    Connect, TlsSetup, Handshake, Verify, Request, Response, HttpStatus, FileWrite,
    ReadTimeout, Truncated, Rename,
+   Redirect,   // value: the status whose Location was missing or refused, or 0 for too many hops
 };
 
 static constexpr const char *UrlPath  = "/tls/url.txt";
@@ -77,6 +78,9 @@ static constexpr const char *TempPath = "/tls/download.tmp";
 static constexpr const char *OutPath  = "/tls/download.bin";
 static constexpr uint32_t IoTimeoutMs = 20000;
 static constexpr size_t SocketSize = 2048;   // EthernetClient::read narrows its count to int16_t
+static constexpr size_t LineSize = sizeof(Url::path) + 256;   // the request, or one header line
+static constexpr size_t MaxHeadBytes = 32 * 1024;
+static constexpr uint8_t MaxRedirects = 5;
 
 FLASHMEM void ReturnToMenu(uint8_t stage, uint32_t value)
 {
@@ -140,6 +144,14 @@ FLASHMEM static int NetRecv(void *ctx, unsigned char *buf, size_t len)
    return got > 0 ? got : MBEDTLS_ERR_SSL_WANT_READ;
 }
 
+// Host and path go into the request as they are, so a CR or LF in a Location
+// would otherwise add header lines of the server's choosing.
+FLASHMEM static bool Printable(const char *text)
+{
+   for (; *text; text++) if (*text <= ' ' || *text >= 0x7F) return false;
+   return true;
+}
+
 FLASHMEM static bool ParseUrl(const char *text, Url &url)
 {
    if (strncmp(text, "https://", 8) != 0) return false;
@@ -162,7 +174,7 @@ FLASHMEM static bool ParseUrl(const char *text, Url &url)
    if (*rest == 0) rest = "/";
    if (*rest != '/' || strlen(rest) >= sizeof(url.path)) return false;
    strcpy(url.path, rest);
-   return true;
+   return Printable(url.host) && Printable(url.path);
 }
 
 // Reads a whole SD file into the TLS heap. mbedtls_x509_crt_parse wants a PEM
@@ -205,21 +217,143 @@ FLASHMEM static bool EthernetUp()
    return Ethernet.begin(mac, ip, dns, gateway, mask, timeout) != 0;
 }
 
-// Status code and Content-Length (-1 when absent) from a complete header block.
-// Parsed by hand: sscanf links the scanf and strtod families, about 14 KB of a
-// slot this host already nearly fills.
-FLASHMEM static int ParseHeaders(const char *head, int32_t &contentLength)
+// The status code from an HTTP/1.x status line, or 0 when it is not one.
+FLASHMEM static int ParseStatus(const char *line)
 {
-   contentLength = -1;
-   if (strncmp(head, "HTTP/1.", 7) != 0) return 0;
-   const char *code = strchr(head, ' ');
-   if (!code) return 0;
-   int status = strtol(code + 1, nullptr, 10);
-   for (const char *line = strstr(head, "\r\n"); line; line = strstr(line + 2, "\r\n"))
+   if (strncmp(line, "HTTP/1.", 7) != 0 || line[8] != ' ') return 0;
+   char *end;
+   long status = strtol(line + 9, &end, 10);
+   return (end == line + 12 && status >= 100) ? (int)status : 0;
+}
+
+FLASHMEM static bool IsRedirect(int status)
+{
+   return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+// A Location value, absolute or host-relative, applied to `url` only when it
+// parses. An http:// target fails here, so a redirect never leaves TLS.
+FLASHMEM static bool ResolveLocation(const char *value, Url &url)
+{
+   value += strspn(value, " \t");
+   if (value[0] == '/' && value[1] != '/')
    {
-      if (strncasecmp(line + 2, "Content-Length:", 15) == 0) contentLength = strtol(line + 17, nullptr, 10);
+      if (strlen(value) >= sizeof(url.path) || !Printable(value)) return false;
+      strcpy(url.path, value);
+      return true;
    }
-   return status;
+   static Url next;
+   if (!ParseUrl(value, next)) return false;
+   url = next;
+   return true;
+}
+
+FLASHMEM static void FailBody(File &out, Stage stage, uint32_t value)
+{
+   if (out) { out.close(); SD.remove(TempPath); }
+   ReturnToMenu(stage, value);
+}
+
+// One GET on a fresh connection. Returns true once the body is in TempPath, with
+// its size in `bodyBytes`, or false for a redirect, with `url` now its target.
+// `line` (LineSize bytes) holds the request and then each header line in turn.
+FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, uint32_t &bodyBytes)
+{
+   static EthernetClient client;
+   if (!client.connect(url.host, url.port)) ReturnToMenu(Connect, url.port);
+
+   mbedtls_ssl_context ssl;
+   mbedtls_ssl_init(&ssl);
+   int ret = mbedtls_ssl_setup(&ssl, &conf);
+   if (ret == 0) ret = mbedtls_ssl_set_hostname(&ssl, url.host);
+   if (ret != 0) ReturnToMenu(TlsSetup, -ret);
+   mbedtls_ssl_set_bio(&ssl, &client, NetSend, NetRecv, nullptr);
+
+   while ((ret = mbedtls_ssl_handshake(&ssl)) != 0)
+   {
+      if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) ReturnToMenu(Verify, mbedtls_ssl_get_verify_result(&ssl));
+      if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) ReturnToMenu(Handshake, -ret);
+   }
+
+   int reqLen = snprintf(line, LineSize,
+      "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: TeensyROM\r\nConnection: close\r\n\r\n", url.path, url.host);
+   if (reqLen <= 0 || reqLen >= (int)LineSize) ReturnToMenu(Request, 0);
+   for (int off = 0; off < reqLen; )
+   {
+      ret = mbedtls_ssl_write(&ssl, (const unsigned char *)line + off, reqLen - off);
+      if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+      if (ret <= 0) ReturnToMenu(Request, -ret);
+      off += ret;
+   }
+
+   // Headers are taken a line at a time, keeping only the status, Content-Length
+   // and a redirect's Location: github.com's redirect alone sends 5.7 KB of them.
+   // A line longer than `line` keeps its start, enough for every header but
+   // Location, which is then refused rather than followed cut short.
+   int status = 0;
+   int32_t contentLength = -1;
+   bool location = false, overflow = false, inBody = false, closeNotify = false;
+   size_t lineLen = 0, headBytes = 0;
+   File out;
+   bodyBytes = 0;
+   unsigned char buf[1024];
+   while (true)
+   {
+      ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf));
+      if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+      if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) { closeNotify = true; break; }
+      if (ret == 0 || ret == MBEDTLS_ERR_SSL_CONN_EOF) break;
+      if (ret == MBEDTLS_ERR_SSL_TIMEOUT) FailBody(out, ReadTimeout, bodyBytes);
+      if (ret < 0) FailBody(out, Response, -ret);
+
+      size_t at = 0;
+      while (!inBody && at < (size_t)ret)
+      {
+         char c = buf[at++];
+         if (++headBytes > MaxHeadBytes) ReturnToMenu(Response, headBytes);
+         if (c != '\n')
+         {
+            if (lineLen < LineSize - 1) line[lineLen++] = c; else overflow = true;
+            continue;
+         }
+         while (lineLen && strchr("\r \t", line[lineLen - 1])) lineLen--;
+         line[lineLen] = 0;
+         if (status == 0)
+         {
+            status = ParseStatus(line);
+            if (status == 0) ReturnToMenu(Response, 0);
+         }
+         else if (lineLen == 0) inBody = true;
+         else if (strncasecmp(line, "Content-Length:", 15) == 0) contentLength = strtol(line + 15, nullptr, 10);
+         else if (IsRedirect(status) && strncasecmp(line, "Location:", 9) == 0) location = !overflow && ResolveLocation(line + 9, url);
+         lineLen = 0;
+         overflow = false;
+         if (!inBody) continue;
+
+         if (IsRedirect(status))
+         {
+            if (!location) ReturnToMenu(Redirect, status);
+            mbedtls_ssl_close_notify(&ssl);
+            mbedtls_ssl_free(&ssl);
+            client.stop();
+            return false;
+         }
+         if (status != 200) ReturnToMenu(HttpStatus, status);
+         SD.remove(TempPath);
+         out = SD.open(TempPath, FILE_WRITE);
+         if (!out) ReturnToMenu(FileWrite, 0);
+      }
+      size_t bodyLen = ret - at;
+      if (bodyLen && out.write(buf + at, bodyLen) != bodyLen) FailBody(out, FileWrite, bodyBytes);
+      bodyBytes += bodyLen;
+   }
+
+   // Without close_notify or a Content-Length to check against, a cut connection
+   // looks the same as a complete body, so neither is taken as complete.
+   bool complete = inBody && (contentLength >= 0 ? bodyBytes == (uint32_t)contentLength : closeNotify);
+   if (!complete) FailBody(out, Truncated, bodyBytes);
+   out.close();
+   return true;
 }
 
 FLASHMEM static void Fetch()
@@ -227,17 +361,18 @@ FLASHMEM static void Fetch()
    if (!SD.begin(BUILTIN_SDCARD)) ReturnToMenu(SdInit, 0);
 
    mbedtls_memory_buffer_alloc_init((unsigned char *)(Ram2Base + NetHeapSize), TlsHeapSize);
+   char *line = (char *)mbedtls_calloc(1, LineSize);
+   static Url url;
+   if (!line) ReturnToMenu(TlsSetup, 0);
 
-   char line[400]{};
    {
       File f = SD.open(UrlPath, FILE_READ);
       if (!f) ReturnToMenu(UrlFile, 0);
-      size_t n = f.read(line, sizeof(line) - 1);
+      size_t n = f.read(line, LineSize - 1);
       f.close();
       line[n] = 0;
       line[strcspn(line, "\r\n")] = 0;
    }
-   static Url url;
    if (!ParseUrl(line, url)) ReturnToMenu(UrlParse, 0);
 
    mbedtls_x509_crt ca;
@@ -257,97 +392,19 @@ FLASHMEM static void Fetch()
 
    if (!EthernetUp()) ReturnToMenu(NetInit, Ethernet.linkStatus());
 
-   static EthernetClient client;
-   if (!client.connect(url.host, url.port)) ReturnToMenu(Connect, url.port);
-
    mbedtls_ssl_config conf;
-   mbedtls_ssl_context ssl;
    mbedtls_ssl_config_init(&conf);
-   mbedtls_ssl_init(&ssl);
    ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
-   if (ret == 0)
-   {
-      mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-      mbedtls_ssl_conf_ca_chain(&conf, &ca, nullptr);
-      mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
-      ret = mbedtls_ssl_conf_max_frag_len(&conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096);
-   }
-   if (ret == 0) ret = mbedtls_ssl_setup(&ssl, &conf);
-   if (ret == 0) ret = mbedtls_ssl_set_hostname(&ssl, url.host);
    if (ret != 0) ReturnToMenu(TlsSetup, -ret);
-   mbedtls_ssl_set_bio(&ssl, &client, NetSend, NetRecv, nullptr);
+   mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+   mbedtls_ssl_conf_ca_chain(&conf, &ca, nullptr);
+   mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
 
-   while ((ret = mbedtls_ssl_handshake(&ssl)) != 0)
-   {
-      if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) ReturnToMenu(Verify, mbedtls_ssl_get_verify_result(&ssl));
-      if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) ReturnToMenu(Handshake, -ret);
-   }
-
-   char request[512];
-   int reqLen = snprintf(request, sizeof(request),
-      "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: TeensyROM\r\nConnection: close\r\n\r\n", url.path, url.host);
-   if (reqLen <= 0 || reqLen >= (int)sizeof(request)) ReturnToMenu(Request, 0);
-   for (int off = 0; off < reqLen; )
-   {
-      ret = mbedtls_ssl_write(&ssl, (const unsigned char *)request + off, reqLen - off);
-      if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-      if (ret <= 0) ReturnToMenu(Request, -ret);
-      off += ret;
-   }
-
-   SD.remove(TempPath);
-   File out = SD.open(TempPath, FILE_WRITE);
-   if (!out) ReturnToMenu(FileWrite, 0);
-
-   static char head[2048];
-   size_t headLen = 0;
-   bool inBody = false;
-   int32_t contentLength = -1;
    uint32_t bodyBytes = 0;
-   unsigned char buf[1024];
-   bool closeNotify = false;
-   while (true)
+   for (uint8_t hops = 0; !Exchange(url, conf, line, bodyBytes); )
    {
-      ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf));
-      if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-      if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) { closeNotify = true; break; }
-      if (ret == 0 || ret == MBEDTLS_ERR_SSL_CONN_EOF) break;
-      if (ret == MBEDTLS_ERR_SSL_TIMEOUT) { out.close(); SD.remove(TempPath); ReturnToMenu(ReadTimeout, bodyBytes); }
-      if (ret < 0) { out.close(); SD.remove(TempPath); ReturnToMenu(Response, -ret); }
-
-      const unsigned char *body = buf;
-      size_t bodyLen = ret;
-      if (!inBody)
-      {
-         size_t take = min(bodyLen, sizeof(head) - 1 - headLen);
-         memcpy(head + headLen, buf, take);
-         headLen += take;
-         head[headLen] = 0;
-         char *end = strstr(head, "\r\n\r\n");
-         if (!end)
-         {
-            if (headLen == sizeof(head) - 1) { out.close(); SD.remove(TempPath); ReturnToMenu(Response, headLen); }
-            continue;
-         }
-         size_t headerBytes = end + 4 - head;
-         end[2] = 0;
-         int status = ParseHeaders(head, contentLength);
-         if (status != 200) { out.close(); SD.remove(TempPath); ReturnToMenu(HttpStatus, status); }
-         inBody = true;
-         // What of this read lies past the header block is body.
-         size_t consumedBefore = headLen - take;
-         body = buf + (headerBytes - consumedBefore);
-         bodyLen = ret - (headerBytes - consumedBefore);
-      }
-      if (bodyLen && out.write(body, bodyLen) != bodyLen) { out.close(); SD.remove(TempPath); ReturnToMenu(FileWrite, bodyBytes); }
-      bodyBytes += bodyLen;
+      if (++hops > MaxRedirects) ReturnToMenu(Redirect, 0);
    }
-   out.close();
-
-   // Without close_notify or a Content-Length to check against, a cut connection
-   // looks the same as a complete body, so neither is taken as complete.
-   bool complete = inBody && (contentLength >= 0 ? bodyBytes == (uint32_t)contentLength : closeNotify);
-   if (!complete) { SD.remove(TempPath); ReturnToMenu(Truncated, bodyBytes); }
 
    SD.remove(OutPath);
    if (!SD.rename(TempPath, OutPath)) ReturnToMenu(Rename, bodyBytes);
