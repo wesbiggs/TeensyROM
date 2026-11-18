@@ -67,7 +67,7 @@ const VmHostId vmHostId = { VM_HOSTID_MAGIC, VM_ABI, 0, 0, "TLS spike", VM_HOST_
 // arena at runtime: the host linker script refuses RAM2 globals, and the host
 // heap is 16 KiB of DTCM. Everything stays below VM_FAIL_BASE.
 static constexpr uint32_t Ram2Base    = 0x20200000u;
-static constexpr uint32_t NetHeapSize = 64 * 1024;
+static constexpr uint32_t NetHeapSize = 128 * 1024;   // holds RecvWindow of queued segments
 static constexpr uint32_t TlsHeapSize = 160 * 1024;
 static_assert(Ram2Base + NetHeapSize + TlsHeapSize <= VM_FAIL_BASE, "RAM2 carve-out reaches the fail record");
 
@@ -86,7 +86,11 @@ static constexpr char OutDir[]        = "/tls/";
 static constexpr const char *DefaultName = "download.bin";
 static constexpr size_t MaxNameLen = 255;   // a FAT long file name
 static constexpr uint32_t IoTimeoutMs = 20000;
-static constexpr size_t SocketSize = 2048;   // EthernetClient::read narrows its count to int16_t
+static constexpr uint32_t ConnectTimeoutMs = 10000;
+// TCP keeps at most this much unread data in flight, so it caps throughput at
+// RecvWindow per round trip: NativeEthernet's 2 KiB default held a 23 ms path
+// to 88 KB/s.
+static constexpr fnet_uint32_t RecvWindow = 32 * 1024;
 static constexpr size_t LineSize = sizeof(Url::path) + 256;   // the request, or one header line
 static constexpr size_t MaxHeadBytes = 32 * 1024;
 static constexpr uint8_t MaxRedirects = 5;
@@ -156,27 +160,64 @@ FLASHMEM static int TrngEntropy(void *, unsigned char *out, size_t len)
    return 0;
 }
 
-FLASHMEM static int NetSend(void *ctx, const unsigned char *buf, size_t len)
+// The TLS connection uses an FNET socket directly rather than EthernetClient,
+// which sets the receive buffer to its own socket size before it connects, and
+// FNET sizes the TCP window from that buffer when the connection opens.
+FLASHMEM static fnet_socket_t TcpConnect(IPAddress ip, uint16_t port)
 {
-   EthernetClient *client = (EthernetClient *)ctx;
-   if (!client->connected()) return MBEDTLS_ERR_SSL_CONN_EOF;
-   size_t sent = client->write(buf, len);
-   return sent ? (int)sent : MBEDTLS_ERR_SSL_CONN_EOF;
+   fnet_socket_t sock = fnet_socket(AF_INET, SOCK_STREAM, 0);
+   if (!sock) return nullptr;
+   const fnet_int32_t noDelay = 1;
+   fnet_socket_setopt(sock, SOL_SOCKET, SO_RCVBUF, &RecvWindow, sizeof(RecvWindow));
+   fnet_socket_setopt(sock, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
+   struct fnet_sockaddr_in addr;
+   memset(&addr, 0, sizeof(addr));
+   addr.sin_family = AF_INET;
+   addr.sin_port = FNET_HTONS(port);
+   addr.sin_addr.s_addr = (uint32_t)ip;
+   if (fnet_socket_connect(sock, (struct fnet_sockaddr *)&addr, sizeof(addr)) != FNET_ERR)
+   {
+      uint32_t start = millis();
+      while (millis() - start < ConnectTimeoutMs)
+      {
+         fnet_socket_state_t state;
+         fnet_size_t size = sizeof(state);
+         if (fnet_socket_getopt(sock, SOL_SOCKET, SO_STATE, &state, &size) == FNET_ERR) break;
+         if (state == SS_CONNECTED) return sock;
+         if (state != SS_CONNECTING) break;
+         yield();
+      }
+   }
+   fnet_socket_close(sock);
+   return nullptr;
 }
 
-FLASHMEM static int NetRecv(void *ctx, unsigned char *buf, size_t len)
+FLASHMEM static int NetSend(void *ctx, const unsigned char *buf, size_t len)
 {
-   EthernetClient *client = (EthernetClient *)ctx;
    uint32_t start = millis();
-   while (client->available() <= 0)
+   while (true)
    {
-      if (!client->connected()) return 0;   // EOF; mbedTLS reports it as CONN_EOF
+      fnet_ssize_t sent = fnet_socket_send((fnet_socket_t)ctx, buf, len, 0);
+      if (sent == FNET_ERR) return MBEDTLS_ERR_SSL_CONN_EOF;
+      if (sent > 0) return (int)sent;
       if (millis() - start > IoTimeoutMs) return MBEDTLS_ERR_SSL_TIMEOUT;
       yield();
    }
-   if (len > SocketSize) len = SocketSize;
-   int got = client->read(buf, len);
-   return got > 0 ? got : MBEDTLS_ERR_SSL_WANT_READ;
+}
+
+// FNET's recv returns 0 while nothing has arrived and an error once the peer
+// has closed and everything it sent has been read.
+FLASHMEM static int NetRecv(void *ctx, unsigned char *buf, size_t len)
+{
+   uint32_t start = millis();
+   while (true)
+   {
+      fnet_ssize_t got = fnet_socket_recv((fnet_socket_t)ctx, buf, len, 0);
+      if (got == FNET_ERR) return 0;   // EOF; mbedTLS reports it as CONN_EOF
+      if (got > 0) return (int)got;
+      if (millis() - start > IoTimeoutMs) return MBEDTLS_ERR_SSL_TIMEOUT;
+      yield();
+   }
 }
 
 // Host and path go into the request as they are, so a CR or LF in a Location
@@ -252,8 +293,10 @@ FLASHMEM static bool EthernetUp()
    uint16_t timeout;
    EEPROM.get(eepAdDHCPTimeout, timeout);
    Ethernet.setStackHeap((uint8_t *)Ram2Base, NetHeapSize);
-   Ethernet.setSocketNum(2);
-   Ethernet.setSocketSize(SocketSize);
+   // NativeEthernet's own sockets go unused (DNS runs on FNET's resolver), but
+   // begin() allocates their buffers on the 16 KiB host heap regardless.
+   Ethernet.setSocketNum(1);
+   Ethernet.setSocketSize(512);
    if (EEPROM.read(eepAdDHCPEnabled))
    {
       uint16_t respTimeout;
@@ -311,13 +354,8 @@ FLASHMEM static void FailBody(File &out, Stage stage, uint32_t value)
 FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, uint32_t &bodyBytes, uint32_t &bodyMs)
 {
    LogHost(url.host);
-   // A new client per connection: EthernetClient counts unread bytes in
-   // _remaining, which neither stop() nor connect() clears, so a reused client
-   // hands the next connection's first reads the bytes the last one left unread.
-   EthernetClient client;
-   // Resolved here rather than by connect(host, port), which returns the same 0
-   // for a failed lookup and a failed connection. Connect's value is the time
-   // it took, which tells a refusal from the 10 s connect timeout.
+   // Connect's value is the time it took, which tells a refusal from the
+   // 10 s connect timeout.
    IPAddress remote;
    DNSClient dns;
    dns.begin(Ethernet.dnsServerIP());
@@ -325,7 +363,8 @@ FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, ui
    if (!dns.getHostByName(url.host, remote)) ReturnToMenu(Dns, millis() - start);
    LogTime("dns", millis() - start, 0);
    start = millis();
-   if (!client.connect(remote, url.port)) ReturnToMenu(Connect, millis() - start);
+   fnet_socket_t sock = TcpConnect(remote, url.port);
+   if (!sock) ReturnToMenu(Connect, millis() - start);
    LogTime("connect", millis() - start, 0);
    start = millis();
 
@@ -334,7 +373,7 @@ FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, ui
    int ret = mbedtls_ssl_setup(&ssl, &conf);
    if (ret == 0) ret = mbedtls_ssl_set_hostname(&ssl, url.host);
    if (ret != 0) ReturnToMenu(TlsSetup, -ret);
-   mbedtls_ssl_set_bio(&ssl, &client, NetSend, NetRecv, nullptr);
+   mbedtls_ssl_set_bio(&ssl, sock, NetSend, NetRecv, nullptr);
 
    while ((ret = mbedtls_ssl_handshake(&ssl)) != 0)
    {
@@ -365,7 +404,7 @@ FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, ui
    size_t lineLen = 0, headBytes = 0;
    File out;
    bodyBytes = 0;
-   unsigned char buf[1024];
+   unsigned char buf[4096];
    while (true)
    {
       ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf));
@@ -406,7 +445,7 @@ FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, ui
             if (!location) ReturnToMenu(Redirect, status);
             mbedtls_ssl_close_notify(&ssl);
             mbedtls_ssl_free(&ssl);
-            client.stop();
+            fnet_socket_close(sock);
             return false;
          }
          if (status != 200) ReturnToMenu(HttpStatus, status);
