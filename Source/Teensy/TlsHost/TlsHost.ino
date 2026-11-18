@@ -440,6 +440,8 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
       if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
       if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) { closeNotify = true; break; }
       if (ret == 0 || ret == MBEDTLS_ERR_SSL_CONN_EOF) { eof = true; break; }
+      // A reset after the last byte still leaves a Content-Length body complete.
+      if (ret == NetReset) break;
       if (ret == MBEDTLS_ERR_SSL_TIMEOUT) FAIL(ReadTimeout, bodyBytes);
       if (ret < 0) FAIL(Response, -ret);
 
