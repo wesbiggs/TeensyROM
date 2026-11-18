@@ -135,7 +135,7 @@ FLASHMEM void ReturnToMenu(uint8_t stage, uint32_t value)
 static constexpr uint8_t ClientBank = 58;
 static constexpr uint8_t RowPacket = 1;
 static constexpr uint8_t KeyProtocol = 0x82;
-static volatile bool LinkActive, ClientStarted;
+static volatile bool LinkActive, ClientStarted, Repaint;
 static volatile uint8_t Keys[32];
 static volatile uint8_t KeyHead, KeyTail;
 
@@ -150,7 +150,9 @@ bool VMHostIO2(uint8_t address, bool read)
    TraceLogAddValidData(value);
    if (address == 0xf6 || (address >= 0xf8 && address <= 0xfa) || address >= 0xfd) EZFlashRAM[address] = value;
    if (address != 0xf4) return true;
-   if (value == 1) ClientStarted = true;
+   // A start after the first is the client starting over (RESTORE runs its
+   // cold start again) with a blank screen: everything is sent again.
+   if (value == 1) { Repaint = ClientStarted; ClientStarted = true; }
    if (value != 3 || !EZFlashRAM[0xfe] || EZFlashRAM[0xfe] == EZFlashRAM[0xfc] || EZFlashRAM[0xfd] != KeyProtocol) return true;
    if ((0xa5 ^ EZFlashRAM[0xf8] ^ EZFlashRAM[0xf9] ^ EZFlashRAM[0xfa] ^ EZFlashRAM[0xfd] ^ EZFlashRAM[0xfe]) != EZFlashRAM[0xff]) return true;
    const uint8_t next = (KeyHead + 1) % sizeof(Keys);
@@ -186,6 +188,7 @@ FLASHMEM static void LinkService()
    using namespace Link;
    if (!LinkActive || !ClientStarted) return;
    EZFlashRAM[0xf5] = 2;
+   if (Repaint) { Repaint = false; pending = false; Dirty = (1u << 25) - 1; }
    if (pending && EZFlashRAM[0xf6] == sequence) pending = false;
    if (pending || !Dirty) return;
    const uint8_t row = __builtin_ctz(Dirty);

@@ -73,11 +73,15 @@ coldstart:
         sta $D021
         sta lastseq
         sta pending
-        sta token
 
-        ; Open the host window, then ask the host to start.
+        ; Open the host window, then ask the host to start. RESTORE lands here
+        ; too, through the KERNAL's NMI handler finding CBM80, with the host
+        ; still running: the token then starts from the last one it took, or
+        ; no key would get through again, and the start tells it to repaint.
         lda #HOSTBANK
         sta $DE00
+        lda TAKEN
+        sta token
         lda #1
         sta CMD
 
