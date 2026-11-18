@@ -36,6 +36,7 @@
 #include "Common/VMHostABI.h"
 #include "Common/VMFail.h"
 #include "Common/NativeEthernet/src/NativeEthernet.h"
+#include "Common/NativeEthernet/src/NativeDns.h"
 #include "TlsUrl.h"
 #include "third_party/mbedtls-2.12.0/src/mbedtls/platform.h"
 #include "third_party/mbedtls-2.12.0/src/mbedtls/ssl.h"
@@ -70,6 +71,7 @@ enum Stage : uint8_t {
    Connect, TlsSetup, Handshake, Verify, Request, Response, HttpStatus, FileWrite,
    ReadTimeout, Truncated, Rename,
    Redirect,   // value: the status whose Location was missing or refused, or 0 for too many hops
+   Dns,        // value: milliseconds the lookup took to fail
 };
 
 static constexpr const char *UrlPath  = "/tls/url.txt";
@@ -260,7 +262,16 @@ FLASHMEM static void FailBody(File &out, Stage stage, uint32_t value)
 FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, uint32_t &bodyBytes)
 {
    static EthernetClient client;
-   if (!client.connect(url.host, url.port)) ReturnToMenu(Connect, url.port);
+   // Resolved here rather than by connect(host, port), which returns the same 0
+   // for a failed lookup and a failed connection. Connect's value is the time
+   // it took, which tells a refusal from the 10 s connect timeout.
+   IPAddress remote;
+   DNSClient dns;
+   dns.begin(Ethernet.dnsServerIP());
+   uint32_t start = millis();
+   if (!dns.getHostByName(url.host, remote)) ReturnToMenu(Dns, millis() - start);
+   start = millis();
+   if (!client.connect(remote, url.port)) ReturnToMenu(Connect, millis() - start);
 
    mbedtls_ssl_context ssl;
    mbedtls_ssl_init(&ssl);
