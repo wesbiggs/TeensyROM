@@ -44,9 +44,9 @@
 //   --host-tls  with --host-sketch only: link mbedTLS into the host, for a host that makes
 //            TLS connections itself. FNET_CFG_TLS stays 0, so FNET's own TLS layer and its
 //            test credentials stay out; the host calls mbedTLS directly. mbedTLS gets its
-//            memory from a buffer the host hands it (MBEDTLS_MEMORY_BUFFER_ALLOC_C), since
-//            the host heap is 16 KiB, and FNET's code runs from flash, since ITCM cannot
-//            hold it. The stock images and the stock host never take this.
+//            memory from a buffer the host hands it, since the host heap is 16 KiB, and
+//            FNET's code runs from flash, since ITCM cannot hold it. HostTlsConfig.h in
+//            MinimalBoot/Common holds the mbedTLS settings. The stock images and the stock host never take this.
 //   --tag <name>  a special build. The name goes on the version string in every image
 //            ("TeensyROM+ v0.9-pr65" on the C64 banner and in the serial version reply) and
 //            into the output names (TeensyROM+_0.9-pr65_full.hex). Letters, digits, '.'
@@ -455,9 +455,10 @@ if (useCcache) {
 // behind an #ifndef), which links mbedTLS into MinimalBoot and the main image. build()
 // appends this to every image it compiles, the extension host included.
 const TLS_OFF = '-DFNET_CFG_TLS=0';
-// --host-tls: the two mbedTLS options FNET's config.h leaves off, which let the host give
-// mbedTLS a buffer of its own instead of the 16 KiB host heap.
-const HOST_TLS_DEFS = ' -DMBEDTLS_PLATFORM_MEMORY -DMBEDTLS_MEMORY_BUFFER_ALLOC_C';
+// --host-tls: mbedTLS settings over FNET's config.h. Forward slashes, since the path
+// becomes a C string literal, where a Windows '\' would be an escape.
+const HOST_TLS_CONFIG = path.join(root, 'Source/Teensy/MinimalBoot/Common/HostTlsConfig.h').replace(/\\/g, '/');
+const HOST_TLS_DEFS = ` '-DMBEDTLS_USER_CONFIG_FILE="${HOST_TLS_CONFIG}"'`;
 
 // `suffix` picks a stock BootLinkerFiles pair; `ld`/`bootdata` override it with
 // generated text, which is how the extension image gets its own flash slot.
