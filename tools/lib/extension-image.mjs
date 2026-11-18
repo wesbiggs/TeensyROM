@@ -95,10 +95,18 @@ export function extensionLinkerScript(linkers, hostCodeKiB = DEFAULT_HOST_CODE_K
   // .text.progmem precedes .text.itcm, so ld places these here before
   // .text.itcm's own *(.text*) can claim them.
   ld = replaceOnce(ld, '\t\t*(.progmem*)\n', '\t\t*(.progmem*)\n' +
-    Object.entries(FLASH_RESIDENT_LIBRARIES).map(([name, staying]) =>
-      `\t\t*${PATH_SEPARATOR}libraries${PATH_SEPARATOR}${name}${PATH_SEPARATOR}*(` +
-      (staying.length ? `EXCLUDE_FILE(${staying.map((file) => `*${PATH_SEPARATOR}${file}`).join(' ')}) ` : '') +
-      '.text*)\n').join(''));
+    // Each library gets a rule for its loose objects and one for the same objects inside
+    // an archive. arduino-cli links each library's objects through an objs.a of its own
+    // once the link command would grow too long, and ld matches an archive member only by
+    // the archive:member form, so without the second rule every library here would
+    // silently land in ITCM, SdioTeensy's exclusion included.
+    Object.entries(FLASH_RESIDENT_LIBRARIES).map(([name, staying]) => {
+      const dir = `*${PATH_SEPARATOR}libraries${PATH_SEPARATOR}${name}${PATH_SEPARATOR}*`;
+      const exclude = (prefix) => staying.length
+        ? `EXCLUDE_FILE(${staying.map((file) => `${prefix}${file}`).join(' ')}) ` : '';
+      return `\t\t${dir}(${exclude(`*${PATH_SEPARATOR}`)}.text*)\n` +
+        `\t\t${dir}:*(${exclude('*:')}.text*)\n`;
+    }).join(''));
   // Pin the host to six 32 KiB ITCM blocks, so the module window at 0x18000
   // cannot be pushed around by a change in host code size.
   ld = replaceOnce(ld, '_itcm_block_count = (SIZEOF(.text.itcm) + SIZEOF(.ARM.exidx) + 0x7FFF) >> 15;',
