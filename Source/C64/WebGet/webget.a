@@ -19,9 +19,11 @@
 ;
 ; Packet type 1 paints a row: payload[0] screen row, payload[1] colour,
 ; payload[2..41] 40 screen codes. Input protocol $82 carries one PETSCII key in
-; the first byte. A key is sent only once $DFFC shows the host took the last
-; one, so keys typed while the host is busy wait in the KERNAL's buffer rather
-; than overwrite each other.
+; the first byte. A new key is sent only once $DFFC shows the host took the
+; last one, so keys typed while the host is busy wait in the KERNAL's buffer
+; rather than overwrite each other.
+;
+; It runs from RAM with the cartridge switched off; coldstart says why.
 
 HOSTBANK   = 58
 IO2        = $DF00
@@ -31,12 +33,13 @@ ACK        = $DFF6
 SEQ        = $DFF7
 FAILCODE   = $DFFB
 TAKEN      = $DFFC
+CARTOFF    = $80          ; $DE02: LED on, GAME and EXROM released, no cartridge
 
 SCREEN     = $0400
 COLOUR     = $D800
 GETIN      = $FFE4
 
-; Free RAM once the cartridge cold start has run.
+; Free RAM once the cartridge cold start has run, clear of the copy at $8000.
 packetbuf  = $C000        ; 238 bytes
 total      = $C100
 crcn       = $C101
@@ -51,9 +54,16 @@ cptr       = $FD
 ; ---------------------------------------------------------------- ROML $8000
 * = $8000
         !word coldstart
-        !word coldstart
+        !word warmstart          ; RESTORE: the KERNAL's NMI handler finds CBM80
         !byte $C3, $C2, $CD, $38, $30    ; CBM80
 
+; The host's PHI2 interrupt is sometimes several microseconds late while it
+; downloads (flash stalls in mbedTLS and FNET), and a cartridge ROM fetch it
+; answers late gives the 6502 garbage. So the client copies itself into the RAM
+; under ROML and switches the cartridge off: from then on the C64 fetches
+; nothing from the Teensy, and only the $DF00 link depends on it, which
+; tolerates a lost or garbled access (see main and pollKeys). The copy keeps
+; CBM80, so RESTORE still lands in warmstart.
 coldstart:
         sei
         ; The KERNAL jumps straight here on finding the cartridge, before it has
@@ -62,6 +72,35 @@ coldstart:
         jsr $FD50                ; RAMTAS
         jsr $FD15                ; RESTOR
         jsr $FF5B                ; CINT
+        ; Writes to $8000-$9FFF reach the RAM under ROML.
+        lda #$80
+        sta ptr + 1
+        ldy #0
+        sty ptr
+copyRom:
+        lda (ptr), y
+        sta (ptr), y
+        iny
+        bne copyRom
+        inc ptr + 1
+        lda ptr + 1
+        cmp #$A0
+        bne copyRom
+        ; The next fetch comes from the copy, at the same address.
+        lda #CARTOFF
+        sta $DE02
+        jmp start
+
+warmstart:
+        sei
+        ldx #$FF
+        txs
+        cld
+        jsr $FD15                ; RESTOR
+        jsr $FDA3                ; IOINIT
+        jsr $FF5B                ; CINT
+
+start:
         cli
         lda #$17                 ; lower/upper case set: URLs are mostly lower case
         sta $D018
@@ -74,30 +113,38 @@ coldstart:
         sta lastseq
         sta pending
 
-        ; Open the host window, then ask the host to start. RESTORE lands here
-        ; too, through the KERNAL's NMI handler finding CBM80, with the host
-        ; still running: the token then starts from the last one it took, or
-        ; no key would get through again, and the start tells it to repaint.
+        ; Open the host window, then ask the host to start. After RESTORE the
+        ; host is still running: the token then starts from the last one it
+        ; took, or no key would get through again, and the start tells it to
+        ; repaint.
         lda #HOSTBANK
         sta $DE00
+readToken:
         lda TAKEN
+        cmp TAKEN
+        bne readToken
         sta token
         lda #1
         sta CMD
 
+; Every write the host must see is repeated until it shows it saw it, and a
+; register that decides anything is read twice: a late PHI2 interrupt loses a
+; write or garbles a read, and packets carry their own CRC.
 main:
+        lda #HOSTBANK
+        sta $DE00
+        lda #CARTOFF
+        sta $DE02
         lda STATUS
+        cmp STATUS
+        bne main
         cmp #$E0
         bne running
         jmp failed
 running:
-        ; A write the host's PHI2 interrupt was too late for is lost (see
-        ; NetPollFromLoop in TlsHost.ino), so the start and the ACK are repeated:
-        ; the start until the host reports running, the ACK on every pass. Both
-        ; are harmless to repeat.
         cmp #2
         beq started
-        lda #1
+        lda #1                   ; the start until the host reports running
         sta CMD
 started:
         lda SEQ
@@ -109,7 +156,7 @@ started:
         lda packetbuf + 4        ; the sequence the packet itself carries
         sta lastseq
 noPacket:
-        lda lastseq
+        lda lastseq              ; the ACK on every pass
         sta ACK
         jsr pollKeys
         jmp main
@@ -220,20 +267,22 @@ crcNext:
         rts
 
 ; ---- Keys -----------------------------------------------------------------
+; A record the host has not taken, by $DFFC, is written again whole: a lost
+; write to any of its bytes fails the checksum, so raising the command alone
+; would never get it through.
 pollKeys:
         lda TAKEN
+        cmp TAKEN
+        bne keysDone             ; read twice
         cmp token
-        beq linkFree
-        lda #3                   ; the host has not taken the last key: offer it again
-        sta CMD
-        rts
-linkFree:
+        bne sendRecord
         jsr GETIN
         beq keysDone
         sta pending
-
-        ; Build the whole record before raising the command: the host ignores
-        ; one whose token repeats or whose checksum does not match.
+        inc token
+        bne sendRecord
+        inc token                ; zero means "no input", so skip it
+sendRecord:
         lda pending
         sta $DFF8                ; key
         lda #0
@@ -241,10 +290,6 @@ linkFree:
         sta $DFFA
         lda #$82
         sta $DFFD                ; protocol: one PETSCII key
-        inc token
-        bne tokenOk
-        inc token                ; zero means "no input", so skip it
-tokenOk:
         lda token
         sta $DFFE
         lda #$A5
@@ -254,8 +299,6 @@ tokenOk:
         sta $DFFF                ; checksum
         lda #3
         sta CMD
-        lda #0
-        sta pending
 keysDone:
         rts
 
