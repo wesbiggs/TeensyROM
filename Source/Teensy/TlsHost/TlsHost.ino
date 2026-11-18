@@ -1,26 +1,25 @@
 // SPDX-License-Identifier: MIT
 //
-// TLS spike: an extension host that fetches one HTTPS URL to the SD card.
+// TLS spike: an extension host that fetches a list of HTTPS URLs to the SD card.
 //
-// It exists to answer whether Ethernet plus mbedTLS fits a TR+ host image and
-// completes a verified handshake, before any downloader is designed. Inputs are
-// two files on the SD card:
+// Inputs are two files on the SD card:
 //
-//   /tls/url.txt   one line, https://host[:port]/path
-//   /tls/ca.pem    the PEM root certificate(s) that may sign the server's chain
+//   /tls/urls.txt  one https://host[:port]/path per line; blank lines and lines
+//                  starting with '#' are skipped
+//   /tls/ca.pem    the PEM root certificate(s) that may sign the servers' chains
 //
-// It follows up to five redirects to other https:// URLs, so url.txt can hold a
-// stable link such as a GitHub release download, whose signed target expires in
-// minutes. It writes the response body to /tls/download.tmp and renames it to
-// /tls/<name> only once the whole body has arrived, where <name> is the last
-// segment of url.txt's path, query and fragment removed. A URL whose path ends
-// in '/', or whose last segment is no FAT long name, saves as download.bin. The result comes back
-// on the C64 menu as `extension host returned ($50/<detail>)`, where detail is
-// (stage << 24) | value; stage 0 is success with value = the milliseconds the
-// body took to arrive. The stages are the Stage enum below. /tls/timing.txt gets
-// one "<phase> <ms> <extra>" line per phase: boot, setup and total give millis()
-// since power-on, the rest durations; head's extra is the HTTP status, body's
-// the bytes, total's the stage. A "host <name>" line opens each connection.
+// Each URL follows up to five redirects to other https:// URLs, so a line can
+// hold a stable link such as a GitHub release download, whose signed target
+// expires in minutes. Its body goes to /tls/download.tmp and is renamed to
+// /tls/<name> only once all of it has arrived, where <name> is the last segment
+// of the line's path, query and fragment removed. A URL whose path ends in '/',
+// or whose last segment is no FAT long name, saves as download.bin.
+//
+// A failed URL is skipped and the rest are still tried. /tls/results.txt gets
+// one "$<stage> <value> <ms> <url>" line per URL, value being the bytes saved on
+// success. The menu shows `extension host returned ($50/<detail>)`, where detail
+// is (stage << 24) | value: the first failure's, or stage 0 with the number of
+// files saved. The stages are the Stage enum below.
 //
 // Build and install:
 //
@@ -79,7 +78,9 @@ enum Stage : uint8_t {
    Dns,        // value: milliseconds the lookup took to fail
 };
 
-static constexpr const char *UrlPath  = "/tls/url.txt";
+static constexpr const char *UrlsPath = "/tls/urls.txt";
+static constexpr const char *ResultsPath = "/tls/results.txt";
+static constexpr size_t MaxUrlsBytes = 16 * 1024;
 static constexpr const char *CaPath   = "/tls/ca.pem";
 static constexpr const char *TempPath = "/tls/download.tmp";
 static constexpr char OutDir[]        = "/tls/";
@@ -94,35 +95,8 @@ static constexpr fnet_uint32_t RecvWindow = 32 * 1024;
 static constexpr size_t LineSize = sizeof(Url::path) + 256;   // the request, or one header line
 static constexpr size_t MaxHeadBytes = 32 * 1024;
 static constexpr uint8_t MaxRedirects = 5;
-static constexpr const char *TimingPath = "/tls/timing.txt";
-
-// Each phase's milliseconds, written to TimingPath on the way back to the menu,
-// whatever the outcome, once the SD card is up.
-static char Timing[1024];
-static size_t TimingLen;
-static bool SdReady;
-
-FLASHMEM static void LogTime(const char *phase, uint32_t ms, uint32_t extra)
-{
-   int n = snprintf(Timing + TimingLen, sizeof(Timing) - TimingLen, "%s %lu %lu\n", phase, (unsigned long)ms, (unsigned long)extra);
-   if (n > 0) TimingLen = min(TimingLen + n, sizeof(Timing) - 1);
-}
-
-FLASHMEM static void LogHost(const char *host)
-{
-   int n = snprintf(Timing + TimingLen, sizeof(Timing) - TimingLen, "host %s\n", host);
-   if (n > 0) TimingLen = min(TimingLen + n, sizeof(Timing) - 1);
-}
-
 FLASHMEM void ReturnToMenu(uint8_t stage, uint32_t value)
 {
-   if (SdReady)
-   {
-      LogTime("total", millis(), stage);
-      SD.remove(TimingPath);
-      File f = SD.open(TimingPath, FILE_WRITE);
-      if (f) { f.write(Timing, TimingLen); f.close(); }
-   }
    VmFail::set(VmFail::HostReturned, ((uint32_t)stage << 24) | (value & 0xFFFFFF));
    EEPROM.write(VM_EEP_BOOTIND_ADDR, VM_BOOT_FROM_MIN);
    delay(10);
@@ -228,7 +202,7 @@ FLASHMEM static bool Printable(const char *text)
    return true;
 }
 
-// The file the body is saved as, named for the last segment of url.txt's path.
+// The file the body is saved as, named for the last segment of the URL's path.
 // That is the name a user asked for: a redirect target, such as a GitHub
 // release asset's, ends in an opaque identifier.
 FLASHMEM static void OutputPath(const Url &url, char *path)
@@ -342,55 +316,61 @@ FLASHMEM static bool ResolveLocation(const char *value, Url &url)
    return true;
 }
 
-FLASHMEM static void FailBody(File &out, Stage stage, uint32_t value)
+// What one connection holds, released however the exchange ends: a failed
+// download leaves no temp file, socket or TLS buffers behind for the next one.
+struct Connection
+{
+   fnet_socket_t sock = nullptr;
+   mbedtls_ssl_context ssl;
+   File out;
+   Connection() { mbedtls_ssl_init(&ssl); }
+   ~Connection();
+};
+
+FLASHMEM Connection::~Connection()
 {
    if (out) { out.close(); SD.remove(TempPath); }
-   ReturnToMenu(stage, value);
+   mbedtls_ssl_free(&ssl);
+   if (sock) fnet_socket_close(sock);
 }
+#define FAIL(s, v) do { result = Result{ (s), (uint32_t)(v) }; return Failed; } while (0)
 
-// One GET on a fresh connection. Returns true once the body is in TempPath, with
-// its size in `bodyBytes`, or false for a redirect, with `url` now its target.
+// One GET on a fresh connection. Fetched leaves the body in TempPath with its
+// size in `bodyBytes`; Redirected leaves `url` at the redirect's target.
 // `line` (LineSize bytes) holds the request and then each header line in turn.
-FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, uint32_t &bodyBytes, uint32_t &bodyMs)
+FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line, uint32_t &bodyBytes, Result &result)
 {
-   LogHost(url.host);
-   // Connect's value is the time it took, which tells a refusal from the
-   // 10 s connect timeout.
+   Connection c;
    IPAddress remote;
    DNSClient dns;
    dns.begin(Ethernet.dnsServerIP());
+   // Dns's and Connect's values are the milliseconds they took, which tells a
+   // refusal from a timeout.
    uint32_t start = millis();
-   if (!dns.getHostByName(url.host, remote)) ReturnToMenu(Dns, millis() - start);
-   LogTime("dns", millis() - start, 0);
+   if (!dns.getHostByName(url.host, remote)) FAIL(Dns, millis() - start);
    start = millis();
-   fnet_socket_t sock = TcpConnect(remote, url.port);
-   if (!sock) ReturnToMenu(Connect, millis() - start);
-   LogTime("connect", millis() - start, 0);
-   start = millis();
+   c.sock = TcpConnect(remote, url.port);
+   if (!c.sock) FAIL(Connect, millis() - start);
 
-   mbedtls_ssl_context ssl;
-   mbedtls_ssl_init(&ssl);
-   int ret = mbedtls_ssl_setup(&ssl, &conf);
-   if (ret == 0) ret = mbedtls_ssl_set_hostname(&ssl, url.host);
-   if (ret != 0) ReturnToMenu(TlsSetup, -ret);
-   mbedtls_ssl_set_bio(&ssl, sock, NetSend, NetRecv, nullptr);
+   int ret = mbedtls_ssl_setup(&c.ssl, &conf);
+   if (ret == 0) ret = mbedtls_ssl_set_hostname(&c.ssl, url.host);
+   if (ret != 0) FAIL(TlsSetup, -ret);
+   mbedtls_ssl_set_bio(&c.ssl, c.sock, NetSend, NetRecv, nullptr);
 
-   while ((ret = mbedtls_ssl_handshake(&ssl)) != 0)
+   while ((ret = mbedtls_ssl_handshake(&c.ssl)) != 0)
    {
-      if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) ReturnToMenu(Verify, mbedtls_ssl_get_verify_result(&ssl));
-      if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) ReturnToMenu(Handshake, -ret);
+      if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) FAIL(Verify, mbedtls_ssl_get_verify_result(&c.ssl));
+      if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) FAIL(Handshake, -ret);
    }
-   LogTime("handshake", millis() - start, 0);
-   start = millis();
 
    int reqLen = snprintf(line, LineSize,
       "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: TeensyROM\r\nConnection: close\r\n\r\n", url.path, url.host);
-   if (reqLen <= 0 || reqLen >= (int)LineSize) ReturnToMenu(Request, 0);
+   if (reqLen <= 0 || reqLen >= (int)LineSize) FAIL(Request, 0);
    for (int off = 0; off < reqLen; )
    {
-      ret = mbedtls_ssl_write(&ssl, (const unsigned char *)line + off, reqLen - off);
+      ret = mbedtls_ssl_write(&c.ssl, (const unsigned char *)line + off, reqLen - off);
       if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-      if (ret <= 0) ReturnToMenu(Request, -ret);
+      if (ret <= 0) FAIL(Request, -ret);
       off += ret;
    }
 
@@ -402,26 +382,25 @@ FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, ui
    int32_t contentLength = -1;
    bool location = false, overflow = false, inBody = false, closeNotify = false;
    size_t lineLen = 0, headBytes = 0;
-   File out;
    bodyBytes = 0;
    unsigned char buf[4096];
    while (true)
    {
-      ret = mbedtls_ssl_read(&ssl, buf, sizeof(buf));
+      ret = mbedtls_ssl_read(&c.ssl, buf, sizeof(buf));
       if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
       if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) { closeNotify = true; break; }
       if (ret == 0 || ret == MBEDTLS_ERR_SSL_CONN_EOF) break;
-      if (ret == MBEDTLS_ERR_SSL_TIMEOUT) FailBody(out, ReadTimeout, bodyBytes);
-      if (ret < 0) FailBody(out, Response, -ret);
+      if (ret == MBEDTLS_ERR_SSL_TIMEOUT) FAIL(ReadTimeout, bodyBytes);
+      if (ret < 0) FAIL(Response, -ret);
 
       size_t at = 0;
       while (!inBody && at < (size_t)ret)
       {
-         char c = buf[at++];
-         if (++headBytes > MaxHeadBytes) ReturnToMenu(Response, headBytes);
-         if (c != '\n')
+         char ch = buf[at++];
+         if (++headBytes > MaxHeadBytes) FAIL(Response, headBytes);
+         if (ch != '\n')
          {
-            if (lineLen < LineSize - 1) line[lineLen++] = c; else overflow = true;
+            if (lineLen < LineSize - 1) line[lineLen++] = ch; else overflow = true;
             continue;
          }
          while (lineLen && strchr("\r \t", line[lineLen - 1])) lineLen--;
@@ -429,7 +408,7 @@ FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, ui
          if (status == 0)
          {
             status = ParseStatus(line);
-            if (status == 0) ReturnToMenu(Response, 0);
+            if (status == 0) FAIL(Response, 0);
          }
          else if (lineLen == 0) inBody = true;
          else if (strncasecmp(line, "Content-Length:", 15) == 0) contentLength = strtol(line + 15, nullptr, 10);
@@ -438,60 +417,79 @@ FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, ui
          overflow = false;
          if (!inBody) continue;
 
-         LogTime("head", millis() - start, status);
-         start = millis();
          if (IsRedirect(status))
          {
-            if (!location) ReturnToMenu(Redirect, status);
-            mbedtls_ssl_close_notify(&ssl);
-            mbedtls_ssl_free(&ssl);
-            fnet_socket_close(sock);
-            return false;
+            if (!location) FAIL(Redirect, status);
+            mbedtls_ssl_close_notify(&c.ssl);
+            return Redirected;
          }
-         if (status != 200) ReturnToMenu(HttpStatus, status);
+         if (status != 200) FAIL(HttpStatus, status);
          SD.remove(TempPath);
-         out = SD.open(TempPath, FILE_WRITE);
-         if (!out) ReturnToMenu(FileWrite, 0);
+         c.out = SD.open(TempPath, FILE_WRITE);
+         if (!c.out) FAIL(FileWrite, 0);
       }
       size_t bodyLen = ret - at;
-      if (bodyLen && out.write(buf + at, bodyLen) != bodyLen) FailBody(out, FileWrite, bodyBytes);
+      if (bodyLen && c.out.write(buf + at, bodyLen) != bodyLen) FAIL(FileWrite, bodyBytes);
       bodyBytes += bodyLen;
    }
 
    // Without close_notify or a Content-Length to check against, a cut connection
    // looks the same as a complete body, so neither is taken as complete.
    bool complete = inBody && (contentLength >= 0 ? bodyBytes == (uint32_t)contentLength : closeNotify);
-   if (!complete) FailBody(out, Truncated, bodyBytes);
-   out.close();
-   bodyMs = millis() - start;
-   LogTime("body", bodyMs, bodyBytes);
-   return true;
+   if (!complete) FAIL(Truncated, bodyBytes);
+   c.out.close();
+   return Fetched;
+}
+
+// One URL from urls.txt, through its redirects, to its file on the card.
+// Success's value is the bytes saved.
+FLASHMEM static Result Download(const char *text, mbedtls_ssl_config &conf, char *line)
+{
+   static Url url;
+   if (!ParseUrl(text, url)) return Result{ UrlParse, 0 };
+   static char outPath[sizeof(OutDir) + MaxNameLen];
+   OutputPath(url, outPath);
+
+   Result result{ Done, 0 };
+   uint32_t bodyBytes = 0;
+   for (uint8_t hops = 0; ; hops++)
+   {
+      Outcome outcome = Exchange(url, conf, line, bodyBytes, result);
+      if (outcome == Failed) return result;
+      if (outcome == Fetched) break;
+      if (hops == MaxRedirects) return Result{ Redirect, 0 };
+   }
+   SD.remove(outPath);
+   if (!SD.rename(TempPath, outPath)) { SD.remove(TempPath); return Result{ Rename, bodyBytes }; }
+   return Result{ Done, bodyBytes };
+}
+
+// One "$<stage> <value> <ms> <url>" line per URL, so a list's outcome is on
+// the card even though the menu shows only one result.
+FLASHMEM static void LogResult(const Result &r, uint32_t ms, const char *url)
+{
+   File f = SD.open(ResultsPath, FILE_WRITE);
+   if (!f) return;
+   char head[40];
+   snprintf(head, sizeof(head), "$%02X %lu %lu ", r.stage, (unsigned long)r.value, (unsigned long)ms);
+   f.write(head, strlen(head));
+   f.write(url, strlen(url));
+   f.write("\n", 1);
+   f.close();
 }
 
 FLASHMEM static void Fetch()
 {
    if (!SD.begin(BUILTIN_SDCARD)) ReturnToMenu(SdInit, 0);
-   SdReady = true;
-   LogTime("boot", millis(), 0);
+   SD.remove(ResultsPath);
 
    mbedtls_memory_buffer_alloc_init((unsigned char *)(Ram2Base + NetHeapSize), TlsHeapSize);
    char *line = (char *)mbedtls_calloc(1, LineSize);
-   static Url url;
    if (!line) ReturnToMenu(TlsSetup, 0);
 
-   {
-      File f = SD.open(UrlPath, FILE_READ);
-      if (!f) ReturnToMenu(UrlFile, 0);
-      // A card read error comes back as SdFat's -1 cast to size_t.
-      size_t n = f.read(line, LineSize - 1);
-      f.close();
-      if (n > LineSize - 1) ReturnToMenu(UrlFile, 1);
-      line[n] = 0;
-      line[strcspn(line, "\r\n")] = 0;
-   }
-   if (!ParseUrl(line, url)) ReturnToMenu(UrlParse, 0);
-   static char outPath[sizeof(OutDir) + MaxNameLen];
-   OutputPath(url, outPath);
+   size_t urlsLen = 0;
+   char *urls = (char *)ReadFile(UrlsPath, urlsLen, MaxUrlsBytes);
+   if (!urls) ReturnToMenu(UrlFile, 0);
 
    mbedtls_x509_crt ca;
    mbedtls_x509_crt_init(&ca);
@@ -509,10 +507,7 @@ FLASHMEM static void Fetch()
    ret = mbedtls_ctr_drbg_seed(&drbg, TrngEntropy, nullptr, (const unsigned char *)"TeensyROM", 9);
    if (ret != 0) ReturnToMenu(DrbgSeed, -ret);
 
-   LogTime("setup", millis(), 0);
-   uint32_t start = millis();
    if (!EthernetUp()) ReturnToMenu(NetInit, Ethernet.linkStatus());
-   LogTime("ethernet", millis() - start, 0);
 
    mbedtls_ssl_config conf;
    mbedtls_ssl_config_init(&conf);
@@ -522,15 +517,27 @@ FLASHMEM static void Fetch()
    mbedtls_ssl_conf_ca_chain(&conf, &ca, nullptr);
    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
 
-   uint32_t bodyBytes = 0, bodyMs = 0;
-   for (uint8_t hops = 0; !Exchange(url, conf, line, bodyBytes, bodyMs); )
+   // Every URL is tried; the menu shows the first failure, or the count saved.
+   uint32_t saved = 0;
+   Result first{ Done, 0 };
+   for (char *next = urls; *next; )
    {
-      if (++hops > MaxRedirects) ReturnToMenu(Redirect, 0);
-   }
+      char *text = next;
+      size_t len = strcspn(text, "\n");
+      next = text + len + (text[len] == '\n');
+      text[len] = 0;
+      while (len && strchr("\r \t", text[len - 1])) text[--len] = 0;
+      text += strspn(text, " \t");
+      if (*text == 0 || *text == '#') continue;
 
-   SD.remove(outPath);
-   if (!SD.rename(TempPath, outPath)) ReturnToMenu(Rename, bodyBytes);
-   ReturnToMenu(Done, bodyMs);
+      uint32_t start = millis();
+      Result r = Download(text, conf, line);
+      LogResult(r, millis() - start, text);
+      if (r.stage == Done) saved++;
+      else if (first.stage == Done) first = r;
+   }
+   if (first.stage != Done) ReturnToMenu(first.stage, first.value);
+   ReturnToMenu(Done, saved);
 }
 
 void setup()
