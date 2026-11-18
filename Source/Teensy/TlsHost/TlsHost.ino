@@ -17,8 +17,10 @@
 // in '/', or whose last segment is no FAT long name, saves as download.bin. The result comes back
 // on the C64 menu as `extension host returned ($50/<detail>)`, where detail is
 // (stage << 24) | value; stage 0 is success with value = the milliseconds the
-// body took to arrive. The stages are the Stage enum below. Each phase's
-// milliseconds also go to /tls/timing.txt, one "<phase> <ms> <extra>" line each.
+// body took to arrive. The stages are the Stage enum below. /tls/timing.txt gets
+// one "<phase> <ms> <extra>" line per phase: boot, setup and total give millis()
+// since power-on, the rest durations; head's extra is the HTTP status, body's
+// the bytes, total's the stage. A "host <name>" line opens each connection.
 //
 // Build and install:
 //
