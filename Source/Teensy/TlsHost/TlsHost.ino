@@ -13,7 +13,8 @@
 // expires in minutes. Its body goes to /tls/download.tmp and is renamed to
 // /tls/<name> only once all of it has arrived, where <name> is the last segment
 // of the line's path, query and fragment removed. A URL whose path ends in '/',
-// or whose last segment is no FAT long name, saves as download.bin.
+// or whose last segment is no FAT long name or names one of the files above,
+// saves as download.bin.
 //
 // A failed URL is skipped and the rest are still tried. /tls/results.txt gets
 // one "$<stage> <value> <ms> <url>" line per URL, value being the bytes saved on
@@ -202,6 +203,18 @@ FLASHMEM static bool Printable(const char *text)
    return true;
 }
 
+// A name one of this host's own files in OutDir has: saving over results.txt
+// mid-list would wipe the earlier lines and append the later ones to the body.
+FLASHMEM static bool NameReserved(const char *name, size_t len)
+{
+   for (const char *path : { TempPath, UrlsPath, ResultsPath, CaPath })
+   {
+      const char *own = path + sizeof(OutDir) - 1;
+      if (strlen(own) == len && strncasecmp(name, own, len) == 0) return true;
+   }
+   return false;
+}
+
 // The file the body is saved as, named for the last segment of the URL's path.
 // That is the name a user asked for: a redirect target, such as a GitHub
 // release asset's, ends in an opaque identifier.
@@ -212,7 +225,7 @@ FLASHMEM static void OutputPath(const Url &url, char *path)
    while (name[-1] != '/') name--;
    size_t len = url.path + end - name;
    bool usable = len > 0 && len <= MaxNameLen && strcspn(name, "\\:*\"<>|") >= len && strspn(name, ".") < len &&
-      !(len == 12 && strncasecmp(name, "download.tmp", 12) == 0);
+      !NameReserved(name, len);
    strcpy(path, OutDir);
    if (usable) strncat(path, name, len);
    else strcat(path, DefaultName);
