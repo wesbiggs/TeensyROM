@@ -5,8 +5,9 @@
 // Deliberately close to Source/Teensy/VMBoot/Min_TeensyROM.h, because the
 // difference is the point: what a host owes the build is this file and one
 // .ino, and everything else it inherits from the minimal sketch it is overlaid
-// onto. The one line that differs is FeatVMHost, which this host does not
-// define -- it runs no modules, so it compiles none of the module runtime.
+// onto. It defines FeatVMHost for the EasyFlash handler's two client-link
+// hooks, VMHostIO2 and VMHostPoll, which TlsHost.ino supplies itself; it does
+// not include VMHost.h, so it compiles none of the module runtime.
 //
 // It must be built by tools/build-firmware.mjs, which generates the linker
 // script that puts the image in the extension slot and reserves the module's
@@ -22,10 +23,13 @@
 #endif
 
 #define MinimumBuild         //Must be defined for minimal build to identify in common files
+#define FeatVMHost           //IO_Handler hooks for the client link, supplied by TlsHost.ino
 
-// No module runtime, no bank swapping. Ethernet is the vendored NativeEthernet, brought in by the Net_*.cpp wrappers. RAM_ImageSize still has to
-// be something: the shared minimal sources declare a buffer of that size, and
-// this host never fills it.
-#define Num8kSwapBuffers  2
+// No module runtime and no bank swapping: RAM_Image holds the 16 KiB WebGet
+// client cartridge whole. Ethernet is the vendored NativeEthernet, brought in by
+// the Net_*.cpp wrappers. IOH_EasyFlash still declares the swap buffers, 8 KiB
+// of DTCM each, so this keeps the one it needs to compile: two would push the
+// host's data into the module DTCM window.
+#define Num8kSwapBuffers  1
 #define EthernetDeduction 0
 #define MaxRAM_ImageSize  16

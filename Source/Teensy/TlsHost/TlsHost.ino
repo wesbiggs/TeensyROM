@@ -45,7 +45,10 @@
 #include "Common/Common_Defs.h"
 #include "Common/Menu_Regs.h"
 #include "Common/DriveDirLoad.h"
+#include "Common/C64Spans.h"
+#include "Common/DMAControl.c"
 #include "Common/IOHandlers.h"
+#include "Common/MachineDetect.h"
 #include "Common/VMHostABI.h"
 #include "Common/VMFail.h"
 #include "Common/NativeEthernet/src/NativeEthernet.h"
@@ -86,6 +89,7 @@ enum Stage : uint8_t {
    Redirect,   // value: the status whose Location was missing or refused, or 0 for too many hops
    Dns,        // value: milliseconds the lookup took to fail
    Launch,     // value: 0 no readable record, 1 no file selected
+   Client,     // the package's client.crt would not load
 };
 
 static constexpr size_t MaxUrlsBytes = 16 * 1024;
@@ -115,6 +119,183 @@ FLASHMEM void ReturnToMenu(uint8_t stage, uint32_t value)
    delay(10);
    RebootTR();
    while (true) ;
+}
+
+// ---- The client link --------------------------------------------------------
+//
+// The C64 runs the WebGet client (Source/C64/WebGet/webget.a), presented as a
+// 16 KiB EasyFlash cartridge. It speaks the stock host's IO2 link
+// (vm/abi/README.md section 6): this host publishes packets in $DF00..$DFEF
+// and takes input records, but drives the link itself rather than through the
+// module runtime, so its downloads can block while the screen keeps updating
+// from Idle(). Packet type 1 paints one row; input protocol $82 is one key.
+
+// IOH_EasyFlash records the selected bank in CurrentEasyFlashBank under
+// FeatVMHost; bank 58 opens the link.
+static constexpr uint8_t ClientBank = 58;
+static constexpr uint8_t RowPacket = 1;
+static constexpr uint8_t KeyProtocol = 0x82;
+static volatile bool LinkActive, ClientStarted;
+static volatile uint8_t Keys[32];
+static volatile uint8_t KeyHead, KeyTail;
+
+// From IOH_EasyFlash's IO2 handler, in the PHI2 interrupt: only register
+// traffic happens here. A key is taken, and $DFFC set to its token, only while
+// the queue has room, so a client that sees $DFFC unchanged offers it again.
+bool VMHostIO2(uint8_t address, bool read)
+{
+   if (!LinkActive || CurrentEasyFlashBank != ClientBank) return false;
+   if (read) { DataPortWriteWaitLog(EZFlashRAM[address]); return true; }
+   const uint8_t value = DataPortWaitRead();
+   TraceLogAddValidData(value);
+   if (address == 0xf6 || (address >= 0xf8 && address <= 0xfa) || address >= 0xfd) EZFlashRAM[address] = value;
+   if (address != 0xf4) return true;
+   if (value == 1) ClientStarted = true;
+   if (value != 3 || !EZFlashRAM[0xfe] || EZFlashRAM[0xfe] == EZFlashRAM[0xfc] || EZFlashRAM[0xfd] != KeyProtocol) return true;
+   if ((0xa5 ^ EZFlashRAM[0xf8] ^ EZFlashRAM[0xf9] ^ EZFlashRAM[0xfa] ^ EZFlashRAM[0xfd] ^ EZFlashRAM[0xfe]) != EZFlashRAM[0xff]) return true;
+   const uint8_t next = (KeyHead + 1) % sizeof(Keys);
+   if (next == KeyTail) return true;
+   Keys[KeyHead] = EZFlashRAM[0xf8];
+   KeyHead = next;
+   EZFlashRAM[0xfc] = EZFlashRAM[0xfe];
+   return true;
+}
+
+FLASHMEM static int NextKey()
+{
+   if (KeyTail == KeyHead) return -1;
+   const uint8_t key = Keys[KeyTail];
+   KeyTail = (KeyTail + 1) % sizeof(Keys);
+   return key;
+}
+
+// The screen the client shows, kept here and sent a changed row at a time.
+static uint8_t Screen[25][40];
+static uint8_t RowColour[25];
+static uint32_t Dirty;
+
+namespace Link {
+static VmPacket packet;
+static uint8_t sequence;
+static bool pending;
+#include "VMHostWire.h"
+}
+
+FLASHMEM static void LinkService()
+{
+   using namespace Link;
+   if (!LinkActive || !ClientStarted) return;
+   EZFlashRAM[0xf5] = 2;
+   if (pending && EZFlashRAM[0xf6] == sequence) pending = false;
+   if (pending || !Dirty) return;
+   const uint8_t row = __builtin_ctz(Dirty);
+   Dirty &= ~(1u << row);
+   packet.type = RowPacket;
+   packet.flags = 0;
+   packet.length = 42;
+   packet.reserved = 0;
+   packet.payload[0] = row;
+   packet.payload[1] = RowColour[row];
+   memcpy(packet.payload + 2, Screen[row], 40);
+   sequence = sequence == 255 ? 1 : sequence + 1;
+   uint8_t bytes[240];
+   const unsigned size = encodePacket(bytes);
+   for (unsigned i = 0; i < size; i++) EZFlashRAM[i] = bytes[i];
+   pending = true;
+   __asm__ volatile("dmb":::"memory");
+   EZFlashRAM[0xf7] = sequence;
+}
+
+// IOH_EasyFlash's polling handler calls this from loop(); Idle() calls it
+// from every wait.
+void VMHostPoll() { LinkService(); }
+
+// ASCII to a screen code in the lower/upper case set the client selects.
+FLASHMEM static uint8_t ScreenCode(char c)
+{
+   if (c >= 'a' && c <= 'z') return c - 'a' + 1;
+   if (c >= 'A' && c <= 'Z') return c - 'A' + 65;
+   if (c >= ' ' && c <= '?') return c;
+   if (c == '@') return 0;
+   if (c == '[') return 27;
+   if (c == ']') return 29;
+   if (c == '_') return 100;
+   return '?';
+}
+
+// A typed key as ASCII, or 0 for one a URL has no use for.
+FLASHMEM static char KeyChar(uint8_t key)
+{
+   if (key >= 0x41 && key <= 0x5a) return key - 0x41 + 'a';
+   if (key >= 0xc1 && key <= 0xda) return key - 0xc1 + 'A';
+   if (key >= 0x20 && key <= 0x40) return key;
+   if (key == 0x5b || key == 0x5d) return key;
+   if (key == 0x5f) return '_';   // the left-arrow key
+   return 0;
+}
+
+FLASHMEM static void Put(uint8_t row, uint8_t colour, const char *text)
+{
+   uint8_t i = 0;
+   for (; i < 40 && text[i]; i++) Screen[row][i] = ScreenCode(text[i]);
+   for (; i < 40; i++) Screen[row][i] = ' ';
+   RowColour[row] = colour;
+   Dirty |= 1u << row;
+}
+
+FLASHMEM static void Putf(uint8_t row, uint8_t colour, const char *format, ...)
+{
+   char text[64];
+   va_list args;
+   va_start(args, format);
+   vsnprintf(text, sizeof(text), format, args);
+   va_end(args);
+   Put(row, colour, text);
+}
+
+// ---- The screen -------------------------------------------------------------
+
+enum Colour : uint8_t { White = 1, Red = 2, Cyan = 3, Green = 5, Yellow = 7, LightRed = 10, Grey = 12, LightBlue = 14, LightGrey = 15 };
+static constexpr uint8_t TitleRow = 0, FolderRow = 1, LogTop = 3, LogBottom = 17, StatusRow = 19, PromptRow = 21,
+                         PromptRows = 3, HelpRow = 24;
+
+FLASHMEM static void Status(const char *text) { Put(StatusRow, Yellow, text); }
+
+// A finished URL's line, scrolling the log up.
+FLASHMEM static void LogLine(uint8_t colour, const char *text)
+{
+   memmove(Screen[LogTop], Screen[LogTop + 1], (LogBottom - LogTop) * 40);
+   memmove(RowColour + LogTop, RowColour + LogTop + 1, LogBottom - LogTop);
+   for (uint8_t row = LogTop; row < LogBottom; row++) Dirty |= 1u << row;
+   Put(LogBottom, colour, text);
+}
+
+// Every wait calls this, so the screen keeps up and RUN/STOP or the TR button
+// can leave mid-download.
+static bool Prompting;
+static uint32_t Saved;
+FLASHMEM static void Exit(uint8_t stage, uint32_t value);
+FLASHMEM static void Idle()
+{
+   LinkService();
+   FollowVideoStd();
+   if (BtnPressed) Exit(Done, Saved);
+   if (Prompting) return;
+   for (int key; (key = NextKey()) >= 0; ) if (key == 3) Exit(Done, Saved);
+}
+
+// Progress, at most every quarter second: the link carries a row per packet.
+static uint32_t ProgressStart, ProgressShown;
+FLASHMEM static void Progress(uint32_t bytes, int32_t total)
+{
+   const uint32_t now = millis();
+   if (now - ProgressShown < 250) return;
+   ProgressShown = now;
+   const uint32_t ms = now - ProgressStart;
+   const uint32_t rate = ms ? bytes / ms : 0;   // bytes per ms is kB/s
+   if (total > 0) Putf(StatusRow, Yellow, "%lu/%ld %lu%% %lukB/s", (unsigned long)bytes, (long)total,
+                       (unsigned long)((uint64_t)bytes * 100 / (uint32_t)total), (unsigned long)rate);
+   else Putf(StatusRow, Yellow, "%lu bytes %lukB/s", (unsigned long)bytes, (unsigned long)rate);
 }
 
 // The i.MX RT1062 TRNG, read directly. FNET's own mbedTLS entropy callback is
@@ -172,7 +353,7 @@ FLASHMEM static fnet_socket_t TcpConnect(IPAddress ip, uint16_t port)
          if (fnet_socket_getopt(sock, SOL_SOCKET, SO_STATE, &state, &size) == FNET_ERR) break;
          if (state == SS_CONNECTED) return sock;
          if (state != SS_CONNECTING) break;
-         yield();
+         Idle();
       }
    }
    fnet_socket_close(sock);
@@ -188,7 +369,7 @@ FLASHMEM static int NetSend(void *ctx, const unsigned char *buf, size_t len)
       if (sent == FNET_ERR) return MBEDTLS_ERR_SSL_CONN_EOF;
       if (sent > 0) return (int)sent;
       if (millis() - start > IoTimeoutMs) return MBEDTLS_ERR_SSL_TIMEOUT;
-      yield();
+      Idle();
    }
 }
 
@@ -216,7 +397,7 @@ FLASHMEM static int NetRecv(void *ctx, unsigned char *buf, size_t len)
       }
       if (got > 0) return (int)got;
       if (millis() - start > IoTimeoutMs) return MBEDTLS_ERR_SSL_TIMEOUT;
-      yield();
+      Idle();
    }
 }
 
@@ -397,11 +578,14 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    IPAddress remote;
    DNSClient dns;
    dns.begin(Ethernet.dnsServerIP());
+   Putf(StatusRow, Yellow, "looking up %s", url.host);
    // Dns's and Connect's values are the milliseconds they took, which tells a
    // refusal from a timeout.
    uint32_t start = millis();
    if (!dns.getHostByName(url.host, remote)) FAIL(Dns, millis() - start);
    start = millis();
+   Putf(StatusRow, Yellow, "connecting to %s", url.host);
+   Idle();
    c.sock = TcpConnect(remote, url.port);
    if (!c.sock) FAIL(Connect, millis() - start);
 
@@ -409,6 +593,8 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    c.tls = url.tls;
    if (c.tls)
    {
+      Status("securing the connection");
+      Idle();
       ret = mbedtls_ssl_setup(&c.ssl, &conf);
       if (ret == 0) ret = mbedtls_ssl_set_hostname(&c.ssl, url.host);
       if (ret != 0) FAIL(TlsSetup, -ret);
@@ -424,6 +610,7 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    // on a non-standard port may need to find the site.
    char port[8] = "";
    if (url.port != (url.tls ? 443 : 80)) snprintf(port, sizeof(port), ":%u", url.port);
+   Status("waiting for the server");
    int reqLen = snprintf(line, LineSize,
       "GET %s HTTP/1.0\r\nHost: %s%s\r\nUser-Agent: TeensyROM\r\nConnection: close\r\n\r\n", url.path, url.host, port);
    if (reqLen <= 0 || reqLen >= (int)LineSize) FAIL(Request, 0);
@@ -489,11 +676,14 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
          if (status != 200) FAIL(HttpStatus, status);
          SD.remove(TempPath);
          c.out = SD.open(TempPath, FILE_WRITE);
+         ProgressStart = millis();
+         ProgressShown = 0;
          if (!c.out) FAIL(FileWrite, 0);
       }
       size_t bodyLen = ret - at;
       if (bodyLen && c.out.write(buf + at, bodyLen) != bodyLen) FAIL(FileWrite, bodyBytes);
       bodyBytes += bodyLen;
+      Progress(bodyBytes, contentLength);
    }
 
    // With no Content-Length, a TLS body is complete only on close_notify: an
@@ -507,12 +697,16 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
 
 // One URL from the list, through its redirects, to its file on the card.
 // Success's value is the bytes saved.
+// The name the last download saved, or would have, as.
+static const char *LastName;
+
 FLASHMEM static Result Download(const char *text, mbedtls_ssl_config &conf, char *line)
 {
    static Url url;
    if (!ParseUrl(text, url)) return Result{ UrlParse, 0 };
    static char outPath[sizeof(Dir) + MaxNameLen + 1];
    OutputPath(url, outPath);
+   LastName = outPath + strlen(Dir);
 
    Result result{ Done, 0 };
    uint32_t bodyBytes = 0;
@@ -542,69 +736,182 @@ FLASHMEM static void LogResult(const Result &r, uint32_t ms, const char *url)
    f.close();
 }
 
-FLASHMEM static void Fetch()
+// The prompt: "> " and the tail of what has been typed that fits its rows,
+// with a reverse-video cursor after it.
+static constexpr size_t PromptWidth = PromptRows * 40 - 3;
+FLASHMEM static void DrawPrompt(const char *text, size_t len)
 {
-   if (!SD.begin(BUILTIN_SDCARD)) ReturnToMenu(SdInit, 0);
-
-   // The main image wrote the launch record before rebooting: the package's
-   // folder, and the .www file the user picked.
-   static VmLaunchRecord launch;
+   const char *shown = text + (len > PromptWidth ? len - PromptWidth : 0);
+   uint8_t cells[PromptRows * 40];
+   memset(cells, ' ', sizeof(cells));
+   cells[0] = '>';
+   size_t at = 2;
+   for (; *shown; shown++) cells[at++] = ScreenCode(*shown);
+   cells[at] = 0xa0;   // reverse space
+   for (uint8_t row = 0; row < PromptRows; row++)
    {
-      File f = SD.open("/VMS/launch.vml", FILE_READ);
-      bool read = f && f.size() == sizeof(launch) && f.read(&launch, sizeof(launch)) == sizeof(launch);
-      if (f) f.close();
-      if (!read || !vm_launch_valid(launch)) ReturnToMenu(Launch, 0);
+      memcpy(Screen[PromptRow + row], cells + row * 40, 40);
+      RowColour[PromptRow + row] = White;
+      Dirty |= 1u << (PromptRow + row);
    }
-   if (!launch.content[0]) ReturnToMenu(Launch, 1);
-   const char *slash = strrchr(launch.content, '/');
-   ListName = slash + 1;
-   memcpy(Dir, launch.content, ListName - launch.content);
-   Dir[ListName - launch.content] = 0;
-   const char *dot = strrchr(ListName, '.');
-   size_t stem = dot ? (size_t)(dot - ListName) : strlen(ListName);
-   char caPath[sizeof(launch.root) + sizeof("/ca.pem") - 1];
-   snprintf(TempPath, sizeof(TempPath), "%s%s", Dir, TempName);
-   snprintf(LogPath, sizeof(LogPath), "%s%.*s.log", Dir, (int)stem, ListName);
-   snprintf(caPath, sizeof(caPath), "%s/ca.pem", launch.root);
-   SD.remove(LogPath);
+}
+
+// One line typed at the prompt, or nullptr when the user leaves.
+FLASHMEM static const char *ReadUrl()
+{
+   static char typed[sizeof(Url::path) + sizeof(Url::host) + 16];
+   size_t len = 0;
+   typed[0] = 0;
+   DrawPrompt(typed, len);
+   Prompting = true;
+   while (true)
+   {
+      Idle();
+      const int key = NextKey();
+      if (key < 0) continue;
+      if (key == 3) { Prompting = false; return nullptr; }                 // RUN/STOP
+      if (key == 13 && len) { Prompting = false; return typed; }          // RETURN
+      if (key == 20 && len) typed[--len] = 0;                             // DEL
+      else if (key == 147) typed[len = 0] = 0;                            // CLR
+      else if (const char c = KeyChar(key); c && len < sizeof(typed) - 1) { typed[len++] = c; typed[len] = 0; }
+      DrawPrompt(typed, len);
+   }
+}
+
+// ---- Bus and cartridge, as the stock host sets them up (VMBoot.ino) ----------
+
+// The client cartridge from the launching package, checked as the stock host
+// checks it (VMHostBoot), then presented to the C64 as a 16 KiB EasyFlash.
+FLASHMEM static bool StartClient(const VmLaunchRecord &launch)
+{
+   char path[sizeof(launch.root) + 16];
+   snprintf(path, sizeof(path), "%s/client.crt", launch.root);
+   File f = SD.open(path, FILE_READ);
+   if (!f) return false;
+   uint8_t header[64], chip[16], descriptor[128];
+   bool ok = f.read(header, 64) == 64 && !memcmp(header, "C64 CARTRIDGE   ", 16) && header[23] == 32;
+   for (unsigned i = 0; ok && i < 2; i++)
+      ok = f.read(chip, 16) == 16 && !memcmp(chip, "CHIP", 4) && !chip[10] && !chip[11] && chip[12] == (i ? 0xa0 : 0x80) &&
+           !chip[13] && chip[14] == 0x20 && !chip[15] && f.read(RAM_Image + i * 8192, 8192) == 8192;
+   const char *id = strrchr(launch.root, '/') + 1;
+   ok = ok && f.read(chip, 16) == 16 && !memcmp(chip, "CHIP", 4) && !chip[10] && chip[11] == 1 && chip[12] == 0x80 && !chip[13] &&
+        f.read(descriptor, 128) == 128 && !memcmp(descriptor, "VMH1", 4) && descriptor[4] == VM_ABI &&
+        memchr(descriptor + 16, 0, 24) && !strcmp((char *)descriptor + 16, id) &&
+        vm_crc32(descriptor, 124) == *(uint32_t *)(descriptor + 124) &&
+        vm_crc32(RAM_Image, 16384) == *(uint32_t *)(descriptor + 8);
+   f.close();
+   if (!ok) return false;
+   NumCrtChips = 0;
+   memset(EZFlashRAM, 0, sizeof(EZFlashRAM));
+   CurrentEasyFlashBank = 0;
+   SetGameAssert;
+   SetExROMDeassert;
+   for (unsigned i = 0; i < 64; i++) { BankDecode[i][0] = RAM_Image; BankDecode[i][1] = RAM_Image + 8192; }
+   LOROM_Image = RAM_Image;
+   HIROM_Image = RAM_Image + 8192;
+   LOROM_Mask = HIROM_Mask = 8191;
+   CurrentIOHandler = IOH_EasyFlash;
+   EmulateVicCycles = false;
+   memcpy(EZFlashRAM + 0xf0, "M3TP", 4);
+   LinkActive = true;
+   doReset = true;
+   return true;
+}
+
+// ---- The session ------------------------------------------------------------
+
+static VmLaunchRecord LaunchRecord;
+
+// Every way out: the record the menu shows, and no temp file left behind.
+FLASHMEM static void Exit(uint8_t stage, uint32_t value)
+{
+   if (TempPath[0]) SD.remove(TempPath);
+   ReturnToMenu(stage, value);
+}
+
+// A failure the session cannot go on from: on screen until the user leaves,
+// then in the record the menu shows.
+FLASHMEM static void Stop(uint8_t stage, uint32_t value, const char *what)
+{
+   Putf(StatusRow, LightRed, "%s ($%02X/%lX)", what, stage, (unsigned long)value);
+   Prompting = true;
+   while (true)
+   {
+      Idle();
+      const int key = NextKey();
+      if (key == 3 || key == 13) Exit(stage, value);
+   }
+}
+
+// One URL, downloaded and logged both on screen and in <list>.log.
+FLASHMEM static void FetchOne(const char *text, mbedtls_ssl_config &conf, char *line)
+{
+   const char *shown = strstr(text, "://");
+   shown = shown ? shown + 3 : text;
+   const uint32_t start = millis();
+   Result r = Download(text, conf, line);
+   LogResult(r, millis() - start, text);
+   char entry[48];
+   if (r.stage == Done)
+   {
+      Saved++;
+      snprintf(entry, sizeof(entry), "%-8lu %s", (unsigned long)r.value, LastName);
+      LogLine(Green, entry);
+   }
+   else
+   {
+      snprintf(entry, sizeof(entry), "$%02X %-4lu %s", r.stage, (unsigned long)r.value, shown);
+      LogLine(LightRed, entry);
+   }
+   Status("ready");
+}
+
+FLASHMEM static void Session()
+{
+   Put(TitleRow, LightBlue, "TeensyROM web downloader");
+   Putf(FolderRow, Grey, "into %s", Dir);
+   Put(HelpRow, Grey, "return fetches, run/stop leaves");
+   for (uint8_t row = LogTop; row <= LogBottom; row++) Put(row, Green, "");
+   Status("starting");
 
    mbedtls_memory_buffer_alloc_init((unsigned char *)(Ram2Base + NetHeapSize), TlsHeapSize);
    char *line = (char *)mbedtls_calloc(1, LineSize);
-   if (!line) ReturnToMenu(TlsSetup, 0);
+   if (!line) Stop(TlsSetup, 0, "out of memory");
 
    size_t urlsLen = 0;
-   char *urls = (char *)ReadFile(launch.content, urlsLen, MaxUrlsBytes);
-   if (!urls) ReturnToMenu(UrlFile, 0);
+   char *urls = (char *)ReadFile(LaunchRecord.content, urlsLen, MaxUrlsBytes);
+   if (!urls) Stop(UrlFile, 0, "cannot read the list");
 
+   char caPath[sizeof(LaunchRecord.root) + sizeof("/ca.pem") - 1];
+   snprintf(caPath, sizeof(caPath), "%s/ca.pem", LaunchRecord.root);
    mbedtls_x509_crt ca;
    mbedtls_x509_crt_init(&ca);
    size_t caLen = 0;
    unsigned char *caPem = ReadFile(caPath, caLen, 64 * 1024);
-   if (!caPem) ReturnToMenu(CaFile, 0);
+   if (!caPem) Stop(CaFile, 0, "no ca.pem in the package");
    int ret = mbedtls_x509_crt_parse(&ca, caPem, caLen);
    mbedtls_free(caPem);
    // A positive ret is the number of certificates in the file that did not parse.
-   if (ret != 0) ReturnToMenu(CaParse, ret < 0 ? -ret : ret);
+   if (ret != 0) Stop(CaParse, ret < 0 ? -ret : ret, "bad ca.pem");
 
-   if (!TrngInit()) ReturnToMenu(Trng, TRNG_MCTL);
+   if (!TrngInit()) Stop(Trng, TRNG_MCTL, "no random source");
    mbedtls_ctr_drbg_context drbg;
    mbedtls_ctr_drbg_init(&drbg);
    ret = mbedtls_ctr_drbg_seed(&drbg, TrngEntropy, nullptr, (const unsigned char *)"TeensyROM", 9);
-   if (ret != 0) ReturnToMenu(DrbgSeed, -ret);
+   if (ret != 0) Stop(DrbgSeed, -ret, "no random source");
 
-   if (!EthernetUp()) ReturnToMenu(NetInit, Ethernet.linkStatus());
+   Status("starting the network");
+   if (!EthernetUp()) Stop(NetInit, Ethernet.linkStatus(), "no network");
 
    mbedtls_ssl_config conf;
    mbedtls_ssl_config_init(&conf);
    ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
-   if (ret != 0) ReturnToMenu(TlsSetup, -ret);
+   if (ret != 0) Stop(TlsSetup, -ret, "tls setup failed");
    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
    mbedtls_ssl_conf_ca_chain(&conf, &ca, nullptr);
    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
 
-   // Every URL is tried; the menu shows the first failure, or the count saved.
-   uint32_t saved = 0;
-   Result first{ Done, 0 };
+   SD.remove(LogPath);
    for (char *next = urls; *next; )
    {
       char *text = next;
@@ -614,26 +921,51 @@ FLASHMEM static void Fetch()
       while (len && strchr("\r \t", text[len - 1])) text[--len] = 0;
       text += strspn(text, " \t");
       if (*text == 0 || *text == '#') continue;
-
-      uint32_t start = millis();
-      Result r = Download(text, conf, line);
-      LogResult(r, millis() - start, text);
-      if (r.stage == Done) saved++;
-      else if (first.stage == Done) first = r;
+      FetchOne(text, conf, line);
    }
-   if (first.stage != Done) ReturnToMenu(first.stage, first.value);
-   ReturnToMenu(Done, saved);
+
+   Status("ready");
+   while (const char *text = ReadUrl()) FetchOne(text, conf, line);
+   Exit(Done, Saved);
 }
+
+// ---- setup() and loop(), as the stock host's (VMBoot.ino) ---------------------
+
+extern "C" uint32_t set_arm_clock(uint32_t frequency);
 
 void setup()
 {
+   set_arm_clock(816000000);
    SetLEDOn;
    for (uint8_t PinNum = 0; PinNum < sizeof(OutputPins); PinNum++) pinMode(OutputPins[PinNum], OUTPUT);
+#ifdef Fab04_FullDMACapable
+   SetAddrPortDirIn;
+   SetAddrBufsIn;
+#endif
+#ifdef Fab04_DataBufAlwaysEnabled
+   SetDataPortDirIn;
+   SetDataBufIn;
+#else
+   DataBufDisable;
+   SetDataPortDirOut;
+#endif
    SetDMADeassert;
    SetIRQDeassert;
    SetNMIDeassert;
+#ifdef Fab04_BiDirReset
+   pinMode(BiDir_Reset_PIN, INPUT_PULLUP);
+   attachInterrupt(digitalPinToInterrupt(BiDir_Reset_PIN), isrButton, FALLING);
+#endif
    SetResetAssert;
+#ifdef Fab04_SpecialButton
+   pinMode(Special_Btn_In_PIN, INPUT_PULLUP);
+#endif
+   for (uint8_t PinNum = 0; PinNum < sizeof(InputPins); PinNum++) pinMode(InputPins[PinNum], INPUT);
    pinMode(Menu_Btn_In_PIN, INPUT_PULLUP);
+   pinMode(PHI2_PIN, INPUT_PULLUP);
+   attachInterrupt(digitalPinToInterrupt(Menu_Btn_In_PIN), isrButton, FALLING);
+   attachInterrupt(digitalPinToInterrupt(PHI2_PIN), isrPHI2, RISING);
+   NVIC_SET_PRIORITY(IRQ_GPIO6789, 16);   // above Ethernet's timer, which would otherwise cost bus cycles
 
    if (ReadButton == 0) runMainTRApp();
    uint32_t magic = 0;
@@ -643,11 +975,58 @@ void setup()
    for (uint8_t i = 0; i < 4; i++) marker[i] = EEPROM.read(VM_EEP_BOOTNAME_ADDR + i);
    if (strcmp(marker, VM_HOST_MARKER) != 0) runMainTRApp();
 
-   Fetch();
+   // PAL/NTSC timed here with the machine in reset; C64 or C128 comes from the
+   // pair the main image left.
+   if (TimeVideoStdAtBoot() != 0xff) SetVideoStdDMATiming(MeasuredVidStd);
+   uint8_t machine[2];
+   EEPreadNBuf(VM_EEP_MACHINE_ADDR, machine, 2);
+   const int Machine = vm_launch_machine(machine);
+   if (Machine >= 0)
+      SetVideoStdDMATiming(MeasuredVidStd == 0xff ? Machine : (uint8_t)((Machine & ~rvtcNTSC) | MeasuredVidStd));
+
+   if (!SD.begin(BUILTIN_SDCARD)) ReturnToMenu(SdInit, 0);
+
+   // The main image wrote the launch record before rebooting: the package's
+   // folder, and the .www file the user picked.
+   {
+      File f = SD.open("/VMS/launch.vml", FILE_READ);
+      bool read = f && f.size() == sizeof(LaunchRecord) && f.read(&LaunchRecord, sizeof(LaunchRecord)) == sizeof(LaunchRecord);
+      if (f) f.close();
+      if (!read || !vm_launch_valid(LaunchRecord)) ReturnToMenu(Launch, 0);
+   }
+   if (!LaunchRecord.content[0]) ReturnToMenu(Launch, 1);
+   ListName = strrchr(LaunchRecord.content, '/') + 1;
+   memcpy(Dir, LaunchRecord.content, ListName - LaunchRecord.content);
+   Dir[ListName - LaunchRecord.content] = 0;
+   const char *dot = strrchr(ListName, '.');
+   const size_t stem = dot ? (size_t)(dot - ListName) : strlen(ListName);
+   snprintf(TempPath, sizeof(TempPath), "%s%s", Dir, TempName);
+   snprintf(LogPath, sizeof(LogPath), "%s%.*s.log", Dir, (int)stem, ListName);
+
+   if (!StartClient(LaunchRecord)) ReturnToMenu(Client, 0);
+   BtnPressed = false;
 }
 
 void loop()
 {
+   FollowVideoStd();
+   if (BtnPressed) Exit(Done, Saved);
+   if (doReset)
+   {
+      SetResetAssert;
+      delay(50);
+#ifdef Fab04_BiDirReset
+      SetResetInput;
+      delay(50);
+#else
+      SetResetDeassert;
+#endif
+      doReset = false;
+      BtnPressed = false;
+      Phi2ResetReleased();
+   }
+   LinkService();
+   if (ClientStarted) Session();   // does not return
 }
 
 void EEPwriteNBuf(uint16_t addr, const uint8_t* buf, uint8_t len)
