@@ -1,31 +1,39 @@
 // SPDX-License-Identifier: MIT
 //
-// TLS spike: an extension host that fetches a list of HTTPS URLs to the SD card.
+// TLS spike: an extension host that fetches a list of HTTP and HTTPS URLs to
+// the SD card.
 //
-// Inputs are two files on the SD card:
+// It runs when the user picks a .www file in the menu, which a /VMS package
+// claims (see the package line below). Its inputs are:
 //
-//   /tls/urls.txt  one http[s]://host[:port]/path per line; blank lines and lines
-//                  starting with '#' are skipped
-//   /tls/ca.pem    the PEM root certificate(s) that may sign the servers' chains
+//   <list>.www          the picked file: one http[s]://host[:port]/path per line;
+//                       blank lines and lines starting with '#' are skipped
+//   /VMS/<id>/ca.pem    the PEM root certificate(s) that may sign the servers'
+//                       chains, in the claiming package's own folder
 //
 // Each URL follows up to five redirects, never from https:// to http://, so a
-// line can hold a stable link such as a GitHub release download, whose signed target
-// expires in minutes. Its body goes to /tls/download.tmp and is renamed to
-// /tls/<name> only once all of it has arrived, where <name> is the last segment
-// of the line's path, query and fragment removed. A URL whose path ends in '/',
-// or whose last segment is no FAT long name or names one of the files above,
-// saves as download.bin.
+// line can hold a stable link such as a GitHub release download, whose signed
+// target expires in minutes. Its body goes to download.tmp beside the list and
+// is renamed to <name> there only once all of it has arrived, where <name> is the
+// last segment of the line's path, query and fragment removed. A URL whose path
+// ends in '/', or whose last segment is no FAT long name or names the list, its
+// log or the temp file, saves as download.bin.
 //
-// A failed URL is skipped and the rest are still tried. /tls/results.txt gets
-// one "$<stage> <value> <ms> <url>" line per URL, value being the bytes saved on
-// success. The menu shows `extension host returned ($50/<detail>)`, where detail
-// is (stage << 24) | value: the first failure's, or stage 0 with the number of
-// files saved. The stages are the Stage enum below.
+// A failed URL is skipped and the rest are still tried. <list>.log beside the
+// list gets one "$<stage> <value> <ms> <url>" line per URL, value being the
+// bytes saved on success. The menu shows `extension host returned
+// ($50/<detail>)`, where detail is (stage << 24) | value: the first failure's,
+// or stage 0 with the number of files saved. The stages are the Stage enum below.
 //
 // Build and install:
 //
 //   node tools/build-firmware.mjs --target tr-plus --host-sketch Source/Teensy/TlsHost --host-tls
 //   python3 tools/bench/hostinstall.py build/firmware/TeensyROM+_<ver>_TlsHost.TRH
+//
+// The package that claims .www, with the same ca.pem copied into /VMS/WWW:
+//
+//   node tools/build-extension.mjs --id WWW --extensions www --services 0 \
+//     --source vm/hello/hello.cpp --client-source Source/C64/VMHello/vmhello.a
 //
 // Known limits of the mbedTLS 2.12.0 that Teensyduino 1.61.0 bundles inside FNET:
 // TLS 1.2 only, and MBEDTLS_HAVE_TIME is off, so certificate validity dates are
@@ -77,16 +85,19 @@ enum Stage : uint8_t {
    ReadTimeout, Truncated, Rename,
    Redirect,   // value: the status whose Location was missing or refused, or 0 for too many hops
    Dns,        // value: milliseconds the lookup took to fail
+   Launch,     // value: 0 no readable record, 1 no file selected, 2 a path too long
 };
 
-static constexpr const char *UrlsPath = "/tls/urls.txt";
-static constexpr const char *ResultsPath = "/tls/results.txt";
 static constexpr size_t MaxUrlsBytes = 16 * 1024;
-static constexpr const char *CaPath   = "/tls/ca.pem";
-static constexpr const char *TempPath = "/tls/download.tmp";
-static constexpr char OutDir[]        = "/tls/";
+static constexpr const char *TempName = "download.tmp";
 static constexpr const char *DefaultName = "download.bin";
 static constexpr size_t MaxNameLen = 255;   // a FAT long file name
+// Set from the launch record: the selected list's folder, ending in '/', and
+// the files this host writes there.
+static char Dir[sizeof(VmLaunchRecord::content)];
+static const char *ListName;
+static char TempPath[sizeof(Dir) + 16];
+static char LogPath[sizeof(Dir) + MaxNameLen + 8];
 static constexpr uint32_t IoTimeoutMs = 20000;
 static constexpr uint32_t ConnectTimeoutMs = 10000;
 // TCP keeps at most this much unread data in flight, so it caps throughput at
@@ -216,13 +227,12 @@ FLASHMEM static bool Printable(const char *text)
    return true;
 }
 
-// A name one of this host's own files in OutDir has: saving over results.txt
-// mid-list would wipe the earlier lines and append the later ones to the body.
+// A name one of this host's own files in Dir has: saving over the list or its
+// log would lose them, and the temp file is renamed onto the name.
 FLASHMEM static bool NameReserved(const char *name, size_t len)
 {
-   for (const char *path : { TempPath, UrlsPath, ResultsPath, CaPath })
+   for (const char *own : { TempName, ListName, (const char *)LogPath + strlen(Dir) })
    {
-      const char *own = path + sizeof(OutDir) - 1;
       if (strlen(own) == len && strncasecmp(name, own, len) == 0) return true;
    }
    return false;
@@ -239,7 +249,7 @@ FLASHMEM static void OutputPath(const Url &url, char *path)
    size_t len = url.path + end - name;
    bool usable = len > 0 && len <= MaxNameLen && strcspn(name, "\\:*\"<>|") >= len && strspn(name, ".") < len &&
       !NameReserved(name, len);
-   strcpy(path, OutDir);
+   strcpy(path, Dir);
    if (usable) strncat(path, name, len);
    else strcat(path, DefaultName);
 }
@@ -277,7 +287,7 @@ FLASHMEM static unsigned char *ReadFile(const char *path, size_t &len, size_t li
    File f = SD.open(path, FILE_READ);
    if (!f) return nullptr;
    size_t size = f.size();
-   if (size == 0 || size > limit) { f.close(); return nullptr; }
+   if (size > limit) { f.close(); return nullptr; }
    unsigned char *buf = (unsigned char *)mbedtls_calloc(1, size + 1);
    if (!buf) { f.close(); return nullptr; }
    len = f.read(buf, size);
@@ -494,13 +504,13 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    return Fetched;
 }
 
-// One URL from urls.txt, through its redirects, to its file on the card.
+// One URL from the list, through its redirects, to its file on the card.
 // Success's value is the bytes saved.
 FLASHMEM static Result Download(const char *text, mbedtls_ssl_config &conf, char *line)
 {
    static Url url;
    if (!ParseUrl(text, url)) return Result{ UrlParse, 0 };
-   static char outPath[sizeof(OutDir) + MaxNameLen];
+   static char outPath[sizeof(Dir) + MaxNameLen + 1];
    OutputPath(url, outPath);
 
    Result result{ Done, 0 };
@@ -521,7 +531,7 @@ FLASHMEM static Result Download(const char *text, mbedtls_ssl_config &conf, char
 // the card even though the menu shows only one result.
 FLASHMEM static void LogResult(const Result &r, uint32_t ms, const char *url)
 {
-   File f = SD.open(ResultsPath, FILE_WRITE);
+   File f = SD.open(LogPath, FILE_WRITE);
    if (!f) return;
    char head[40];
    snprintf(head, sizeof(head), "$%02X %lu %lu ", r.stage, (unsigned long)r.value, (unsigned long)ms);
@@ -534,20 +544,42 @@ FLASHMEM static void LogResult(const Result &r, uint32_t ms, const char *url)
 FLASHMEM static void Fetch()
 {
    if (!SD.begin(BUILTIN_SDCARD)) ReturnToMenu(SdInit, 0);
-   SD.remove(ResultsPath);
+
+   // The main image wrote the launch record before rebooting: the package's
+   // folder, and the .www file the user picked.
+   static VmLaunchRecord launch;
+   {
+      File f = SD.open("/VMS/launch.vml", FILE_READ);
+      bool read = f && f.size() == sizeof(launch) && f.read(&launch, sizeof(launch)) == sizeof(launch);
+      if (f) f.close();
+      if (!read || !vm_launch_valid(launch)) ReturnToMenu(Launch, 0);
+   }
+   if (!launch.content[0]) ReturnToMenu(Launch, 1);
+   const char *slash = strrchr(launch.content, '/');
+   ListName = slash + 1;
+   memcpy(Dir, launch.content, ListName - launch.content);
+   Dir[ListName - launch.content] = 0;
+   const char *dot = strrchr(ListName, '.');
+   size_t stem = dot ? (size_t)(dot - ListName) : strlen(ListName);
+   char caPath[sizeof(launch.root) + 8];
+   if (snprintf(TempPath, sizeof(TempPath), "%s%s", Dir, TempName) >= (int)sizeof(TempPath) ||
+       snprintf(LogPath, sizeof(LogPath), "%s%.*s.log", Dir, (int)stem, ListName) >= (int)sizeof(LogPath) ||
+       snprintf(caPath, sizeof(caPath), "%s/ca.pem", launch.root) >= (int)sizeof(caPath))
+      ReturnToMenu(Launch, 2);
+   SD.remove(LogPath);
 
    mbedtls_memory_buffer_alloc_init((unsigned char *)(Ram2Base + NetHeapSize), TlsHeapSize);
    char *line = (char *)mbedtls_calloc(1, LineSize);
    if (!line) ReturnToMenu(TlsSetup, 0);
 
    size_t urlsLen = 0;
-   char *urls = (char *)ReadFile(UrlsPath, urlsLen, MaxUrlsBytes);
+   char *urls = (char *)ReadFile(launch.content, urlsLen, MaxUrlsBytes);
    if (!urls) ReturnToMenu(UrlFile, 0);
 
    mbedtls_x509_crt ca;
    mbedtls_x509_crt_init(&ca);
    size_t caLen = 0;
-   unsigned char *caPem = ReadFile(CaPath, caLen, 64 * 1024);
+   unsigned char *caPem = ReadFile(caPath, caLen, 64 * 1024);
    if (!caPem) ReturnToMenu(CaFile, 0);
    int ret = mbedtls_x509_crt_parse(&ca, caPem, caLen);
    mbedtls_free(caPem);
