@@ -12,7 +12,9 @@
 // It follows up to five redirects to other https:// URLs, so url.txt can hold a
 // stable link such as a GitHub release download, whose signed target expires in
 // minutes. It writes the response body to /tls/download.tmp and renames it to
-// /tls/download.bin only once the whole body has arrived. The result comes back
+// /tls/<name> only once the whole body has arrived, where <name> is the last
+// segment of url.txt's path, query and fragment removed. A URL whose path ends
+// in '/', or whose last segment is no FAT long name, saves as download.bin. The result comes back
 // on the C64 menu as `extension host returned ($50/<detail>)`, where detail is
 // (stage << 24) | value; stage 0 is success with value = bytes written. The
 // stages are the Stage enum below.
@@ -77,7 +79,9 @@ enum Stage : uint8_t {
 static constexpr const char *UrlPath  = "/tls/url.txt";
 static constexpr const char *CaPath   = "/tls/ca.pem";
 static constexpr const char *TempPath = "/tls/download.tmp";
-static constexpr const char *OutPath  = "/tls/download.bin";
+static constexpr char OutDir[]        = "/tls/";
+static constexpr const char *DefaultName = "download.bin";
+static constexpr size_t MaxNameLen = 255;   // a FAT long file name
 static constexpr uint32_t IoTimeoutMs = 20000;
 static constexpr size_t SocketSize = 2048;   // EthernetClient::read narrows its count to int16_t
 static constexpr size_t LineSize = sizeof(Url::path) + 256;   // the request, or one header line
@@ -152,6 +156,22 @@ FLASHMEM static bool Printable(const char *text)
 {
    for (; *text; text++) if (*text <= ' ' || *text >= 0x7F) return false;
    return true;
+}
+
+// The file the body is saved as, named for the last segment of url.txt's path.
+// That is the name a user asked for: a redirect target, such as a GitHub
+// release asset's, ends in an opaque identifier.
+FLASHMEM static void OutputPath(const Url &url, char *path)
+{
+   size_t end = strcspn(url.path, "?#");
+   const char *name = url.path + end;
+   while (name[-1] != '/') name--;
+   size_t len = url.path + end - name;
+   bool usable = len > 0 && len <= MaxNameLen && strcspn(name, "\\:*\"<>|") >= len && strspn(name, ".") < len &&
+      !(len == 12 && strncasecmp(name, "download.tmp", 12) == 0);
+   strcpy(path, OutDir);
+   if (usable) strncat(path, name, len);
+   else strcat(path, DefaultName);
 }
 
 FLASHMEM static bool ParseUrl(const char *text, Url &url)
@@ -390,6 +410,8 @@ FLASHMEM static void Fetch()
       line[strcspn(line, "\r\n")] = 0;
    }
    if (!ParseUrl(line, url)) ReturnToMenu(UrlParse, 0);
+   static char outPath[sizeof(OutDir) + MaxNameLen];
+   OutputPath(url, outPath);
 
    mbedtls_x509_crt ca;
    mbedtls_x509_crt_init(&ca);
@@ -423,8 +445,8 @@ FLASHMEM static void Fetch()
       if (++hops > MaxRedirects) ReturnToMenu(Redirect, 0);
    }
 
-   SD.remove(OutPath);
-   if (!SD.rename(TempPath, OutPath)) ReturnToMenu(Rename, bodyBytes);
+   SD.remove(outPath);
+   if (!SD.rename(TempPath, outPath)) ReturnToMenu(Rename, bodyBytes);
    ReturnToMenu(Done, bodyBytes);
 }
 
