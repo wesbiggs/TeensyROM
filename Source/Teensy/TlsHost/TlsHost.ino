@@ -261,7 +261,10 @@ FLASHMEM static void FailBody(File &out, Stage stage, uint32_t value)
 // `line` (LineSize bytes) holds the request and then each header line in turn.
 FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, uint32_t &bodyBytes)
 {
-   static EthernetClient client;
+   // A new client per connection: EthernetClient counts unread bytes in
+   // _remaining, which neither stop() nor connect() clears, so a reused client
+   // hands the next connection's first reads the bytes the last one left unread.
+   EthernetClient client;
    // Resolved here rather than by connect(host, port), which returns the same 0
    // for a failed lookup and a failed connection. Connect's value is the time
    // it took, which tells a refusal from the 10 s connect timeout.
