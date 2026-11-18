@@ -17,7 +17,8 @@
 // is renamed to <name> there only once all of it has arrived, where <name> is the
 // last segment of the line's path, query and fragment removed. A URL whose path
 // ends in '/', or whose last segment is no FAT long name or names the list, its
-// log or the temp file, saves as download.bin.
+// log or the temp file, saves as download.bin, or download1.bin, download2.bin...
+// when that name is taken.
 //
 // A failed URL is skipped and the rest are still tried. <list>.log beside the
 // list gets one "$<stage> <value> <ms> <url>" line per URL, value being the
@@ -94,7 +95,6 @@ enum Stage : uint8_t {
 
 static constexpr size_t MaxUrlsBytes = 16 * 1024;
 static constexpr char TempName[] = "download.tmp";
-static constexpr const char *DefaultName = "download.bin";
 static constexpr size_t MaxNameLen = 255;   // a FAT long file name
 // Set from the launch record: the selected list's folder, ending in '/', and
 // the files this host writes there. Dir and the list's stem are both cut from
@@ -228,7 +228,7 @@ FLASHMEM static char KeyChar(uint8_t key)
 {
    if (key >= 0x41 && key <= 0x5a) return key - 0x41 + 'a';
    if (key >= 0xc1 && key <= 0xda) return key - 0xc1 + 'A';
-   if (key >= 0x20 && key <= 0x40) return key;
+   if (key > 0x20 && key <= 0x40) return key;   // not space: a URL has none
    if (key == 0x5b || key == 0x5d) return key;
    if (key == 0x5f) return '_';   // the left-arrow key
    return 0;
@@ -432,8 +432,13 @@ FLASHMEM static void OutputPath(const Url &url, char *path)
    bool usable = len > 0 && len <= MaxNameLen && strcspn(name, "\\:*\"<>|") >= len && strspn(name, ".") < len &&
       !NameReserved(name, len);
    strcpy(path, Dir);
-   if (usable) strncat(path, name, len);
-   else strcat(path, DefaultName);
+   if (usable) { strncat(path, name, len); return; }
+   // No name of its own: download.bin, or the first of download1.bin,
+   // download2.bin... not already in Dir, so one unnamed file does not replace
+   // another.
+   char *tail = path + strlen(path);
+   strcpy(tail, "download.bin");
+   for (unsigned n = 1; n < 1000 && SD.exists(path); n++) sprintf(tail, "download%u.bin", n);
 }
 
 FLASHMEM static bool ParseUrl(const char *text, Url &url)
