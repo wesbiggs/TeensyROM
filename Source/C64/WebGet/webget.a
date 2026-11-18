@@ -1,7 +1,7 @@
 ; SPDX-License-Identifier: MIT
 ;
 ; WebGet client: the C64 half of the web downloader host
-; (Source/Teensy/TlsHost). The host draws every screen; this cartridge paints
+; (Source/Teensy/WebGet). The host draws every screen; this cartridge paints
 ; the rows it is sent and hands it the keys that are typed.
 ;
 ; It speaks the same IO2 link as the stock extension host's clients

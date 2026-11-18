@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// TLS spike: an extension host that fetches a list of HTTP and HTTPS URLs to
-// the SD card.
+// WebGet: an extension host that downloads HTTP and HTTPS URLs to the SD card,
+// with its progress on the C64 screen and a prompt for more.
 //
 // It runs when the user picks a .www file in the menu, which a /VMS package
 // claims (see the package line below). Its inputs are:
@@ -27,15 +27,10 @@
 // stopped the session, or stage 0 with the number of files saved when the user
 // left. The stages are the Stage enum below.
 //
-// Build and install:
-//
-//   node tools/build-firmware.mjs --target tr-plus --host-sketch Source/Teensy/TlsHost --host-tls
-//   python3 tools/bench/hostinstall.py build/firmware/TeensyROM+_<ver>_TlsHost.TRH
-//
-// The package that claims .www, with the same ca.pem copied into /VMS/WWW:
-//
-//   node tools/build-extension.mjs --id WWW --extensions www --services 0 \
-//     --source vm/hello/hello.cpp --client-source Source/C64/WebGet/webget.a
+// Build it, its client package and a ready-to-copy card layout with
+// `npm run build:webget`, and install the .TRH from the TR menu or with
+// tools/bench/hostinstall.py. The client is Source/C64/WebGet/webget.a, and its
+// package (/VMS/WWW) claims .www and carries ca.pem.
 //
 // Known limits of the mbedTLS 2.12.0 that Teensyduino 1.61.0 bundles inside FNET:
 // TLS 1.2 only, and MBEDTLS_HAVE_TIME is off, so certificate validity dates are
@@ -55,7 +50,7 @@
 #include "Common/VMFail.h"
 #include "Common/NativeEthernet/src/NativeEthernet.h"
 #include "Common/NativeEthernet/src/NativeDns.h"
-#include "TlsUrl.h"
+#include "WebGetTypes.h"
 #include "third_party/mbedtls-2.12.0/src/mbedtls/platform.h"
 #include "third_party/mbedtls-2.12.0/src/mbedtls/ssl.h"
 #include "third_party/mbedtls-2.12.0/src/mbedtls/ctr_drbg.h"
@@ -74,7 +69,7 @@ Stream *CmdChannel = &Serial;
 #include "Common/ISRs.c"
 
 __attribute__((used, section(".vmhostid")))
-const VmHostId vmHostId = { VM_HOSTID_MAGIC, VM_ABI, 0, 0, "TLS spike", VM_HOST_CODE_FLOOR };
+const VmHostId vmHostId = { VM_HOSTID_MAGIC, VM_ABI, 0, 0, "WebGet", VM_HOST_CODE_FLOOR };
 
 // RAM2 is the module arena, and this host loads no module, so it takes the
 // arena at runtime: the host linker script refuses RAM2 globals, and the host
