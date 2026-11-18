@@ -4,12 +4,12 @@
 //
 // Inputs are two files on the SD card:
 //
-//   /tls/urls.txt  one https://host[:port]/path per line; blank lines and lines
+//   /tls/urls.txt  one http[s]://host[:port]/path per line; blank lines and lines
 //                  starting with '#' are skipped
 //   /tls/ca.pem    the PEM root certificate(s) that may sign the servers' chains
 //
-// Each URL follows up to five redirects to other https:// URLs, so a line can
-// hold a stable link such as a GitHub release download, whose signed target
+// Each URL follows up to five redirects, never from https:// to http://, so a
+// line can hold a stable link such as a GitHub release download, whose signed target
 // expires in minutes. Its body goes to /tls/download.tmp and is renamed to
 // /tls/<name> only once all of it has arrived, where <name> is the last segment
 // of the line's path, query and fragment removed. A URL whose path ends in '/',
@@ -180,15 +180,28 @@ FLASHMEM static int NetSend(void *ctx, const unsigned char *buf, size_t len)
    }
 }
 
-// FNET's recv returns 0 while nothing has arrived and an error once the peer
-// has closed and everything it sent has been read.
+// mbedTLS's MBEDTLS_ERR_NET_CONN_RESET, from net_sockets.h, which FNET's
+// mbedTLS port does not build.
+static constexpr int NetReset = -0x0050;
+
+// FNET's recv returns 0 while nothing has arrived and an error once the
+// connection has ended and everything it carried has been read. The socket's
+// state says how it ended: SS_CLOSING after the peer's FIN, SS_CLOSED after a
+// reset or abort. Plain HTTP with no Content-Length has only that to tell a
+// complete body from a cut one.
 FLASHMEM static int NetRecv(void *ctx, unsigned char *buf, size_t len)
 {
    uint32_t start = millis();
    while (true)
    {
       fnet_ssize_t got = fnet_socket_recv((fnet_socket_t)ctx, buf, len, 0);
-      if (got == FNET_ERR) return 0;   // EOF; mbedTLS reports it as CONN_EOF
+      if (got == FNET_ERR)
+      {
+         fnet_socket_state_t state = SS_CLOSED;
+         fnet_size_t size = sizeof(state);
+         fnet_socket_getopt((fnet_socket_t)ctx, SOL_SOCKET, SO_STATE, &state, &size);
+         return state == SS_CLOSING ? 0 : NetReset;   // 0 is EOF; mbedTLS reports it as CONN_EOF
+      }
       if (got > 0) return (int)got;
       if (millis() - start > IoTimeoutMs) return MBEDTLS_ERR_SSL_TIMEOUT;
       yield();
@@ -233,14 +246,15 @@ FLASHMEM static void OutputPath(const Url &url, char *path)
 
 FLASHMEM static bool ParseUrl(const char *text, Url &url)
 {
-   if (strncmp(text, "https://", 8) != 0) return false;
-   const char *host = text + 8;
+   const char *host;
+   if (strncmp(text, "https://", 8) == 0) { url.tls = true; url.port = 443; host = text + 8; }
+   else if (strncmp(text, "http://", 7) == 0) { url.tls = false; url.port = 80; host = text + 7; }
+   else return false;
    const char *hostEnd = host + strcspn(host, ":/");
    size_t hostLen = hostEnd - host;
    if (hostLen == 0 || hostLen >= sizeof(url.host)) return false;
    memcpy(url.host, host, hostLen);
    url.host[hostLen] = 0;
-   url.port = 443;
    const char *rest = hostEnd;
    if (*rest == ':')
    {
@@ -313,7 +327,8 @@ FLASHMEM static bool IsRedirect(int status)
 }
 
 // A Location value, absolute or host-relative, applied to `url` only when it
-// parses. An http:// target fails here, so a redirect never leaves TLS.
+// parses. An https:// URL's redirect to http:// fails here, so a download that
+// started on TLS never leaves it.
 FLASHMEM static bool ResolveLocation(const char *value, Url &url)
 {
    value += strspn(value, " \t");
@@ -324,7 +339,7 @@ FLASHMEM static bool ResolveLocation(const char *value, Url &url)
       return true;
    }
    static Url next;
-   if (!ParseUrl(value, next)) return false;
+   if (!ParseUrl(value, next) || (url.tls && !next.tls)) return false;
    url = next;
    return true;
 }
@@ -333,11 +348,14 @@ FLASHMEM static bool ResolveLocation(const char *value, Url &url)
 // download leaves no temp file, socket or TLS buffers behind for the next one.
 struct Connection
 {
+   bool tls = false;
    fnet_socket_t sock = nullptr;
    mbedtls_ssl_context ssl;
    File out;
    Connection() { mbedtls_ssl_init(&ssl); }
    ~Connection();
+   int read(unsigned char *buf, size_t len);
+   int write(const unsigned char *buf, size_t len);
 };
 
 FLASHMEM Connection::~Connection()
@@ -346,6 +364,17 @@ FLASHMEM Connection::~Connection()
    mbedtls_ssl_free(&ssl);
    if (sock) fnet_socket_close(sock);
 }
+
+FLASHMEM int Connection::read(unsigned char *buf, size_t len)
+{
+   return tls ? mbedtls_ssl_read(&ssl, buf, len) : NetRecv(sock, buf, len);
+}
+
+FLASHMEM int Connection::write(const unsigned char *buf, size_t len)
+{
+   return tls ? mbedtls_ssl_write(&ssl, buf, len) : NetSend(sock, buf, len);
+}
+
 #define FAIL(s, v) do { result = Result{ (s), (uint32_t)(v) }; return Failed; } while (0)
 
 // One GET on a fresh connection. Fetched leaves the body in TempPath with its
@@ -365,23 +394,31 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    c.sock = TcpConnect(remote, url.port);
    if (!c.sock) FAIL(Connect, millis() - start);
 
-   int ret = mbedtls_ssl_setup(&c.ssl, &conf);
-   if (ret == 0) ret = mbedtls_ssl_set_hostname(&c.ssl, url.host);
-   if (ret != 0) FAIL(TlsSetup, -ret);
-   mbedtls_ssl_set_bio(&c.ssl, c.sock, NetSend, NetRecv, nullptr);
-
-   while ((ret = mbedtls_ssl_handshake(&c.ssl)) != 0)
+   int ret;
+   c.tls = url.tls;
+   if (c.tls)
    {
-      if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) FAIL(Verify, mbedtls_ssl_get_verify_result(&c.ssl));
-      if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) FAIL(Handshake, -ret);
+      ret = mbedtls_ssl_setup(&c.ssl, &conf);
+      if (ret == 0) ret = mbedtls_ssl_set_hostname(&c.ssl, url.host);
+      if (ret != 0) FAIL(TlsSetup, -ret);
+      mbedtls_ssl_set_bio(&c.ssl, c.sock, NetSend, NetRecv, nullptr);
+      while ((ret = mbedtls_ssl_handshake(&c.ssl)) != 0)
+      {
+         if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) FAIL(Verify, mbedtls_ssl_get_verify_result(&c.ssl));
+         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) FAIL(Handshake, -ret);
+      }
    }
 
+   // A port other than the scheme's own goes in Host, which a virtual host
+   // on a non-standard port may need to find the site.
+   char port[8] = "";
+   if (url.port != (url.tls ? 443 : 80)) snprintf(port, sizeof(port), ":%u", url.port);
    int reqLen = snprintf(line, LineSize,
-      "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: TeensyROM\r\nConnection: close\r\n\r\n", url.path, url.host);
+      "GET %s HTTP/1.0\r\nHost: %s%s\r\nUser-Agent: TeensyROM\r\nConnection: close\r\n\r\n", url.path, url.host, port);
    if (reqLen <= 0 || reqLen >= (int)LineSize) FAIL(Request, 0);
    for (int off = 0; off < reqLen; )
    {
-      ret = mbedtls_ssl_write(&c.ssl, (const unsigned char *)line + off, reqLen - off);
+      ret = c.write((const unsigned char *)line + off, reqLen - off);
       if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
       if (ret <= 0) FAIL(Request, -ret);
       off += ret;
@@ -393,16 +430,16 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    // Location, which is then refused rather than followed cut short.
    int status = 0;
    int32_t contentLength = -1;
-   bool location = false, overflow = false, inBody = false, closeNotify = false;
+   bool location = false, overflow = false, inBody = false, closeNotify = false, eof = false;
    size_t lineLen = 0, headBytes = 0;
    bodyBytes = 0;
    unsigned char buf[4096];
    while (true)
    {
-      ret = mbedtls_ssl_read(&c.ssl, buf, sizeof(buf));
+      ret = c.read(buf, sizeof(buf));
       if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
       if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) { closeNotify = true; break; }
-      if (ret == 0 || ret == MBEDTLS_ERR_SSL_CONN_EOF) break;
+      if (ret == 0 || ret == MBEDTLS_ERR_SSL_CONN_EOF) { eof = true; break; }
       if (ret == MBEDTLS_ERR_SSL_TIMEOUT) FAIL(ReadTimeout, bodyBytes);
       if (ret < 0) FAIL(Response, -ret);
 
@@ -433,7 +470,7 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
          if (IsRedirect(status))
          {
             if (!location) FAIL(Redirect, status);
-            mbedtls_ssl_close_notify(&c.ssl);
+            if (c.tls) mbedtls_ssl_close_notify(&c.ssl);
             return Redirected;
          }
          if (status != 200) FAIL(HttpStatus, status);
@@ -446,9 +483,10 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
       bodyBytes += bodyLen;
    }
 
-   // Without close_notify or a Content-Length to check against, a cut connection
-   // looks the same as a complete body, so neither is taken as complete.
-   bool complete = inBody && (contentLength >= 0 ? bodyBytes == (uint32_t)contentLength : closeNotify);
+   // With no Content-Length, a TLS body is complete only on close_notify: an
+   // attacker can forge a TCP close, but not the alert. Plain HTTP has nothing
+   // better than the peer's FIN, which NetRecv tells from a reset.
+   bool complete = inBody && (contentLength >= 0 ? bodyBytes == (uint32_t)contentLength : (c.tls ? closeNotify : eof));
    if (!complete) FAIL(Truncated, bodyBytes);
    c.out.close();
    return Fetched;
