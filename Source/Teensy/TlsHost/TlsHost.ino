@@ -16,8 +16,9 @@
 // segment of url.txt's path, query and fragment removed. A URL whose path ends
 // in '/', or whose last segment is no FAT long name, saves as download.bin. The result comes back
 // on the C64 menu as `extension host returned ($50/<detail>)`, where detail is
-// (stage << 24) | value; stage 0 is success with value = bytes written. The
-// stages are the Stage enum below.
+// (stage << 24) | value; stage 0 is success with value = the milliseconds the
+// body took to arrive. The stages are the Stage enum below. Each phase's
+// milliseconds also go to /tls/timing.txt, one "<phase> <ms> <extra>" line each.
 //
 // Build and install:
 //
@@ -87,9 +88,35 @@ static constexpr size_t SocketSize = 2048;   // EthernetClient::read narrows its
 static constexpr size_t LineSize = sizeof(Url::path) + 256;   // the request, or one header line
 static constexpr size_t MaxHeadBytes = 32 * 1024;
 static constexpr uint8_t MaxRedirects = 5;
+static constexpr const char *TimingPath = "/tls/timing.txt";
+
+// Each phase's milliseconds, written to TimingPath on the way back to the menu,
+// whatever the outcome, once the SD card is up.
+static char Timing[1024];
+static size_t TimingLen;
+static bool SdReady;
+
+FLASHMEM static void LogTime(const char *phase, uint32_t ms, uint32_t extra)
+{
+   int n = snprintf(Timing + TimingLen, sizeof(Timing) - TimingLen, "%s %lu %lu\n", phase, (unsigned long)ms, (unsigned long)extra);
+   if (n > 0) TimingLen = min(TimingLen + n, sizeof(Timing) - 1);
+}
+
+FLASHMEM static void LogHost(const char *host)
+{
+   int n = snprintf(Timing + TimingLen, sizeof(Timing) - TimingLen, "host %s\n", host);
+   if (n > 0) TimingLen = min(TimingLen + n, sizeof(Timing) - 1);
+}
 
 FLASHMEM void ReturnToMenu(uint8_t stage, uint32_t value)
 {
+   if (SdReady)
+   {
+      LogTime("total", millis(), stage);
+      SD.remove(TimingPath);
+      File f = SD.open(TimingPath, FILE_WRITE);
+      if (f) { f.write(Timing, TimingLen); f.close(); }
+   }
    VmFail::set(VmFail::HostReturned, ((uint32_t)stage << 24) | (value & 0xFFFFFF));
    EEPROM.write(VM_EEP_BOOTIND_ADDR, VM_BOOT_FROM_MIN);
    delay(10);
@@ -279,8 +306,9 @@ FLASHMEM static void FailBody(File &out, Stage stage, uint32_t value)
 // One GET on a fresh connection. Returns true once the body is in TempPath, with
 // its size in `bodyBytes`, or false for a redirect, with `url` now its target.
 // `line` (LineSize bytes) holds the request and then each header line in turn.
-FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, uint32_t &bodyBytes)
+FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, uint32_t &bodyBytes, uint32_t &bodyMs)
 {
+   LogHost(url.host);
    // A new client per connection: EthernetClient counts unread bytes in
    // _remaining, which neither stop() nor connect() clears, so a reused client
    // hands the next connection's first reads the bytes the last one left unread.
@@ -293,8 +321,11 @@ FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, ui
    dns.begin(Ethernet.dnsServerIP());
    uint32_t start = millis();
    if (!dns.getHostByName(url.host, remote)) ReturnToMenu(Dns, millis() - start);
+   LogTime("dns", millis() - start, 0);
    start = millis();
    if (!client.connect(remote, url.port)) ReturnToMenu(Connect, millis() - start);
+   LogTime("connect", millis() - start, 0);
+   start = millis();
 
    mbedtls_ssl_context ssl;
    mbedtls_ssl_init(&ssl);
@@ -308,6 +339,8 @@ FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, ui
       if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) ReturnToMenu(Verify, mbedtls_ssl_get_verify_result(&ssl));
       if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) ReturnToMenu(Handshake, -ret);
    }
+   LogTime("handshake", millis() - start, 0);
+   start = millis();
 
    int reqLen = snprintf(line, LineSize,
       "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: TeensyROM\r\nConnection: close\r\n\r\n", url.path, url.host);
@@ -364,6 +397,8 @@ FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, ui
          overflow = false;
          if (!inBody) continue;
 
+         LogTime("head", millis() - start, status);
+         start = millis();
          if (IsRedirect(status))
          {
             if (!location) ReturnToMenu(Redirect, status);
@@ -387,12 +422,16 @@ FLASHMEM static bool Exchange(Url &url, mbedtls_ssl_config &conf, char *line, ui
    bool complete = inBody && (contentLength >= 0 ? bodyBytes == (uint32_t)contentLength : closeNotify);
    if (!complete) FailBody(out, Truncated, bodyBytes);
    out.close();
+   bodyMs = millis() - start;
+   LogTime("body", bodyMs, bodyBytes);
    return true;
 }
 
 FLASHMEM static void Fetch()
 {
    if (!SD.begin(BUILTIN_SDCARD)) ReturnToMenu(SdInit, 0);
+   SdReady = true;
+   LogTime("boot", millis(), 0);
 
    mbedtls_memory_buffer_alloc_init((unsigned char *)(Ram2Base + NetHeapSize), TlsHeapSize);
    char *line = (char *)mbedtls_calloc(1, LineSize);
@@ -429,7 +468,10 @@ FLASHMEM static void Fetch()
    ret = mbedtls_ctr_drbg_seed(&drbg, TrngEntropy, nullptr, (const unsigned char *)"TeensyROM", 9);
    if (ret != 0) ReturnToMenu(DrbgSeed, -ret);
 
+   LogTime("setup", millis(), 0);
+   uint32_t start = millis();
    if (!EthernetUp()) ReturnToMenu(NetInit, Ethernet.linkStatus());
+   LogTime("ethernet", millis() - start, 0);
 
    mbedtls_ssl_config conf;
    mbedtls_ssl_config_init(&conf);
@@ -439,15 +481,15 @@ FLASHMEM static void Fetch()
    mbedtls_ssl_conf_ca_chain(&conf, &ca, nullptr);
    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
 
-   uint32_t bodyBytes = 0;
-   for (uint8_t hops = 0; !Exchange(url, conf, line, bodyBytes); )
+   uint32_t bodyBytes = 0, bodyMs = 0;
+   for (uint8_t hops = 0; !Exchange(url, conf, line, bodyBytes, bodyMs); )
    {
       if (++hops > MaxRedirects) ReturnToMenu(Redirect, 0);
    }
 
    SD.remove(outPath);
    if (!SD.rename(TempPath, outPath)) ReturnToMenu(Rename, bodyBytes);
-   ReturnToMenu(Done, bodyBytes);
+   ReturnToMenu(Done, bodyMs);
 }
 
 void setup()
