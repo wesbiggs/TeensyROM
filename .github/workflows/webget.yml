@@ -1,0 +1,110 @@
+name: Build WebGet
+
+# The WebGet extension host (Source/Teensy/WebGet) and its card layout, from
+# `npm run build:webget`. A file of its own beside build.yml, so a rebase onto
+# upstream rarely touches it.
+#
+# It runs on a change to anything the .TRH is built from. The host is compiled
+# on top of the MinimalBoot sketch, so a change there reaches it too, and tools/
+# holds the build and the linker script. A WebGet_v* tag builds without path
+# filters (GitHub does not apply them to tags) and drafts a release.
+on:
+  push:
+    branches: ['**']
+    tags: ['WebGet_v*']
+    paths:
+      - 'Source/Teensy/WebGet/**'
+      - 'Source/C64/WebGet/**'
+      - 'Source/Teensy/MinimalBoot/**'
+      - 'tools/**'
+      - 'vm/**'
+      - 'package.json'
+      - '.nvmrc'
+      - '.github/workflows/webget.yml'
+  pull_request:
+    paths:
+      - 'Source/Teensy/WebGet/**'
+      - 'Source/C64/WebGet/**'
+      - 'Source/Teensy/MinimalBoot/**'
+      - 'tools/**'
+      - 'vm/**'
+      - 'package.json'
+      - '.nvmrc'
+      - '.github/workflows/webget.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # git describe needs the WebGet_v* tags to name the build.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: '.nvmrc'
+
+      # As in build.yml: unpinned on purpose, tracked by tools/check-pins.mjs.
+      - name: Install ACME
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y acme
+          acme --version
+
+      - name: Run tool tests
+        run: npm test
+
+      - name: Install arduino-cli
+        run: |
+          CLI=$(node tools/install-arduino-cli.mjs)
+          echo "Resolved arduino-cli: $CLI"
+          if [ "$CLI" != "arduino-cli" ]; then
+            dirname "$CLI" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install Teensy core 1.61.0
+        run: |
+          arduino-cli config init --additional-urls https://www.pjrc.com/teensy/package_teensy_index.json
+          arduino-cli core update-index
+          arduino-cli core install teensy:avr@1.61.0
+          arduino-cli lib install CRC32@2.0.1
+
+      # The host names itself "WebGet" in the descriptor the TR menu reads; a build that
+      # packaged some other identity would otherwise pass.
+      - name: Build WebGet
+        shell: bash
+        run: |
+          built=$(npm run build:webget)
+          echo "$built"
+          grep -q 'Host "WebGet"' <<<"$built"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: webget
+          path: build/webget/WebGet_*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/WebGet_v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: webget
+          path: build/webget
+
+      # A draft, so the notes can be written and the zip tried on a board before
+      # anyone sees it; it goes public when published from the Releases page.
+      - name: Draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          files: build/webget/WebGet_*.zip
