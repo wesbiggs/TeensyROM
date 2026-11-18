@@ -41,6 +41,12 @@
 //   --host-code-kib 64|96  with --host-sketch only: how much ITCM the host's code may
 //            fill. The default, 64, is what the stock host is linked at. 96 lets a
 //            third-party host's code grow up to the module window at 0x18000.
+//   --host-tls  with --host-sketch only: link mbedTLS into the host, for a host that makes
+//            TLS connections itself. FNET_CFG_TLS stays 0, so FNET's own TLS layer and its
+//            test credentials stay out; the host calls mbedTLS directly. mbedTLS gets its
+//            memory from a buffer the host hands it (MBEDTLS_MEMORY_BUFFER_ALLOC_C), since
+//            the host heap is 16 KiB, and FNET's code runs from flash, since ITCM cannot
+//            hold it. The stock images and the stock host never take this.
 //   --tag <name>  a special build. The name goes on the version string in every image
 //            ("TeensyROM+ v0.9-pr65" on the C64 banner and in the serial version reply) and
 //            into the output names (TeensyROM+_0.9-pr65_full.hex). Letters, digits, '.'
@@ -109,6 +115,7 @@ const { option, flag } = scanArgs(process.argv.slice(2), {
   flags: [
     '--yes', '--force', '--keep-work', '--skip-teensy-build', '--skip-minimal-build',
     '--skip-combine', '--skip-extension-build', '--no-extensions', '--with-extensions', '--ccache',
+    '--host-tls',
   ],
 });
 
@@ -162,6 +169,10 @@ if (hostCodeOption !== null && hostSketchOption === null) {
 }
 if (hostCodeOption !== null && !HOST_CODE_KIB.map(String).includes(hostCodeOption)) {
   throw new Error('--host-code-kib must be 64 or 96');
+}
+const hostTls = flag('--host-tls');
+if (hostTls && hostSketchOption === null) {
+  throw new Error('--host-tls requires an explicit --host-sketch');
 }
 const hostCodeKiB = hostCodeOption === null ? DEFAULT_HOST_CODE_KIB : Number(hostCodeOption);
 if (hostSketchOption !== null && !withExtensions) {
@@ -444,6 +455,9 @@ if (useCcache) {
 // behind an #ifndef), which links mbedTLS into MinimalBoot and the main image. build()
 // appends this to every image it compiles, the extension host included.
 const TLS_OFF = '-DFNET_CFG_TLS=0';
+// --host-tls: the two mbedTLS options FNET's config.h leaves off, which let the host give
+// mbedTLS a buffer of its own instead of the 16 KiB host heap.
+const HOST_TLS_DEFS = ' -DMBEDTLS_PLATFORM_MEMORY -DMBEDTLS_MEMORY_BUFFER_ALLOC_C';
 
 // `suffix` picks a stock BootLinkerFiles pair; `ld`/`bootdata` override it with
 // generated text, which is how the extension image gets its own flash slot.
@@ -454,7 +468,7 @@ function writeLinkerFiles(suffix, { ld, bootdata } = {}) {
     ld ?? read(path.join(linkers, `imxrt1062_t41.ld.${suffix}`)));
 }
 
-function build(name, { inoPath, fqbn, suffix, elfStem, ld, bootdata, usbType, extraDefs = '', minFreeLocals = 0, checkHeavyLibc = false }) {
+function build(name, { inoPath, fqbn, suffix, elfStem, ld, bootdata, usbType, extraDefs = '', minFreeLocals = 0, checkHeavyLibc = false, allowMbedtls = false }) {
   console.log(`\n[${name}] Building`);
   writeLinkerFiles(suffix, { ld, bootdata });
   const buildDir = path.join(runRoot, name);
@@ -495,7 +509,7 @@ function build(name, { inoPath, fqbn, suffix, elfStem, ld, bootdata, usbType, ex
   const symbols = run(armBin + 'nm' + exeSuffix, ['-n', '-C', elf], env);
   write(path.join(runRoot, `${name}.nm`), symbols);
   if (!/^[0-9a-fA-F]+ \S /m.test(symbols)) throw new Error(`nm listed no symbols for ${name}; the linked-symbol checks cannot run`);
-  if (/mbedtls/i.test(symbols)) throw new Error(`mbedTLS is linked into ${name}; ${TLS_OFF} should have kept it out`);
+  if (!allowMbedtls && /mbedtls/i.test(symbols)) throw new Error(`mbedTLS is linked into ${name}; ${TLS_OFF} should have kept it out`);
   // The extension image skips this: a third-party host may use these in its own RAM.
   if (checkHeavyLibc) {
     const linked = heavyLibcLinked(symbols);
@@ -589,10 +603,11 @@ if (withExtensions && !skipExtensionBuild) {
     inoPath: path.join(sketch, hostEntryIno),
     fqbn: 'teensy:avr:teensy41:usb=serial,speed=600,opt=o2std,keys=en-us',
     elfStem,
-    ld: extensionLinkerScript(linkers, hostCodeKiB),
+    ld: extensionLinkerScript(linkers, hostCodeKiB, { flashLibraries: hostTls ? ['FNET'] : [] }),
     bootdata: extensionBootdata(linkers),
     usbType: 'USB_DISABLED',
-    extraDefs: ' -DVM_HOST_PROFILE',
+    extraDefs: ' -DVM_HOST_PROFILE' + (hostTls ? HOST_TLS_DEFS : ''),
+    allowMbedtls: hostTls,
   });
 } else if (withExtensions) {
   console.log('\n[extension] Skipped (--skip-extension-build)');

@@ -87,7 +87,9 @@ export function flashResidentLibraryAround(dir) {
 // The extension image: relocated to its own slot, its ITCM footprint pinned and
 // its heap capped, with five ASSERTs that turn a host/module layout regression
 // into a link error instead of a hang on hardware.
-export function extensionLinkerScript(linkers, hostCodeKiB = DEFAULT_HOST_CODE_KIB) {
+// `flashLibraries` names further libraries whose code runs from flash, for a host that
+// links one too large for ITCM (--host-tls: FNET, which carries mbedTLS).
+export function extensionLinkerScript(linkers, hostCodeKiB = DEFAULT_HOST_CODE_KIB, { flashLibraries = [] } = {}) {
   assert(HOST_CODE_KIB.includes(hostCodeKiB), 'Host code budget must be 64 or 96 KiB');
   let ld = read(path.join(linkers, 'imxrt1062_t41.ld.orig'));
   ld = replaceOnce(ld, `ORIGIN = 0x${FLASH_BASE.toString(16)}, LENGTH = ${STOCK_MINIMAL_KB}K`,
@@ -100,12 +102,15 @@ export function extensionLinkerScript(linkers, hostCodeKiB = DEFAULT_HOST_CODE_K
     // once the link command would grow too long, and ld matches an archive member only by
     // the archive:member form, so without the second rule every library here would
     // silently land in ITCM, SdioTeensy's exclusion included.
-    Object.entries(FLASH_RESIDENT_LIBRARIES).map(([name, staying]) => {
+    // A `flashLibraries` library moves its constants too: the core script puts .rodata in
+    // DTCM, and mbedTLS's tables alone would push the host's data into the module window.
+    [...Object.entries(FLASH_RESIDENT_LIBRARIES).map(([name, staying]) => [name, staying, '.text*']),
+     ...flashLibraries.map((name) => [name, [], '.text* .rodata*'])].map(([name, staying, sections]) => {
       const dir = `*${PATH_SEPARATOR}libraries${PATH_SEPARATOR}${name}${PATH_SEPARATOR}*`;
       const exclude = (prefix) => staying.length
         ? `EXCLUDE_FILE(${staying.map((file) => `${prefix}${file}`).join(' ')}) ` : '';
-      return `\t\t${dir}(${exclude(`*${PATH_SEPARATOR}`)}.text*)\n` +
-        `\t\t${dir}:*(${exclude('*:')}.text*)\n`;
+      return `\t\t${dir}(${exclude(`*${PATH_SEPARATOR}`)}${sections})\n` +
+        `\t\t${dir}:*(${exclude('*:')}${sections})\n`;
     }).join(''));
   // Pin the host to six 32 KiB ITCM blocks, so the module window at 0x18000
   // cannot be pushed around by a change in host code size.
