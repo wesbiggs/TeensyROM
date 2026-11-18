@@ -91,6 +91,15 @@ main:
         bne running
         jmp failed
 running:
+        ; A write the host's PHI2 interrupt was too late for is lost (see
+        ; NetPollFromLoop in TlsHost.ino), so the start and the ACK are repeated:
+        ; the start until the host reports running, the ACK on every pass. Both
+        ; are harmless to repeat.
+        cmp #2
+        beq started
+        lda #1
+        sta CMD
+started:
         lda SEQ
         beq noPacket             ; nothing published yet
         cmp lastseq
@@ -99,8 +108,9 @@ running:
         bcc noPacket             ; bad frame: leave it, the host will hold it
         lda packetbuf + 4        ; the sequence the packet itself carries
         sta lastseq
-        sta ACK
 noPacket:
+        lda lastseq
+        sta ACK
         jsr pollKeys
         jmp main
 

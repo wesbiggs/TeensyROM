@@ -280,8 +280,33 @@ FLASHMEM static void LogLine(uint8_t colour, const char *text)
 static bool Prompting;
 static uint32_t Saved;
 FLASHMEM static void Exit(uint8_t stage, uint32_t value);
+
+// FNET's poll runs here, from thread mode, while the C64 runs, rather than in
+// NativeEthernet's 1 ms PIT interrupt: the main image measured that interrupt
+// making about 39 PHI2 interrupts a second late (over 1.1 us) despite PHI2's
+// higher priority, against about one every 2 s polled from loop() (Teensy.ino,
+// FnetLoopPollService). Here a late one lost the client's ACK, freezing the
+// screen mid-download, and a ROM read during its cold start, crashing it.
+// DHCP and DNS busy-wait on results only the poll delivers, so the PIT polls
+// around them.
+static bool NetPollHere;
+FLASHMEM static void NetPollFromLoop(bool here)
+{
+   NetPollHere = here;
+   if (here) NVIC_DISABLE_IRQ(IRQ_PIT); else NVIC_ENABLE_IRQ(IRQ_PIT);
+}
+
+FLASHMEM static void PollNet()
+{
+   static uint32_t last;
+   if (!NetPollHere || micros() - last < 1000) return;
+   last = micros();
+   fnet_poll();
+}
+
 FLASHMEM static void Idle()
 {
+   PollNet();
    LinkService();
    FollowVideoStd();
    if (BtnPressed) Exit(Done, Saved);
@@ -597,7 +622,10 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    // Dns's and Connect's values are the milliseconds they took, which tells a
    // refusal from a timeout.
    uint32_t start = millis();
-   if (!dns.getHostByName(url.host, remote)) FAIL(Dns, millis() - start);
+   NetPollFromLoop(false);
+   const bool found = dns.getHostByName(url.host, remote);
+   NetPollFromLoop(true);
+   if (!found) FAIL(Dns, millis() - start);
    start = millis();
    Putf(StatusRow, Yellow, PSTR("connecting to %s"), url.host);
    Idle();
@@ -649,6 +677,7 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    unsigned char buf[4096];
    while (true)
    {
+      PollNet();
       ret = c.read(buf, sizeof(buf));
       if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
       if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) { closeNotify = true; break; }
@@ -918,6 +947,7 @@ FLASHMEM static void Session()
 
    Status(PSTR("starting the network"));
    if (!EthernetUp()) Stop(NetInit, Ethernet.linkStatus(), PSTR("no network"));
+   NetPollFromLoop(true);
 
    mbedtls_ssl_config conf;
    mbedtls_ssl_config_init(&conf);
