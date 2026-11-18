@@ -23,8 +23,9 @@
 // A failed URL is skipped and the rest are still tried. <list>.log beside the
 // list gets one "$<stage> <value> <ms> <url>" line per URL, value being the
 // bytes saved on success. The menu shows `extension host returned
-// ($50/<detail>)`, where detail is (stage << 24) | value: the first failure's,
-// or stage 0 with the number of files saved. The stages are the Stage enum below.
+// ($50/<detail>)`, where detail is (stage << 24) | value: the failure that
+// stopped the session, or stage 0 with the number of files saved when the user
+// left. The stages are the Stage enum below.
 //
 // Build and install:
 //
@@ -34,7 +35,7 @@
 // The package that claims .www, with the same ca.pem copied into /VMS/WWW:
 //
 //   node tools/build-extension.mjs --id WWW --extensions www --services 0 \
-//     --source vm/hello/hello.cpp --client-source Source/C64/VMHello/vmhello.a
+//     --source vm/hello/hello.cpp --client-source Source/C64/WebGet/webget.a
 //
 // Known limits of the mbedTLS 2.12.0 that Teensyduino 1.61.0 bundles inside FNET:
 // TLS 1.2 only, and MBEDTLS_HAVE_TIME is off, so certificate validity dates are
@@ -209,9 +210,9 @@ FLASHMEM static void LinkService()
    EZFlashRAM[0xf7] = sequence;
 }
 
-// IOH_EasyFlash's polling handler calls this from loop(); Idle() calls it
-// from every wait.
-void VMHostPoll() { LinkService(); }
+// IOH_EasyFlash's polling handler names this, but loop() never runs that
+// handler: it and Idle() call LinkService() themselves.
+FLASHMEM void VMHostPoll() { LinkService(); }
 
 // ASCII to a screen code in the lower/upper case set the client selects.
 FLASHMEM static uint8_t ScreenCode(char c)
@@ -273,8 +274,9 @@ FLASHMEM static void LogLine(uint8_t colour, const char *text)
    Put(LogBottom, colour, text);
 }
 
-// Every wait calls this, so the screen keeps up and RUN/STOP or the TR button
-// can leave mid-download.
+// The prompt and every wait on a socket call this, so the screen keeps up and
+// RUN/STOP or the TR button can leave mid-download. DHCP, the DNS lookup and
+// the TLS handshake's own computation block without it.
 static bool Prompting;
 static uint32_t Saved;
 FLASHMEM static void Exit(uint8_t stage, uint32_t value);
@@ -296,9 +298,9 @@ FLASHMEM static void Progress(uint32_t bytes, int32_t total)
    ProgressShown = now;
    const uint32_t ms = now - ProgressStart;
    const uint32_t rate = ms ? bytes / ms : 0;   // bytes per ms is kB/s
-   if (total > 0) Putf(StatusRow, Yellow, "%lu/%ld %lu%% %lukB/s", (unsigned long)bytes, (long)total,
+   if (total > 0) Putf(StatusRow, Yellow, PSTR("%lu/%ld %lu%% %lukB/s"), (unsigned long)bytes, (long)total,
                        (unsigned long)((uint64_t)bytes * 100 / (uint32_t)total), (unsigned long)rate);
-   else Putf(StatusRow, Yellow, "%lu bytes %lukB/s", (unsigned long)bytes, (unsigned long)rate);
+   else Putf(StatusRow, Yellow, PSTR("%lu bytes %lukB/s"), (unsigned long)bytes, (unsigned long)rate);
 }
 
 // The i.MX RT1062 TRNG, read directly. FNET's own mbedTLS entropy callback is
@@ -441,7 +443,7 @@ FLASHMEM static void OutputPath(const Url &url, char *path)
    // another.
    char *tail = path + strlen(path);
    strcpy(tail, "download.bin");
-   for (unsigned n = 1; n < 1000 && SD.exists(path); n++) sprintf(tail, "download%u.bin", n);
+   for (unsigned n = 1; n < 1000 && SD.exists(path); n++) snprintf(tail, MaxNameLen + 1, PSTR("download%u.bin"), n);
 }
 
 FLASHMEM static bool ParseUrl(const char *text, Url &url)
@@ -544,6 +546,12 @@ FLASHMEM static bool ResolveLocation(const char *value, Url &url)
    return true;
 }
 
+// The body being written to TempPath, outside Connection so that Exit(), which
+// Idle() can call mid-body, closes it before removing the file: SdFat writes a
+// new file's first cluster into its directory entry only on close, so removing
+// it while open frees none of its clusters.
+static File Output;
+
 // What one connection holds, released however the exchange ends: a failed
 // download leaves no temp file, socket or TLS buffers behind for the next one.
 struct Connection
@@ -551,7 +559,6 @@ struct Connection
    bool tls = false;
    fnet_socket_t sock = nullptr;
    mbedtls_ssl_context ssl;
-   File out;
    Connection() { mbedtls_ssl_init(&ssl); }
    ~Connection();
    int read(unsigned char *buf, size_t len);
@@ -560,7 +567,7 @@ struct Connection
 
 FLASHMEM Connection::~Connection()
 {
-   if (out) { out.close(); SD.remove(TempPath); }
+   if (Output) { Output.close(); SD.remove(TempPath); }
    mbedtls_ssl_free(&ssl);
    if (sock) fnet_socket_close(sock);
 }
@@ -586,13 +593,13 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    IPAddress remote;
    DNSClient dns;
    dns.begin(Ethernet.dnsServerIP());
-   Putf(StatusRow, Yellow, "looking up %s", url.host);
+   Putf(StatusRow, Yellow, PSTR("looking up %s"), url.host);
    // Dns's and Connect's values are the milliseconds they took, which tells a
    // refusal from a timeout.
    uint32_t start = millis();
    if (!dns.getHostByName(url.host, remote)) FAIL(Dns, millis() - start);
    start = millis();
-   Putf(StatusRow, Yellow, "connecting to %s", url.host);
+   Putf(StatusRow, Yellow, PSTR("connecting to %s"), url.host);
    Idle();
    c.sock = TcpConnect(remote, url.port);
    if (!c.sock) FAIL(Connect, millis() - start);
@@ -601,7 +608,7 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    c.tls = url.tls;
    if (c.tls)
    {
-      Status("securing the connection");
+      Status(PSTR("securing the connection"));
       Idle();
       ret = mbedtls_ssl_setup(&c.ssl, &conf);
       if (ret == 0) ret = mbedtls_ssl_set_hostname(&c.ssl, url.host);
@@ -618,7 +625,7 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    // on a non-standard port may need to find the site.
    char port[8] = "";
    if (url.port != (url.tls ? 443 : 80)) snprintf(port, sizeof(port), ":%u", url.port);
-   Status("waiting for the server");
+   Status(PSTR("waiting for the server"));
    int reqLen = snprintf(line, LineSize,
       "GET %s HTTP/1.0\r\nHost: %s%s\r\nUser-Agent: TeensyROM\r\nConnection: close\r\n\r\n", url.path, url.host, port);
    if (reqLen <= 0 || reqLen >= (int)LineSize) FAIL(Request, 0);
@@ -683,13 +690,13 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
          }
          if (status != 200) FAIL(HttpStatus, status);
          SD.remove(TempPath);
-         c.out = SD.open(TempPath, FILE_WRITE);
+         Output = SD.open(TempPath, FILE_WRITE);
          ProgressStart = millis();
          ProgressShown = 0;
-         if (!c.out) FAIL(FileWrite, 0);
+         if (!Output) FAIL(FileWrite, 0);
       }
       size_t bodyLen = ret - at;
-      if (bodyLen && c.out.write(buf + at, bodyLen) != bodyLen) FAIL(FileWrite, bodyBytes);
+      if (bodyLen && Output.write(buf + at, bodyLen) != bodyLen) FAIL(FileWrite, bodyBytes);
       bodyBytes += bodyLen;
       Progress(bodyBytes, contentLength);
    }
@@ -699,15 +706,15 @@ FLASHMEM static Outcome Exchange(Url &url, mbedtls_ssl_config &conf, char *line,
    // better than the peer's FIN, which NetRecv tells from a reset.
    bool complete = inBody && (contentLength >= 0 ? bodyBytes == (uint32_t)contentLength : (c.tls ? closeNotify : eof));
    if (!complete) FAIL(Truncated, bodyBytes);
-   c.out.close();
+   Output.close();
    return Fetched;
 }
 
-// One URL from the list, through its redirects, to its file on the card.
-// Success's value is the bytes saved.
 // The name the last download saved, or would have, as.
 static const char *LastName;
 
+// One URL, through its redirects, to its file on the card. Success's value is
+// the bytes saved.
 FLASHMEM static Result Download(const char *text, mbedtls_ssl_config &conf, char *line)
 {
    static Url url;
@@ -793,7 +800,7 @@ FLASHMEM static const char *ReadUrl()
 FLASHMEM static bool StartClient(const VmLaunchRecord &launch)
 {
    char path[sizeof(launch.root) + 16];
-   snprintf(path, sizeof(path), "%s/client.crt", launch.root);
+   snprintf(path, sizeof(path), PSTR("%s/client.crt"), launch.root);
    File f = SD.open(path, FILE_READ);
    if (!f) return false;
    uint8_t header[64], chip[16], descriptor[128];
@@ -833,6 +840,7 @@ static VmLaunchRecord LaunchRecord;
 // Every way out: the record the menu shows, and no temp file left behind.
 FLASHMEM static void Exit(uint8_t stage, uint32_t value)
 {
+   if (Output) Output.close();
    if (TempPath[0]) SD.remove(TempPath);
    ReturnToMenu(stage, value);
 }
@@ -841,7 +849,7 @@ FLASHMEM static void Exit(uint8_t stage, uint32_t value)
 // then in the record the menu shows.
 FLASHMEM static void Stop(uint8_t stage, uint32_t value, const char *what)
 {
-   Putf(StatusRow, LightRed, "%s ($%02X/%lX)", what, stage, (unsigned long)value);
+   Putf(StatusRow, LightRed, PSTR("%s ($%02X/%lX)"), what, stage, (unsigned long)value);
    Prompting = true;
    while (true)
    {
@@ -863,32 +871,32 @@ FLASHMEM static void FetchOne(const char *text, mbedtls_ssl_config &conf, char *
    if (r.stage == Done)
    {
       Saved++;
-      snprintf(entry, sizeof(entry), "%-8lu %s", (unsigned long)r.value, LastName);
+      snprintf(entry, sizeof(entry), PSTR("%-8lu %s"), (unsigned long)r.value, LastName);
       LogLine(Green, entry);
    }
    else
    {
-      snprintf(entry, sizeof(entry), "$%02X %-4lu %s", r.stage, (unsigned long)r.value, shown);
+      snprintf(entry, sizeof(entry), PSTR("$%02X %-4lu %s"), r.stage, (unsigned long)r.value, shown);
       LogLine(LightRed, entry);
    }
-   Status("ready");
+   Status(PSTR("ready"));
 }
 
 FLASHMEM static void Session()
 {
-   Put(TitleRow, LightBlue, "TeensyROM web downloader");
-   Putf(FolderRow, Grey, "into %s", Dir);
-   Put(HelpRow, Grey, "return fetches, run/stop leaves");
+   Put(TitleRow, LightBlue, PSTR("TeensyROM web downloader"));
+   Putf(FolderRow, Grey, PSTR("into %s"), Dir);
+   Put(HelpRow, Grey, PSTR("return fetches, run/stop leaves"));
    for (uint8_t row = LogTop; row <= LogBottom; row++) Put(row, Green, "");
-   Status("starting");
+   Status(PSTR("starting"));
 
    mbedtls_memory_buffer_alloc_init((unsigned char *)(Ram2Base + NetHeapSize), TlsHeapSize);
    char *line = (char *)mbedtls_calloc(1, LineSize);
-   if (!line) Stop(TlsSetup, 0, "out of memory");
+   if (!line) Stop(TlsSetup, 0, PSTR("out of memory"));
 
    size_t urlsLen = 0;
    char *urls = (char *)ReadFile(LaunchRecord.content, urlsLen, MaxUrlsBytes);
-   if (!urls) Stop(UrlFile, 0, "cannot read the list");
+   if (!urls) Stop(UrlFile, 0, PSTR("cannot read the list"));
 
    char caPath[sizeof(LaunchRecord.root) + sizeof("/ca.pem") - 1];
    snprintf(caPath, sizeof(caPath), "%s/ca.pem", LaunchRecord.root);
@@ -896,25 +904,25 @@ FLASHMEM static void Session()
    mbedtls_x509_crt_init(&ca);
    size_t caLen = 0;
    unsigned char *caPem = ReadFile(caPath, caLen, 64 * 1024);
-   if (!caPem) Stop(CaFile, 0, "no ca.pem in the package");
+   if (!caPem) Stop(CaFile, 0, PSTR("no ca.pem in the package"));
    int ret = mbedtls_x509_crt_parse(&ca, caPem, caLen);
    mbedtls_free(caPem);
    // A positive ret is the number of certificates in the file that did not parse.
-   if (ret != 0) Stop(CaParse, ret < 0 ? -ret : ret, "bad ca.pem");
+   if (ret != 0) Stop(CaParse, ret < 0 ? -ret : ret, PSTR("bad ca.pem"));
 
-   if (!TrngInit()) Stop(Trng, TRNG_MCTL, "no random source");
+   if (!TrngInit()) Stop(Trng, TRNG_MCTL, PSTR("no random source"));
    mbedtls_ctr_drbg_context drbg;
    mbedtls_ctr_drbg_init(&drbg);
    ret = mbedtls_ctr_drbg_seed(&drbg, TrngEntropy, nullptr, (const unsigned char *)"TeensyROM", 9);
-   if (ret != 0) Stop(DrbgSeed, -ret, "no random source");
+   if (ret != 0) Stop(DrbgSeed, -ret, PSTR("no random source"));
 
-   Status("starting the network");
-   if (!EthernetUp()) Stop(NetInit, Ethernet.linkStatus(), "no network");
+   Status(PSTR("starting the network"));
+   if (!EthernetUp()) Stop(NetInit, Ethernet.linkStatus(), PSTR("no network"));
 
    mbedtls_ssl_config conf;
    mbedtls_ssl_config_init(&conf);
    ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
-   if (ret != 0) Stop(TlsSetup, -ret, "tls setup failed");
+   if (ret != 0) Stop(TlsSetup, -ret, PSTR("tls setup failed"));
    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
    mbedtls_ssl_conf_ca_chain(&conf, &ca, nullptr);
    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
@@ -932,7 +940,7 @@ FLASHMEM static void Session()
       FetchOne(text, conf, line);
    }
 
-   Status("ready");
+   Status(PSTR("ready"));
    while (const char *text = ReadUrl()) FetchOne(text, conf, line);
    Exit(Done, Saved);
 }
@@ -941,7 +949,7 @@ FLASHMEM static void Session()
 
 extern "C" uint32_t set_arm_clock(uint32_t frequency);
 
-void setup()
+FLASHMEM void setup()
 {
    set_arm_clock(816000000);
    SetLEDOn;
@@ -1015,7 +1023,7 @@ void setup()
    BtnPressed = false;
 }
 
-void loop()
+FLASHMEM void loop()
 {
    FollowVideoStd();
    if (BtnPressed) Exit(Done, Saved);
