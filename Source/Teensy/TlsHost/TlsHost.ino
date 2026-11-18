@@ -85,19 +85,20 @@ enum Stage : uint8_t {
    ReadTimeout, Truncated, Rename,
    Redirect,   // value: the status whose Location was missing or refused, or 0 for too many hops
    Dns,        // value: milliseconds the lookup took to fail
-   Launch,     // value: 0 no readable record, 1 no file selected, 2 a path too long
+   Launch,     // value: 0 no readable record, 1 no file selected
 };
 
 static constexpr size_t MaxUrlsBytes = 16 * 1024;
-static constexpr const char *TempName = "download.tmp";
+static constexpr char TempName[] = "download.tmp";
 static constexpr const char *DefaultName = "download.bin";
 static constexpr size_t MaxNameLen = 255;   // a FAT long file name
 // Set from the launch record: the selected list's folder, ending in '/', and
-// the files this host writes there.
+// the files this host writes there. Dir and the list's stem are both cut from
+// the record's content, so together they fit in it, and ".log" adds 4.
 static char Dir[sizeof(VmLaunchRecord::content)];
 static const char *ListName;
-static char TempPath[sizeof(Dir) + 16];
-static char LogPath[sizeof(Dir) + MaxNameLen + 8];
+static char TempPath[sizeof(Dir) + sizeof(TempName) - 1];
+static char LogPath[sizeof(Dir) + 4];
 static constexpr uint32_t IoTimeoutMs = 20000;
 static constexpr uint32_t ConnectTimeoutMs = 10000;
 // TCP keeps at most this much unread data in flight, so it caps throughput at
@@ -561,11 +562,10 @@ FLASHMEM static void Fetch()
    Dir[ListName - launch.content] = 0;
    const char *dot = strrchr(ListName, '.');
    size_t stem = dot ? (size_t)(dot - ListName) : strlen(ListName);
-   char caPath[sizeof(launch.root) + 8];
-   if (snprintf(TempPath, sizeof(TempPath), "%s%s", Dir, TempName) >= (int)sizeof(TempPath) ||
-       snprintf(LogPath, sizeof(LogPath), "%s%.*s.log", Dir, (int)stem, ListName) >= (int)sizeof(LogPath) ||
-       snprintf(caPath, sizeof(caPath), "%s/ca.pem", launch.root) >= (int)sizeof(caPath))
-      ReturnToMenu(Launch, 2);
+   char caPath[sizeof(launch.root) + sizeof("/ca.pem") - 1];
+   snprintf(TempPath, sizeof(TempPath), "%s%s", Dir, TempName);
+   snprintf(LogPath, sizeof(LogPath), "%s%.*s.log", Dir, (int)stem, ListName);
+   snprintf(caPath, sizeof(caPath), "%s/ca.pem", launch.root);
    SD.remove(LogPath);
 
    mbedtls_memory_buffer_alloc_init((unsigned char *)(Ram2Base + NetHeapSize), TlsHeapSize);
