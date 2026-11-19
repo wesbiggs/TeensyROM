@@ -181,10 +181,11 @@
     },
     {
       "name": "WebGet",
-      "description": "Client of the WebGet extension host (Source/Teensy/WebGet): a headerless 16 KiB EasyFlash image that tools/build-extension.mjs packages. Not embedded in the firmware, so it has no header.",
+      "description": "Client of the WebGet extension host (Source/Teensy/WebGet): a headerless 16 KiB EasyFlash image that tools/build-extension.mjs packages, and tlsterm, the dumb terminal tools/build-webget.mjs packages as tlsterm.tls for the host's modem. Not embedded in the firmware, so neither has a header.",
       "dir": "Source/C64/WebGet",
       "steps": [
-        { "assembler": "acme", "source": "webget.a", "output": "webget.bin", "format": "plain" }
+        { "assembler": "acme", "source": "webget.a", "output": "webget.bin", "format": "plain" },
+        { "assembler": "acme", "source": "tlsterm.a", "output": "tlsterm.prg", "format": "cbm", "report": "TlsTermBuildReport", "labels": "TlsTermLabels" }
       ],
       "headers": []
     }

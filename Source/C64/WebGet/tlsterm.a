@@ -1,0 +1,342 @@
+; SPDX-License-Identifier: MIT
+;
+; TlsTerm: a dumb SwiftLink terminal, the test program for the WebGet host's
+; modem (Source/Teensy/WebGet/TlsModem.h). Packaged as tlsterm.tls, which the
+; host loads and RUNs with its SwiftLink at $DE00.
+;
+; It offers the three speeds the host is tested at, 38400, 115200 and 230400,
+; the last two through the Turbo232 enhanced-speed register at $DE07, as
+; SimpSwiftTerm does. Received bytes go through an NMI-driven 256-byte ring
+; with RTS flow control; typed keys go straight out, so the modem's own echo is
+; what shows them.
+;
+; In ASCII mode (the default, F3 toggles), while carrier is up (DCD, status bit
+; 6, low), received text is ASCII made readable: letters change case, LF and
+; other control codes are dropped, and a UTF-8 character shows as one "?".
+; Typed letters go out as ASCII then too. With carrier down the modem talks
+; PETSCII, and nothing is translated.
+;
+;   F1  types "atdt https://", for the rest of a URL
+;   F3  ASCII or PETSCII
+;   F7  back to BASIC
+
+   !convtab pet
+
+CHROUT     = $FFD2
+GETIN      = $FFE4
+NMINV      = $0318
+QTSW       = $D4          ; quote mode
+INSRT      = $D8          ; inserts pending
+NMIKERNAL  = $FE47
+
+swift      = $DE00
+sw_data    = swift
+sw_stat    = swift+1
+sw_cmd     = swift+2
+sw_ctrl    = swift+3
+sw_turbo   = swift+7
+
+ST_DCD     = %01000000    ; high while no carrier
+ST_TXEMPTY = %00010000
+ST_RXFULL  = %00001000
+CMD_RXOFF  = %00000010
+CMD_RTS    = %00001100    ; transmitter and RTS bits
+CMD_RTSON  = %00001000
+
+KEY_F1     = $85
+KEY_F3     = $86
+KEY_F7     = $88
+
+RING_STOP  = 200          ; RTS drops at this many waiting
+RING_GO    = 50           ; and rises again below this many
+
+   * = $0801
+   !word basicend
+   !word 2026
+   !byte $9e
+   !byte $30 + start / 1000, $30 + (start / 100) % 10, $30 + (start / 10) % 10, $30 + start % 10
+   !byte 0
+basicend
+   !word 0
+
+start
+   lda #11
+   sta $D020
+   lda #0
+   sta $D021
+   lda #<msgtitle
+   ldy #>msgtitle
+   jsr print
+
+-  jsr GETIN
+   ldx #15                ; 38400: the 6551's own top rate
+   ldy #$FF
+   cmp #$31               ; '1'
+   beq +
+   ldx #0                 ; enhanced: $DE07 bits 1-0 pick it
+   ldy #1                 ; 115200
+   cmp #$32
+   beq +
+   ldy #0                 ; 230400
+   cmp #$33
+   bne -
++  jsr CHROUT
+   lda #0
+   sta sw_stat            ; a write to status resets the chip
+   lda #%00001011         ; DTR, RTS, receive interrupt off
+   sta sw_cmd
+   cpy #$FF
+   beq +
+   sty sw_turbo
++  stx sw_ctrl
+
+   sei
+   lda #<nmi
+   sta NMINV
+   lda #>nmi
+   sta NMINV+1
+   lda #0
+   sta rhead
+   sta rtail
+   sta rused
+   cli
+   lda #1
+   sta ascii
+   lda #<msghelp
+   ldy #>msghelp
+   jsr print
+   lda sw_cmd
+   and #!CMD_RXOFF & $FF
+   sta sw_cmd
+
+main
+   jsr charin
+   bcs +
+   jsr show
++  jsr GETIN
+   beq main
+   cmp #KEY_F1
+   bne +
+   lda #<msgdial
+   ldy #>msgdial
+   jsr sendstr
+   jmp main
++  cmp #KEY_F3
+   bne +
+   lda ascii
+   eor #1
+   sta ascii
+   lda #<msgascii
+   ldy #>msgascii
+   ldx ascii
+   bne ++
+   lda #<msgpetscii
+   ldy #>msgpetscii
+++ jsr print
+   jmp main
++  cmp #KEY_F7
+   bne +
+   lda sw_cmd
+   ora #CMD_RXOFF
+   sta sw_cmd
+   sei
+   lda #<NMIKERNAL
+   sta NMINV
+   lda #>NMIKERNAL
+   sta NMINV+1
+   cli
+   rts
++  jsr keyout
+   jsr send
+   jmp main
+
+; A received byte in A, to the screen. Constants here are ASCII and PETSCII
+; codes, not quoted characters, which !convtab would convert.
+show
+   ldx ascii
+   beq raw
+   ldx carrier            ; none: the modem's own PETSCII
+   beq raw
+   cmp #13
+   beq raw
+   cmp #$20
+   bcc skip               ; LF and the other controls
+   cmp #$80
+   bcc +
+   cmp #$C0               ; a UTF-8 continuation byte
+   bcc skip
+   lda #$3F               ; a UTF-8 lead byte: "?"
+   bne raw
++  cmp #$5F               ; ASCII "_"
+   bne +
+   lda #$A4
+   bne raw
++  jsr swapcase
+raw
+   jsr CHROUT
+   lda #0
+   sta QTSW               ; a '"' in the text would leave quote mode on
+   sta INSRT
+skip
+   rts
+
+; Letters to the other case: ASCII's lower case is PETSCII's unshifted
+; letters, which the lower-case character set shows in lower case.
+swapcase
+   cmp #$41
+   bcc +
+   cmp #$5B
+   bcc ++
++  cmp #$C1
+   bcc +
+   cmp #$DB
+   bcs +
+   and #$7F
+   rts
+++ ora #$80
++  rts
+
+; A typed key in A, as the connection wants it.
+keyout
+   ldx ascii
+   beq +
+   ldx carrier
+   beq +
+   cmp #$14               ; DEL
+   bne ++
+   lda #8
++  rts
+++ cmp #$41
+   bcc +
+   cmp #$5B
+   bcs +
+   ora #$20               ; unshifted: ASCII lower case
+   rts
++  cmp #$C1
+   bcc +
+   cmp #$DB
+   bcs +
+   and #$7F               ; shifted: ASCII upper case
++  rts
+
+; Send A, waiting for the transmitter.
+send
+   tax
+-  lda sw_stat
+   and #ST_TXEMPTY
+   beq -
+   stx sw_data
+   rts
+
+sendstr
+   sta sstr+1
+   sty sstr+2
+   ldy #0
+sstr
+   lda $FFFF,y
+   beq +
+   sty sty_save
+   jsr send
+   ldy sty_save
+   iny
+   bne sstr
++  rts
+
+print
+   sta pstr+1
+   sty pstr+2
+   ldy #0
+pstr
+   lda $FFFF,y
+   beq +
+   jsr CHROUT
+   iny
+   bne pstr
++  rts
+
+; The next received byte in A with carry clear, or carry set for none.
+charin
+   ldx rhead
+   cpx rtail
+   bne +
+   sec
+   rts
++  lda ring,x
+   inc rhead
+   dec rused
+   pha
+   lda rused
+   cmp #RING_GO
+   bcs +
+   lda sw_cmd             ; room again: RTS up
+   and #!CMD_RTS & $FF
+   ora #CMD_RTSON
+   sta sw_cmd
++  pla
+   clc
+   rts
+
+; Tests receive-full rather than the IRQ bit: a status read in the main loop,
+; waiting to send, clears IRQ, and a byte left unread stops the modem for good.
+nmi
+   pha
+   txa
+   pha
+   lda sw_stat
+   tax
+   and #ST_DCD
+   eor #ST_DCD
+   sta carrier            ; nonzero while carrier is up
+   txa
+   and #ST_RXFULL
+   beq ++                 ; RESTORE, not the SwiftLink
+   lda sw_cmd
+   ora #CMD_RXOFF
+   sta sw_cmd
+   lda sw_data
+   ldx rtail
+   sta ring,x
+   inc rtail
+   inc rused
+   lda rused
+   cmp #RING_STOP
+   bcc +
+   lda sw_cmd             ; nearly full: RTS down, so the modem waits
+   and #!CMD_RTS & $FF
+   sta sw_cmd
++  lda sw_cmd
+   and #!CMD_RXOFF & $FF
+   sta sw_cmd
+++ pla
+   tax
+   pla
+   rti
+
+msgtitle
+   !byte $0E, $93, $9E
+   !text "TlsTerm, a dumb terminal", 13, 13
+   !byte $05
+   !text "1: 38400  2: 115200  3: 230400 ? ", 0
+msghelp
+   !byte 13, 13, $9B
+   !text "F1 atdt https://  F3 ascii/petscii", 13
+   !text "F7 basic   at? lists the modem's commands", 13, 13
+   !byte $05, 0
+msgdial
+   !text "atdt https://", 0
+msgascii
+   !byte 13
+   !text "[ascii]", 13, 0
+msgpetscii
+   !byte 13
+   !text "[petscii]", 13, 0
+
+ascii    !byte 0
+carrier  !byte 0
+sty_save !byte 0
+rhead    !byte 0
+rtail    !byte 0
+rused    !byte 0
+
+   !align 255, 0
+ring     !fill 256, 0
