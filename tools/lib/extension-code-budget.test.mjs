@@ -117,14 +117,17 @@ const placedInFlash = (patterns, objectPath) =>
 test('the SD card libraries run from flash but for the SDIO driver, on either path separator', () => {
   const patterns = flashTextPatterns(extensionLinkerScript(linkers));
   for (const library of ['SdFat', 'SD', 'SPI']) {
-    for (const objectPath of [`/b/ext/libraries/${library}/src/x.cpp.o`, `C:\\b\\ext\\libraries\\${library}\\src\\x.cpp.o`]) {
+    // arduino-cli passes them relative to the build directory once absolute paths make the link command too long.
+    for (const objectPath of [`/b/ext/libraries/${library}/src/x.cpp.o`, `C:\\b\\ext\\libraries\\${library}\\src\\x.cpp.o`,
+      `libraries/${library}/src/x.cpp.o`, `libraries\\${library}\\src\\x.cpp.o`]) {
       assert.deepEqual(placedInFlash(patterns, objectPath), [true, true], objectPath);
     }
   }
   for (const objectPath of ['/b/ext/libraries/SdFatX/x.cpp.o', '/b/ext/libraries/SPIFlash/x.cpp.o',
     'C:\\b\\ext\\sketch\\VMBoot.ino.cpp.o', '/b/ext/sketch/VMBoot.ino.cpp.o', 'core.a',
     // SdioCard::readData masks interrupts, so the SDIO driver stays in ITCM.
-    '/b/ext/libraries/SdFat/SdCard/SdioTeensy.cpp.o', 'C:\\b\\ext\\libraries\\SdFat\\SdCard\\SdioTeensy.cpp.o']) {
+    '/b/ext/libraries/SdFat/SdCard/SdioTeensy.cpp.o', 'C:\\b\\ext\\libraries\\SdFat\\SdCard\\SdioTeensy.cpp.o',
+    'libraries/SdFat/SdCard/SdioTeensy.cpp.o', 'sketch/VMBoot.ino.cpp.o', 'libraries/SdFatX/x.cpp.o']) {
     assert.deepEqual(placedInFlash(patterns, objectPath), [false, false], objectPath);
   }
 });
@@ -143,7 +146,7 @@ const memberPlacedInFlash = (patterns, archive, member) =>
 
 test('an archived library runs from flash too, and its SDIO driver still does not', () => {
   const patterns = flashTextPatterns(extensionLinkerScript(linkers));
-  for (const archive of ['/b/ext/libraries/SdFat/objs.a', '/b/ext/libraries/SdFat/SdCard/objs.a',
+  for (const archive of ['/b/ext/libraries/SdFat/objs.a', '/b/ext/libraries/SdFat/SdCard/objs.a', 'libraries/SdFat/objs.a',
     'C:\\b\\ext\\libraries\\SdFat\\SdCard\\objs.a', '/b/ext/libraries/SD/objs.a', '/b/ext/libraries/SPI/objs.a']) {
     assert.deepEqual(memberPlacedInFlash(patterns, archive, 'x.cpp.o'), [true, true], archive);
   }
@@ -158,11 +161,11 @@ test('an archived library runs from flash too, and its SDIO driver still does no
 test('a --host-tls library moves its code and constants to flash, and only when asked', () => {
   const stock = extensionLinkerScript(linkers);
   const tls = extensionLinkerScript(linkers, 64, { flashLibraries: ['FNET'] });
-  const fnet = '\t\t*[\\\\/]libraries[\\\\/]FNET[\\\\/]*';
+  const fnet = ['\t\t*[\\\\/]libraries[\\\\/]FNET[\\\\/]*', '\t\tlibraries[\\\\/]FNET[\\\\/]*'];
   assert.equal(stock, extensionLinkerScript(linkers, 64, { flashLibraries: [] }));
   assert.doesNotMatch(stock, /FNET/);
   const added = progmemBlock(tls).split('\n').filter((line) => !progmemBlock(stock).split('\n').includes(line));
-  assert.deepEqual(added, [`${fnet}(.text* .rodata*)`, `${fnet}:*(.text* .rodata*)`]);
+  assert.deepEqual(added, fnet.flatMap((dir) => [`${dir}(.text* .rodata*)`, `${dir}:*(.text* .rodata*)`]));
   assert.equal(tls.replace(added.map((line) => line + '\n').join(''), ''), stock);
 });
 
