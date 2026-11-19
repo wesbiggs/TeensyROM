@@ -155,7 +155,7 @@ main
 show
    ldx ascii
    beq raw
-   ldx carrier            ; none: the modem's own PETSCII
+   ldx rxcarrier          ; none: the modem's own PETSCII
    beq raw
    cmp #13
    beq raw
@@ -187,13 +187,11 @@ swapcase
    bcc +
    cmp #$5B
    bcc ++
-+  cmp #$C1
+   cmp #$61
    bcc +
-   cmp #$DB
+   cmp #$7B
    bcs +
-   and #$7F
-   rts
-++ ora #$80
+++ eor #$20
 +  rts
 
 ; A typed key in A, as the connection wants it.
@@ -254,14 +252,17 @@ pstr
    bne pstr
 +  rts
 
-; The next received byte in A with carry clear, or carry set for none.
+; The next received byte in A with carry clear, and in rxcarrier whether
+; carrier was up when it came; or carry set for none.
 charin
    ldx rhead
    cpx rtail
    bne +
    sec
    rts
-+  lda ring,x
++  lda rcarrier,x
+   sta rxcarrier
+   lda ring,x
    inc rhead
    dec rused
    pha
@@ -293,8 +294,10 @@ nmi
    lda sw_cmd
    ora #CMD_RXOFF
    sta sw_cmd
-   lda sw_data
    ldx rtail
+   lda carrier
+   sta rcarrier,x
+   lda sw_data
    sta ring,x
    inc rtail
    inc rused
@@ -333,6 +336,7 @@ msgpetscii
 
 ascii    !byte 0
 carrier  !byte 0
+rxcarrier !byte 0
 sty_save !byte 0
 rhead    !byte 0
 rtail    !byte 0
@@ -340,3 +344,4 @@ rused    !byte 0
 
    !align 255, 0
 ring     !fill 256, 0
+rcarrier !fill 256, 0
