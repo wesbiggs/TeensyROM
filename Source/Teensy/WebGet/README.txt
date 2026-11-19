@@ -133,7 +133,8 @@ ATBROWSE is not available here: WebGet's modem has no web browser.
 When a .tls file cannot start, the TR menu shows one of these after $50/:
 
   $18  the .tls file: value 0 if it could not be read or has no program,
-       otherwise its load address, which is outside $0400-$CFFF
+       otherwise its load address, from which it does not fit in
+       $0400-$CFFF
   $19  starting the C64: value 0 if the start cartridge never ran, 1 if BASIC
        never came up, 2 if loading the program failed
 

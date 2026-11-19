@@ -49,15 +49,24 @@ FLASHMEM void RemoteLaunch(RegMenuTypes, const char *, bool) {}
 class NoDrive : public FS
 {
 public:
-   File open(const char *, uint8_t) override { return File(); }
-   bool exists(const char *) override { return false; }
-   bool mkdir(const char *) override { return false; }
-   bool rename(const char *, const char *) override { return false; }
-   bool remove(const char *) override { return false; }
-   bool rmdir(const char *) override { return false; }
-   uint64_t usedSize() override { return 0; }
-   uint64_t totalSize() override { return 0; }
+   File open(const char *, uint8_t) override;
+   bool exists(const char *) override;
+   bool mkdir(const char *) override;
+   bool rename(const char *, const char *) override;
+   bool remove(const char *) override;
+   bool rmdir(const char *) override;
+   uint64_t usedSize() override;
+   uint64_t totalSize() override;
 };
+// Out of the class: an inline member cannot take FLASHMEM's section.
+FLASHMEM File NoDrive::open(const char *, uint8_t) { return File(); }
+FLASHMEM bool NoDrive::exists(const char *) { return false; }
+FLASHMEM bool NoDrive::mkdir(const char *) { return false; }
+FLASHMEM bool NoDrive::rename(const char *, const char *) { return false; }
+FLASHMEM bool NoDrive::remove(const char *) { return false; }
+FLASHMEM bool NoDrive::rmdir(const char *) { return false; }
+FLASHMEM uint64_t NoDrive::usedSize() { return 0; }
+FLASHMEM uint64_t NoDrive::totalSize() { return 0; }
 static NoDrive firstPartition;
 
 class ModemClient
@@ -105,8 +114,8 @@ ModemClient client;
 #define SwiftHostATDecls ATRespCode AT_HostDial(char *); ATRespCode AT_HostBrowse(char *);
 #define SwiftHostATCommands "dt", &AT_HostDial, "browse", &AT_HostBrowse,
 #define SwiftHostATHelp \
-   AddToPETSCIIStrToRxQueueLN(" ATDT https://<URL>  Fetch, read-only"); \
-   AddToPETSCIIStrToRxQueueLN(" ATDT tls://<Host>:<Port>  TLS connect");
+   AddToPETSCIIStrToRxQueueLN(PSTR(" ATDT https://<URL>  Fetch, read-only")); \
+   AddToPETSCIIStrToRxQueueLN(PSTR(" ATDT tls://<Host>:<Port>  TLS connect"));
 #include "Common/IO_Handlers/IOH_Swiftlink.c"
 #undef malloc
 #undef free
@@ -224,7 +233,7 @@ FLASHMEM uint8_t ModemClient::connected()
 FLASHMEM void ModemClient::finish(bool cut)
 {
    ended = true;
-   if (cut && kind == Kind::Fetch) AddToPETSCIIStrToRxQueueLN("*cut short*");
+   if (cut && kind == Kind::Fetch) AddToPETSCIIStrToRxQueueLN(PSTR("*cut short*"));
 }
 
 // One read, never a wait. A fetch with no Content-Length is complete only on
@@ -481,7 +490,7 @@ FLASHMEM ATRespCode AT_HostDial(char *CmdArg)
 {
    const char *typed = TypedLine + (CmdArg - TxMsg);
    const bool fetch = strncasecmp(typed, "https://", 8) == 0 || strncasecmp(typed, "http://", 7) == 0;
-   const bool stream = strncasecmp(typed, "tls://", 6) == 0;
+   const bool stream = strncasecmp(typed, PSTR("tls://"), 6) == 0;
    if (!fetch && !stream) return AT_DT(CmdArg);
 
    SwiftRegStatus |= SwiftStatusDCD;
@@ -490,7 +499,7 @@ FLASHMEM ATRespCode AT_HostDial(char *CmdArg)
 
    // tls://host:port takes the https:// parse, and nothing after the port.
    char text[TxMsgMaxSize + 2];
-   if (stream) snprintf(text, sizeof(text), "https://%.*s", (int)strlen(CmdArg) - 6, typed + 6);
+   if (stream) snprintf(text, sizeof(text), PSTR("https://%.*s"), (int)strlen(CmdArg) - 6, typed + 6);
    else snprintf(text, sizeof(text), "%.*s", (int)strlen(CmdArg), typed);
    for (char *c = text; *c != ':'; c++) *c = tolower(*c);   // ParseUrl takes the scheme in lower case
    size_t len = strlen(text);
@@ -500,24 +509,24 @@ FLASHMEM ATRespCode AT_HostDial(char *CmdArg)
    struct Freed { Url *p; ~Freed() { mbedtls_free(p); } } freed{ url };
    if (!ParseUrl(text, *url) || (stream && strcmp(url->path, "/") != 0))
    {
-      AddVerboseToPETSCIIStrToRxQueueLN("not a URL");
+      AddVerboseToPETSCIIStrToRxQueueLN(PSTR("not a URL"));
       return ATRC_ERROR;
    }
 
    char msg[64];
-   snprintf(msg, sizeof(msg), "Trying %s...", url->host);
+   snprintf(msg, sizeof(msg), PSTR("Trying %s..."), url->host);
    AddVerboseToPETSCIIStrToRxQueueLN(msg);
    FlushRxQueue();
    Result r = client.dial(*url, fetch);
    if (r.stage == Done) return ATRC_CONNECT;
-   snprintf(msg, sizeof(msg), "*%s ($%02X/%lu)*", StageText(r.stage), r.stage, (unsigned long)r.value);
+   snprintf(msg, sizeof(msg), PSTR("*%s ($%02X/%lu)*"), StageText(r.stage), r.stage, (unsigned long)r.value);
    AddVerboseToPETSCIIStrToRxQueueLN(msg);
    return ATRC_NO_ANSWER;
 }
 
 FLASHMEM ATRespCode AT_HostBrowse(char *)
 {
-   AddVerboseToPETSCIIStrToRxQueueLN("no browser in this host");
+   AddVerboseToPETSCIIStrToRxQueueLN(PSTR("no browser in this host"));
    return ATRC_ERROR;
 }
 
