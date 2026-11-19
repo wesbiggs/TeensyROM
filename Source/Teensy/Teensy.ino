@@ -215,6 +215,9 @@ void setup()
    //USB is up by here. Not gated on a host listening: printing is what clears
    //the report, and minimal's promoteFault() promotes a stale one to $03 on
    //the next extension launch.
+#ifdef Fab04_TDrive
+   VD_TraceBoot();
+#endif
    if (CrashReport) Serial.print(CrashReport);
 #ifdef VM_EXTENSIONS_ENABLED
    VmFail::printBoot(); //what the last extension launch left in preserved RAM2
@@ -362,6 +365,9 @@ void loop()
 #ifdef Fab04_SpecialButton
    if (SpecialBtnBounce.update())
    {  //Special button Change (rise or fall)
+#ifdef Fab04_TDrive
+      VD_TraceButton(SpecialBtnBounce.read());
+#endif
       if (fSpecialBtnChange != NULL) fSpecialBtnChange(SpecialBtnBounce.read());
    }
 #endif
@@ -571,6 +577,11 @@ FLASHMEM void SetEEPDefaults()
    EEPROM.write(eepAdMIDISettings, 0xff);  //see RegMIDISettingsMasks
    EEPROM.write(eepAdMIDISettings2, 0x0f); //see RegMIDISettingsMasks2
    
+#ifdef TDrive_Any
+   EEPROM.write(eepAdTDriveDevs, 0);   //TDrive device numbers: 0 = defaults (8/9)
+   EEPROM.write(eepAdTDriveDevs+1, 0);
+#endif
+
    //future use:
    for(uint32_t EEPByteNum = 0; EEPByteNum<eepAdUnusedSize ; EEPByteNum++)
       EEPROM.write(eepAdUnused+EEPByteNum, 0);

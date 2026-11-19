@@ -328,6 +328,10 @@ extern bool HandshakeSnoop(uint16_t Address, bool R_Wn);
 
 void FnetLoopPollStart(); //Teensy.ino
 
+#ifdef Fab04_TDrive
+bool (*KernalImageSource)(uint8_t *Bin) = NULL; //fills Bin (8192 bytes) instead of the <Shift-K> file, false: nothing to serve (TDrive, set by KERNALPreStart())
+#endif
+
 FLASHMEM void InitHndlr_KERNALReplace_PreStart() //not called automatically via init; called earlier, manually, from KERNALPreStart()
 {
 #ifdef Fab04_GlobalKernalReplace
@@ -335,6 +339,14 @@ FLASHMEM void InitHndlr_KERNALReplace_PreStart() //not called automatically via 
 #endif
    KernalLoaded = false;
 
+#ifdef Fab04_TDrive
+   if (KernalImageSource != NULL)
+   {
+      if (!KernalImageSource(KernalBin)) return; //KernalLoaded stays false: nothing hooked
+   }
+   else
+#endif
+   {
    //load kernal image into RAM:
    char Filename[MaxPathLength];
    EEPreadStr(eepAdKERNALBinName, Filename);
@@ -370,6 +382,7 @@ FLASHMEM void InitHndlr_KERNALReplace_PreStart() //not called automatically via 
    //Serial.printf("Read %lu Bytes in %lumS\n", CharNum, millis()-StartmS);
    Serial.printf("Read %lu Bytes\nKernal replace Enabled\n", CharNum);
    LoadFile.close();
+   }
    KernalLoaded = true;
    KSenseApplyMode();
    KDS_State = KDS_Idle;

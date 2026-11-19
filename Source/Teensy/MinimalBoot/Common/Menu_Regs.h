@@ -452,6 +452,17 @@ enum enumIOHandlers //Synch order/qty with IOHandler[] (IOHandlers.h)
    #endif
       IOH_GeoRAM,
       IOH_USBMouse, //last manually selectable, see LastSelectableIOH
+   #ifdef Fab04_TDrive
+      IOH_TDrive,
+      IOH_TDriveSwift,
+   #ifdef Fab04_REU
+      IOH_TDriveSwiftREU,
+      IOH_TDriveREU,
+   #endif
+   #endif  
+   #ifdef TDrive_Agent
+      IOH_TDriveAgent,
+   #endif  
 
    //*not* manually selectable, see LastSelectableIOH
       
@@ -486,3 +497,7 @@ enum enumIOHandlers //Synch order/qty with IOHandler[] (IOHandlers.h)
 };
 
 #define LastSelectableIOH  IOH_USBMouse  //127 max.  Used in IOH_TeensyROM.c for Special IO display/select
+#ifdef TDrive_Agent
+   #undef LastSelectableIOH
+   #define LastSelectableIOH  IOH_TDriveAgent   //the TDrive entries follow upstream's; the agent is last on both boards
+#endif

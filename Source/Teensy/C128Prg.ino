@@ -86,10 +86,17 @@ FLASHMEM void LaunchC128BasicPrg(uint8_t *Prg, uint32_t Size)
 #ifdef Fab04_KernalReplace
    if (IO1[rwRegNextIOHndlr] == IOH_KernalReplace) IO1[rwRegNextIOHndlr] = IOH_None;
 #endif
+#ifdef TDrive_Agent
+   const bool TDriveAgent = TDrive_C128Launch(); //teensyrom-vdrive: with a TDrive Special IO this launch runs the agent (IOH_TDriveAgent.c)
+#endif
    SendMsgPrintfln(PSTR("Starting C128 mode"));
    BootComplete = true;
    doReset = true;
+#ifdef TDrive_Agent
+   if (IsEmptyBasicPrg(Prg) && !TDriveAgent) //teensyrom-vdrive: with the agent, the boot ROM's loader installs it, so it runs this too
+#else
    if (IsEmptyBasicPrg(Prg))
+#endif
    {
       ExitToC128Basic();
       IOHandlerSelectInit();
