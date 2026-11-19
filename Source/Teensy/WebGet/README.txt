@@ -5,6 +5,9 @@ WebGet downloads files from the web straight to the TeensyROM+'s SD card, over
 HTTP or HTTPS, with its progress on the C64 screen. It is an extension host: a
 program that installs into the TR+'s extension slot, beside the normal firmware.
 
+It is also a SwiftLink modem that can dial secure (TLS) connections, for C64
+programs launched from a .tls file: see "The modem" below.
+
 It needs a TeensyROM+ (Fab 0.4) with Ethernet, running the firmware this
 release was built against or a later one with the same extension ABI. It does
 not run on the original TeensyROM.
@@ -86,6 +89,53 @@ with these codes (value 0 means none):
 
 When you leave, the TR menu shows "extension host returned ($50/...)" with the
 number of files saved, or the code that stopped WebGet from starting.
+
+
+The modem
+---------
+
+Select a .tls file in the TR menu and WebGet starts the C64 with a SwiftLink
+at $DE00 (the same emulation as the TR's own "Swift-Turbo/Modem" Special IO),
+then loads and runs the program in it. A .tls file is an ordinary .prg file,
+renamed: rename a terminal program's .prg to .tls to run it this way.
+
+  basic.tls    is empty: the C64 goes to BASIC with the modem there, for a
+               program you load from a real disk drive
+  tlsterm.tls  a simple terminal for trying the modem: 38400, 115200 or
+               230400 baud, F1 types "atdt https://", F3 switches between
+               ASCII and PETSCII, F7 goes back to BASIC
+
+A program that loads at $0801 (most BASIC and SYS-started programs) is RUN for
+you. One that loads elsewhere is loaded and left at READY, for you to start
+with SYS. A .tls file must load between $0400 and $CFFF. A C128 starts in C64
+mode. The TR button leaves the modem and returns to the TR menu.
+
+The modem answers the TR's usual AT commands (AT? lists them), with these
+dial strings added:
+
+  ATDT https://<host>/<path>   fetch one page or file, read-only: CONNECT,
+  ATDT http://<host>/<path>    then what the server sent, then NO CARRIER.
+                               Redirects are followed as in a .www list.
+                               Anything typed while connected is ignored,
+                               but +++ still hangs up.
+  ATDT tls://<host>:<port>     a secure connection both ways, as ATDT
+                               <host>:<port> is a plain one (port 443 if
+                               none is given)
+
+Upper and lower case typed in a URL are kept. A fetch that fails says why
+before NO ANSWER, with the code from the list above (such as $0C for an
+untrusted certificate, or $0F and the HTTP status for a refusal). A fetch
+whose data stops short of the end ends with "*cut short*" before NO CARRIER.
+The same ca.pem decides which secure sites are trusted.
+
+ATBROWSE is not available here: WebGet's modem has no web browser.
+
+When a .tls file cannot start, the TR menu shows one of these after $50/:
+
+  $18  the .tls file: value 0 if it could not be read or has no program,
+       otherwise its load address, which is outside $0400-$CFFF
+  $19  starting the C64: value 0 if the start cartridge never ran, 1 if BASIC
+       never came up, 2 if loading the program failed
 
 
 Secure sites

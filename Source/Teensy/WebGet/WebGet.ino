@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //
 // WebGet: an extension host that downloads HTTP and HTTPS URLs to the SD card,
-// with its progress on the C64 screen and a prompt for more.
+// with its progress on the C64 screen and a prompt for more. A .tls file runs
+// it as a SwiftLink modem instead, which TlsModem.h describes.
 //
 // It runs when the user picks a .www file in the menu, which a /VMS package
 // claims (see the package line below). Its inputs are:
@@ -89,6 +90,8 @@ enum Stage : uint8_t {
    Dns,        // value: milliseconds the lookup took to fail
    Launch,     // value: 0 no readable record, 1 no file selected
    Client,     // the package's client.crt would not load
+   Program,    // a .tls file that is no program: value 0 unreadable or too short, else its load address
+   Boot,       // a .tls start: value 0 the boot cartridge never ran, 1 BASIC never came up, 2 a DMA failed
 };
 
 static constexpr size_t MaxUrlsBytes = 16 * 1024;
@@ -486,17 +489,23 @@ FLASHMEM static unsigned char *ReadFile(const char *path, size_t &len, size_t li
    return buf;
 }
 
+// Before any Ethernet.begin(): the modem's begin is the SwiftLink files' own.
+FLASHMEM static void NetSetup()
+{
+   Ethernet.setStackHeap((uint8_t *)Ram2Base, NetHeapSize);
+   // NativeEthernet's own sockets go unused (DNS runs on FNET's resolver), but
+   // begin() allocates their buffers on the 16 KiB host heap regardless.
+   Ethernet.setSocketNum(1);
+   Ethernet.setSocketSize(512);
+}
+
 FLASHMEM static bool EthernetUp()
 {
    uint8_t mac[6];
    EEPreadNBuf(eepAdMyMAC, mac, 6);
    uint16_t timeout;
    EEPROM.get(eepAdDHCPTimeout, timeout);
-   Ethernet.setStackHeap((uint8_t *)Ram2Base, NetHeapSize);
-   // NativeEthernet's own sockets go unused (DNS runs on FNET's resolver), but
-   // begin() allocates their buffers on the 16 KiB host heap regardless.
-   Ethernet.setSocketNum(1);
-   Ethernet.setSocketSize(512);
+   NetSetup();
    if (EEPROM.read(eepAdDHCPEnabled))
    {
       uint16_t respTimeout;
@@ -796,6 +805,22 @@ FLASHMEM static const char *ReadUrl()
 
 // ---- Bus and cartridge, as the stock host sets them up (VMBoot.ino) ----------
 
+// RAM_Image as a 16 KiB EasyFlash, booting in Ultimax mode from bank 0.
+FLASHMEM static void PresentEasyFlash()
+{
+   NumCrtChips = 0;
+   memset(EZFlashRAM, 0, sizeof(EZFlashRAM));
+   CurrentEasyFlashBank = 0;
+   SetGameAssert;
+   SetExROMDeassert;
+   for (unsigned i = 0; i < 64; i++) { BankDecode[i][0] = RAM_Image; BankDecode[i][1] = RAM_Image + 8192; }
+   LOROM_Image = RAM_Image;
+   HIROM_Image = RAM_Image + 8192;
+   LOROM_Mask = HIROM_Mask = 8191;
+   CurrentIOHandler = IOH_EasyFlash;
+   EmulateVicCycles = false;
+}
+
 // The client cartridge from the launching package, checked as the stock host
 // checks it (VMHostBoot), then presented to the C64 as a 16 KiB EasyFlash.
 FLASHMEM static bool StartClient(const VmLaunchRecord &launch)
@@ -817,17 +842,7 @@ FLASHMEM static bool StartClient(const VmLaunchRecord &launch)
         vm_crc32(RAM_Image, 16384) == *(uint32_t *)(descriptor + 8);
    f.close();
    if (!ok) return false;
-   NumCrtChips = 0;
-   memset(EZFlashRAM, 0, sizeof(EZFlashRAM));
-   CurrentEasyFlashBank = 0;
-   SetGameAssert;
-   SetExROMDeassert;
-   for (unsigned i = 0; i < 64; i++) { BankDecode[i][0] = RAM_Image; BankDecode[i][1] = RAM_Image + 8192; }
-   LOROM_Image = RAM_Image;
-   HIROM_Image = RAM_Image + 8192;
-   LOROM_Mask = HIROM_Mask = 8191;
-   CurrentIOHandler = IOH_EasyFlash;
-   EmulateVicCycles = false;
+   PresentEasyFlash();
    memcpy(EZFlashRAM + 0xf0, "M3TP", 4);
    LinkActive = true;
    doReset = true;
@@ -948,6 +963,8 @@ FLASHMEM static void Session()
    Exit(Done, Saved);
 }
 
+#include "TlsModem.h"
+
 // ---- setup() and loop(), as the stock host's (VMBoot.ino) ---------------------
 
 extern "C" uint32_t set_arm_clock(uint32_t frequency);
@@ -1015,9 +1032,15 @@ FLASHMEM void setup()
    }
    if (!LaunchRecord.content[0]) ReturnToMenu(Launch, 1);
    ListName = strrchr(LaunchRecord.content, '/') + 1;
+   const char *dot = strrchr(ListName, '.');
+   if (dot && strcasecmp(dot, ".tls") == 0)
+   {
+      ModemSetup(LaunchRecord);
+      BtnPressed = false;
+      return;
+   }
    memcpy(Dir, LaunchRecord.content, ListName - LaunchRecord.content);
    Dir[ListName - LaunchRecord.content] = 0;
-   const char *dot = strrchr(ListName, '.');
    const size_t stem = dot ? (size_t)(dot - ListName) : strlen(ListName);
    snprintf(TempPath, sizeof(TempPath), "%s%s", Dir, TempName);
    snprintf(LogPath, sizeof(LogPath), "%s%.*s.log", Dir, (int)stem, ListName);
@@ -1044,11 +1067,12 @@ FLASHMEM void loop()
       BtnPressed = false;
       Phi2ResetReleased();
    }
+   if (ModemMode) ModemSession();   // does not return
    LinkService();
    if (ClientStarted) Session();   // does not return
 }
 
-void EEPwriteNBuf(uint16_t addr, const uint8_t* buf, uint8_t len)
+void EEPwriteNBuf(uint16_t addr, const uint8_t* buf, uint16_t len)   // the width IOH_Swiftlink.c declares
 {
    while (len--) EEPROM.write(addr+len, buf[len]);
 }
