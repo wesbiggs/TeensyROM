@@ -76,8 +76,10 @@ const VmHostId vmHostId = { VM_HOSTID_MAGIC, VM_ABI, 0, 0, "WebGet", VM_HOST_COD
 // heap is 16 KiB of DTCM. Everything stays below VM_FAIL_BASE.
 static constexpr uint32_t Ram2Base    = 0x20200000u;
 static constexpr uint32_t NetHeapSize = 128 * 1024;   // holds RecvWindow of queued segments
-static constexpr uint32_t TlsHeapSize = 160 * 1024;
-static_assert(Ram2Base + NetHeapSize + TlsHeapSize <= VM_FAIL_BASE, "RAM2 carve-out reaches the fail record");
+// The rest, up to the fail record, is mbedTLS's heap, which this host's own
+// buffers of a URL's size share: DTCM has no room for them beside the modem's.
+static constexpr uint32_t HeapSize = VM_FAIL_BASE - (Ram2Base + NetHeapSize);
+static_assert(HeapSize >= 160 * 1024, "the 160 KiB a download's TLS was measured working in");
 
 enum Stage : uint8_t {
    Done = 0, SdInit, UrlFile, UrlParse, CaFile, CaParse, Trng, DrbgSeed, NetInit,
@@ -535,10 +537,11 @@ FLASHMEM static bool ResolveLocation(const char *value, Url &url)
       strcpy(url.path, value);
       return true;
    }
-   static Url next;
-   if (!ParseUrl(value, next) || (url.tls && !next.tls)) return false;
-   url = next;
-   return true;
+   Url *next = (Url *)mbedtls_calloc(1, sizeof(Url));
+   const bool ok = next && ParseUrl(value, *next) && !(url.tls && !next->tls);
+   if (ok) url = *next;
+   mbedtls_free(next);
+   return ok;
 }
 
 // The body being written to TempPath, outside Connection so that Exit(), which
@@ -710,9 +713,10 @@ static const char *LastName;
 
 // One URL, through its redirects, to its file on the card. Success's value is
 // the bytes saved.
+static Url *DownloadUrl;   // Session's, on the heap
 FLASHMEM static Result Download(const char *text, mbedtls_ssl_config &conf, char *line)
 {
-   static Url url;
+   Url &url = *DownloadUrl;
    if (!ParseUrl(text, url)) return Result{ UrlParse, 0 };
    static char outPath[sizeof(Dir) + MaxNameLen + 1];
    OutputPath(url, outPath);
@@ -767,9 +771,11 @@ FLASHMEM static void DrawPrompt(const char *text, size_t len)
 }
 
 // One line typed at the prompt, or nullptr when the user leaves.
+static constexpr size_t TypedSize = sizeof(Url::path) + sizeof(Url::host) + 16;
+static char *Typed;   // Session's, on the heap
 FLASHMEM static const char *ReadUrl()
 {
-   static char typed[sizeof(Url::path) + sizeof(Url::host) + 16];
+   char *typed = Typed;
    size_t len = 0;
    typed[0] = 0;
    DrawPrompt(typed, len);
@@ -783,7 +789,7 @@ FLASHMEM static const char *ReadUrl()
       if (key == 13 && len) { Prompting = false; return typed; }          // RETURN
       if (key == 20 && len) typed[--len] = 0;                             // DEL
       else if (key == 147) typed[len = 0] = 0;                            // CLR
-      else if (const char c = KeyChar(key); c && len < sizeof(typed) - 1) { typed[len++] = c; typed[len] = 0; }
+      else if (const char c = KeyChar(key); c && len < TypedSize - 1) { typed[len++] = c; typed[len] = 0; }
       DrawPrompt(typed, len);
    }
 }
@@ -885,9 +891,11 @@ FLASHMEM static void Session()
    for (uint8_t row = LogTop; row <= LogBottom; row++) Put(row, Green, "");
    Status(PSTR("starting"));
 
-   mbedtls_memory_buffer_alloc_init((unsigned char *)(Ram2Base + NetHeapSize), TlsHeapSize);
+   mbedtls_memory_buffer_alloc_init((unsigned char *)(Ram2Base + NetHeapSize), HeapSize);
    char *line = (char *)mbedtls_calloc(1, LineSize);
-   if (!line) Stop(TlsSetup, 0, PSTR("out of memory"));
+   Typed = (char *)mbedtls_calloc(1, TypedSize);
+   DownloadUrl = (Url *)mbedtls_calloc(1, sizeof(Url));
+   if (!line || !Typed || !DownloadUrl) Stop(TlsSetup, 0, PSTR("out of memory"));
 
    size_t urlsLen = 0;
    char *urls = (char *)ReadFile(LaunchRecord.content, urlsLen, MaxUrlsBytes);
