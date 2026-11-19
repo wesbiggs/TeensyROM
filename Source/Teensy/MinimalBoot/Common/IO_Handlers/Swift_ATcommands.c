@@ -347,7 +347,11 @@ FLASHMEM ATRespCode AT_HELP(char* CmdArg)
    AddToPETSCIIStrToRxQueueLN(" ATI  TR ID/versionInfo");
    AddToPETSCIIStrToRxQueueLN(" ATC  Connect Ethernet, display info");
    AddToPETSCIIStrToRxQueueLN(" ATDT<HostName>:<Port>  Connect to host");
+#ifdef SwiftHostATHelp
+   SwiftHostATHelp
+#else
    AddToPETSCIIStrToRxQueueLN(" ATBROWSE  Enter Web Browser");
+#endif
 
    AddToPETSCIIStrToRxQueueLN("Modify saved parameters:");
    AddToPETSCIIStrToRxQueueLN(" AT+S  Display stored Ethernet settings");
@@ -413,8 +417,14 @@ FLASHMEM ATRespCode AT_Hook(char* CmdArg)
 FLASHMEM ATRespCode ProcessATCommand()
 {
    char* CmdMsg = TxMsg; //local pointer for manipulation
+#ifdef SwiftHostATCommands
+   SwiftHostATDecls
+#endif
    stcATCommand ATCommands[] =
    {
+#ifdef SwiftHostATCommands
+      SwiftHostATCommands  //first, so a host's entry replaces a stock one of the same prefix
+#endif
       "dt"        , &AT_DT,
       "c"         , &AT_C,
       "+s"        , &AT_S,
