@@ -39,6 +39,12 @@ test('VERIFY of a file that fits is taken by the fast path', { skip }, () => {
   assert.match(run('verify', '30000'), / stat=5a$/);
 });
 
+// The file's two load-address bytes are not loaded: ROOM + 2 ends at $CFFF, one more byte would need $D000.
+test('VERIFY takes a file ending at $CFFF and hands back one a byte longer', { skip }, () => {
+  assert.match(run('verify', String(ROOM + 2)), / stat=5a$/);
+  assert.match(run('verify', String(ROOM + 3)), new RegExp(` stat=${NOTMINE}$`));
+});
+
 // One mailbox command stalls the whole main loop (ASID, TCP, remote commands) for as long as it reads, and a card file has no
 // size limit: the length pass stops once the file is known not to fit.
 test('VERIFY of a file too long for RAM is handed back without reading the whole file', { skip }, () => {
