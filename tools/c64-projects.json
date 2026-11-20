@@ -123,6 +123,17 @@
       ]
     },
     {
+      "name": "TDriveConfig",
+      "description": "TDrive Config, in the TR menu with a TDrive Special IO: edits the Alt-button disk lists and the mounted images. Ported from teensyrom-tdrive util/vdconfig.s (ca65) to the same bytes.",
+      "dir": "Source/C64/TDriveConfig",
+      "steps": [
+        { "assembler": "acme", "source": "vdconfig.asm", "output": "vdconfig.prg", "format": "cbm" }
+      ],
+      "headers": [
+        { "input": "build/vdconfig.prg", "dest": "vdconfig.prg.h", "progmem": true }
+      ]
+    },
+    {
       "name": "C128PrgBoot",
       "description": "C128 function ROM that streams a $1C01 BASIC program in and runs it in C128 mode; the firmware copies it to RAM to serve it",
       "dir": "Source/C64/C128PrgBoot",
