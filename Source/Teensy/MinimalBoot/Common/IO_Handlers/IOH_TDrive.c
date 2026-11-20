@@ -1199,7 +1199,7 @@ FLASHMEM int TDrive_RemoteQuiet(char *msg, size_t cap)
    return 0;
 }
 
-// 0 = a readable file of at least D64 size; else 62 (not found) / 74 (not a disk image), reason in msg.
+// 0 = a readable .d64/.d71/.d81 file of at least D64 size; else 62 (not found) / 74 (not a disk image), reason in msg.
 FLASHMEM static int VD_CheckImage(FS *fs, const char *path, char *msg, size_t cap)
 {
    File probe = fs->open(path, FILE_READ);
