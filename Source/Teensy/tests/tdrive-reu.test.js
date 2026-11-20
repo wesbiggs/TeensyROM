@@ -49,6 +49,17 @@ test('an immediate command disarms the $FF00 trigger', { skip }, () => {
     ['kernal', 'none', 'kernal']);
 });
 
+// A program may set addresses or length after the command, or poll the status, before it stores to $FF00.
+test('register writes and reads after the command keep the $FF00 trigger armed', { skip }, () => {
+  assert.deepEqual(run(['kernal 0', ...command(ARMED), 'd 10', 'w 7', 'r 0', 'snoop 0', 'ff00 0', 'snoop 0']),
+    ['armed', 'transfer', 'kernal']);
+});
+
+test('a command on the $FF00 trigger written again stays armed', { skip }, () => {
+  assert.deepEqual(run(['kernal 0', ...command(ARMED), ...command(ARMED), 'snoop 0', 'ff00 0', 'snoop 0']),
+    ['armed', 'transfer', 'kernal']);
+});
+
 test('an immediate command with nothing armed leaves the KERNAL check alone', { skip }, () => {
   assert.deepEqual(run(['kernal 0', ...command(IMMEDIATE), 'snoop 0']), ['kernal']);
 });

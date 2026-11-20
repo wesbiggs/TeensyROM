@@ -53,8 +53,8 @@ FASTRUN void IO2Hndlr_TDriveREU(uint8_t Address, bool R_Wn)
    }
    if (R_Wn) { IO2Hndlr_REU(Address, R_Wn); return; }   // a read never arms or clears the trigger
    bool (*Prev)(uint16_t, bool) = fBusSnoop;
-   // IO2Hndlr_REU disarms a pending $FF00 trigger on an immediate command only when it finds its own hook there, so while armed
-   // it is shown REU_FF00_W_Check instead of VDREU_Snoop; otherwise the trigger stayed armed and a later $FF00 store ran a second transfer
+   // while armed, IO2Hndlr_REU is shown its own hook, so a write that leaves the trigger alone or re-arms it hands REU_FF00_W_Check
+   // back and stays armed below; shown VDREU_Snoop, every register write while armed would drop the trigger
    if (Prev == &VDREU_Snoop) fBusSnoop = &REU_FF00_W_Check;
    else vdReuBase = Prev;                             // not armed: what to go back to
    IO2Hndlr_REU(Address, R_Wn);

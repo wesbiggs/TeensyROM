@@ -4,6 +4,7 @@
 //   kernal 0       the KERNAL check holds the bus snoop, as a PRG launch under TDrive+REU leaves it
 //   d VALUE        the byte the C64 drives on the next IO2 write
 //   w OFFSET       an IO2 write of that byte
+//   r OFFSET       an IO2 read
 //   ff00 0         the CPU stores to $FF00: prints "transfer" if the REU started one, else "none"
 //   snoop 0        prints who holds the bus snoop: "kernal", "armed" (the $FF00 trigger, KERNAL still served) or "none"
 #include <cstdint>
@@ -97,6 +98,7 @@ int main()
       if (!strcmp(Command, "kernal")) fBusSnoop = &KernalCheck;
       else if (!strcmp(Command, "d")) WriteData = Value;
       else if (!strcmp(Command, "w")) IOHndlr_TDriveREU.IO2Hndlr(Value, false);
+      else if (!strcmp(Command, "r")) IOHndlr_TDriveREU.IO2Hndlr(Value, true);
       else if (!strcmp(Command, "ff00")) printf("%s\n", fBusSnoop && fBusSnoop(0xff00, false) ? "transfer" : "none");
       else if (!strcmp(Command, "snoop"))
          printf("%s\n", fBusSnoop == &KernalCheck ? "kernal" : fBusSnoop == &VDREU_Snoop ? "armed" : fBusSnoop ? "other" : "none");
