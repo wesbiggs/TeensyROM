@@ -262,6 +262,7 @@ FLASHMEM static int VD_MountHost(int unit, const char *path, d64_t **out)
    const char *slash = strrchr(path, '/');
    const char *leaf = slash ? slash + 1 : path;
    if (strlen(leaf) >= sizeof u->imgName) return 33;
+   if (!image_kind(leaf)) return 74;                                              // only .d64/.d71/.d81: the format comes from the size alone
    VD_Unmount(NULL, unit);
    // Check existence and size with a read-only open first: FILE_WRITE creates missing files on SD/USB, and a mistyped
    // CD: must never litter the card with empty "images".
@@ -1203,7 +1204,8 @@ FLASHMEM static int VD_CheckImage(FS *fs, const char *path, char *msg, size_t ca
 {
    File probe = fs->open(path, FILE_READ);
    if (!probe) { snprintf(msg, cap, "file not found"); return 62; }
-   bool bad = probe.isDirectory() || probe.size() < 174848;
+   const char *slash = strrchr(path, '/');
+   bool bad = probe.isDirectory() || probe.size() < 174848 || !image_kind(slash ? slash + 1 : path);
    probe.close();
    if (bad) { snprintf(msg, cap, "not a disk image"); return 74; }
    return 0;
