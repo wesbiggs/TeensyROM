@@ -172,15 +172,17 @@ VD_COLD static int fverify_open(vio_t *v)
     fload_open(v);
     if (v->h->data) return 0;                               /* not found / no device: reported as for a LOAD */
     uint32_t start = sa ? (uint32_t)v->h->window[0] | (uint32_t)v->h->window[1] << 8 : (uint32_t)at[0] | (uint32_t)at[1] << 8;
-    uint32_t len = 0;
-    while (v->fl_active) {
+    if (!vio_dma_rd_ok(start)) { fload_abandon(v); return 1; }
+    /* counted only as far as RAM a DMA read sees: past that the answer is NOTMINE whatever the rest holds, and a card file has no size limit */
+    uint32_t room = 0xD000 - start, len = 0;
+    while (v->fl_active && len <= room) {
         uint8_t st;
         unsigned n = fload_read(v, v->dma_buf, v->dma_max, &st);   /* closes the channel at the end */
         if (!n) break;
         len += n;
     }
     fload_abandon(v);
-    if (!vio_dma_rd_ok(start) || start + len > 0xD000) return 1;
+    if (len > room) return 1;
     memcpy(v->h->window, name, sizeof name);
     v->h->len = nlen;
     fload_open(v);
