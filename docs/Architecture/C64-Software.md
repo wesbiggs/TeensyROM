@@ -21,7 +21,7 @@ Toolchain: **ACME cross-assembler 0.97** for all `.asm`/`.s` files, except **TRC
 | `MIDI2SID` | `MIDI2SID` | MIDI-to-SID synth app (IO1 register block reuses raw SID register offsets — `Menu_Regs.i:78-108` flags this as needing to stay in sync or be split out) |
 | `SimpSwiftTerm` | `SimpSwiftTerm` | Simple SwiftLink terminal program |
 | `TODCheck` | `TODCheck` | CIA Time-of-Day clock check utility |
-| `TDriveConfig` | `TDriveConfig` | TDrive Config, the TDrive Special IOs' disk-list and mount editor. Ported from teensyrom-tdrive's `util/vdconfig.s` (ca65); the source is at the project root, not in `source/`, and builds `vdconfig.prg` so the header keeps its `vdconfig_prg` name |
+| `TDriveConfig` | `TDriveConfig` | TDrive Config, the TDrive Special IOs' disk-list and mount editor. Ported from teensyrom-tdrive's `util/vdconfig.s` (ca65); the source is at the project root, not in `source/`, and builds `tdconfig.prg` (header `tdconfig.prg.h`, array `tdconfig_prg`) |
 | `TRCustomBasicCommands` | `TRCustomBasicCommands` | Custom BASIC commands — vendored, see below |
 | `BASIC` | `BASIC` | Grab-bag of pre-built standalone `.prg` utilities, individually header-converted |
 | `v1541Wrapper` | `v1541Wrapper` | Virtual 1541 wrapper — **deferred/planned feature**: built and its header kept current, but not yet used by the firmware; waiting on further developer capability before inclusion. Also intended as a general-purpose wrapper for assembly-code PRGs. |

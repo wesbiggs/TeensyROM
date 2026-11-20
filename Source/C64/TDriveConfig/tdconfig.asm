@@ -1,4 +1,4 @@
-; TDrive Config, ported to ACME from util/vdconfig.s (ca65) in the teensyrom-tdrive repository: it assembles to the same bytes.
+; TDrive Config, ported to ACME from util/vdconfig.s (ca65) in the teensyrom-tdrive repository. It assembled to the same bytes before "Colour" in its color prompt became "Color".
 ; The ca65 macros are expanded at each use: PS is "jsr pstr" and a !pet line ending in 0, MSG wraps that in msgbeg/fpad, KEYS prints
 ; each key as 18, C_OPT, key, 146, C_SRC, text, and CMDS is cmdbeg plus pstr with a !tx string.
 ; TDrive Config: edit the Alt-button disk lists (/tdrive-config.txt on each unit) and show / change the mounted images, entirely in machine code.
@@ -11,10 +11,10 @@
 ; (comments, blank lines) stay where they are.
 ; Buffers and tables are BSS at $2000-$4FFF (not in the PRG). The screen is in the lower-case character set: !pet swaps the case of the
 ; letters in its strings for that set, strings for the drive (!tx: CMDS, types) are as they are.
-; Colours follow the TR menu: its seven colour references (background, border, banner, time, option, sources, name) come as the third
+; Colors follow the TR menu: its seven color references (background, border, banner, time, option, sources, name) come as the third
 ; line of "!STATE" (hex digits; the menu's defaults when a firmware sends no such line). Bytes C_BAN..C_NAME in a screen string select
-; one (fch sets the text colour from THEME). As in the menu: a reverse banner, keys in reverse in the option colour, their descriptions and
-; labels in the sources colour, paths and names in the name colour, messages in the time colour.
+; one (fch sets the text color from THEME). As in the menu: a reverse banner, keys in reverse in the option color, their descriptions and
+; labels in the sources color, paths and names in the name color, messages in the time color.
 !cpu 6502
 
 SETLFS  = $FFBA
@@ -69,7 +69,7 @@ LARROW  = 95                    ; left arrow: cancel; "CD:<-" unmounts
 OUTSCR  = 0                     ; OUTM: where fch sends characters
 OUTLINE = 1
 OUTCMD  = 2
-C_BAN   = 3                     ; screen string bytes 1-7: colour reference 0-6 of the TR menu (THEME); only these five are used for text
+C_BAN   = 3                     ; screen string bytes 1-7: color reference 0-6 of the TR menu (THEME); only these five are used for text
 C_TIME  = 4
 C_OPT   = 5
 C_SRC   = 6
@@ -258,7 +258,7 @@ fch     sta FCH
         bcs @ch
         tax
         beq @ch
-        lda THEME-1,x           ; 1-7: a colour reference
+        lda THEME-1,x           ; 1-7: a color reference
         sta TXTCOL
         jmp @r
 @ch     and #$7F
@@ -905,8 +905,8 @@ reindex lda #<TXT
         sta LS0+1
         rts
 
-; The entries: lines that start with "/" after any spaces, "path[, colour[, flashes]]"; the numbers are 1-3 digits after the last
-; commas (spaces around them allowed), colour taken AND 15, flashes at most 20, both 1 when missing. NE entries of at most MAXE:
+; The entries: lines that start with "/" after any spaces, "path[, color[, flashes]]"; the numbers are 1-3 digits after the last
+; commas (spaces around them allowed), color taken AND 15, flashes at most 20, both 1 when missing. NE entries of at most MAXE:
 ; EPL/EPH/ELN the path (in TXT), EC, EF, EX the line.
 parse   lda #0
         sta NE
@@ -959,7 +959,7 @@ parse   lda #0
         sta N1+1
         jsr trailnum
         bcc @two
-        lda N1                  ; one number: the colour
+        lda N1                  ; one number: the color
         and #15
         sta PC
         jmp @tr
@@ -1181,7 +1181,7 @@ emit    lda #0
         sta (P3),y
         jmp incp3
 
-; LINEB = "path, colour, flashes" from (P2)/SLEN, PC, PF
+; LINEB = "path, color, flashes" from (P2)/SLEN, PC, PF
 mkline  lda #OUTLINE
         sta OUTM
         lda #0
@@ -1277,7 +1277,7 @@ save    lda TLEN+1
 ; ---------------------------------------------------------------------------------------------------------------------------------
 ; The screen: row 0 title, 1-2 the units, 3 the list header, 4-19 the list, 20 messages, 21-23 the keys.
 drawall jsr scr
-        jsr pstr                ; the menu clears in the name colour
+        jsr pstr                ; the menu clears in the name color
         !pet C_NAME, 147, 0
         ldx #0
         jsr rowbeg
@@ -1426,7 +1426,7 @@ drawlist
         bcc @r
         rts
 
-; list entry KK on its row: ">" on the cursor, "*" when mounted, number, path (reverse on the cursor), colour, a block in it, flashes
+; list entry KK on its row: ">" on the cursor, "*" when mounted, number, path (reverse on the cursor), color, a block in it, flashes
 drawrow lda KK
         sec
         sbc TP
@@ -1484,7 +1484,7 @@ drawrow lda KK
         jsr pstr
         !pet " ", 18, 0
         ldx KK
-        lda EC,x                ; the block in the entry's colour
+        lda EC,x                ; the block in the entry's color
         sta TXTCOL
         jsr pstr
         !pet "  ", 146, C_SRC, 0
@@ -1495,7 +1495,7 @@ drawrow lda KK
         lda #'X'
         jmp fch
 
-THEME   !by 0, 4, 4, 10, 7, 14, 13 ; the TR menu's colour references (its defaults until "!STATE" gives them): see C_BAN
+THEME   !by 0, 4, 4, 10, 7, 14, 13 ; the TR menu's color references (its defaults until "!STATE" gives them): see C_BAN
 
 ; A = '*' when entry KK is the image mounted on the shown unit, else ' '
 mstar   ldx UN
@@ -1662,7 +1662,7 @@ k_unm   ldx UN
 @d      jsr readstate
         jmp drawmid
 
-; A: add an entry (browse, colour, flashes)
+; A: add an entry (browse, color, flashes)
 k_add   lda NE
         cmp #MAXE
         bcs @full
@@ -1711,7 +1711,7 @@ k_add   lda NE
 @cn     jmp drawall
 @long   jmp toolong
 
-; E: edit the entry (path, "?" browses for it; colour; flashes)
+; E: edit the entry (path, "?" browses for it; color; flashes)
 k_edit  lda NE
         bne @go
         rts
@@ -1913,7 +1913,7 @@ pathbp  lda #<PATHB
         sta SLEN
         rts
 
-lbcol   !pet "Colour 0-15: ", 0
+lbcol   !pet "Color 0-15: ", 0
 lbfl    !pet "Flashes 0-20: ", 0
 lbpath  !pet "Path(?=browse): ", 0
 
@@ -1983,7 +1983,7 @@ edline  sta ML
 @cn     sec
         rts
 
-; Ask for a number with label X/Y, default A, at most NMAX: A = the number (the default when it is not one or too big), carry set = cancelled.
+; Ask for a number with label X/Y, default A, at most NMAX: A = the number (the default when it is not one or too big), carry set = canceled.
 asknum  sta DEF
         stx LBP2
         sty LBP2+1
@@ -2577,5 +2577,5 @@ FGX     = FEND + 1
 MST     = FGX + 1               ; mcall: the answer's ST
 MW0     = MST + 1
 MW1     = MW0 + 1
-THN     = MW1 + 1               ; the colours being read (THEME takes them when all seven came)
+THN     = MW1 + 1               ; the colors being read (THEME takes them when all seven came)
 !if THN + 7 > $5000 { !error "the BSS ends at $4FFF" }

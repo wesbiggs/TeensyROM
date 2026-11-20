@@ -124,13 +124,13 @@
     },
     {
       "name": "TDriveConfig",
-      "description": "TDrive Config, in the TR menu with a TDrive Special IO: edits the Alt-button disk lists and the mounted images. Ported from teensyrom-tdrive util/vdconfig.s (ca65) to the same bytes.",
+      "description": "TDrive Config, in the TR menu with a TDrive Special IO: edits the Alt-button disk lists and the mounted images. Ported from teensyrom-tdrive util/vdconfig.s (ca65).",
       "dir": "Source/C64/TDriveConfig",
       "steps": [
-        { "assembler": "acme", "source": "vdconfig.asm", "output": "vdconfig.prg", "format": "cbm" }
+        { "assembler": "acme", "source": "tdconfig.asm", "output": "tdconfig.prg", "format": "cbm" }
       ],
       "headers": [
-        { "input": "build/vdconfig.prg", "dest": "vdconfig.prg.h", "progmem": true }
+        { "input": "build/tdconfig.prg", "dest": "tdconfig.prg.h", "progmem": true }
       ]
     },
     {

@@ -2,7 +2,7 @@
 //add PROGMEM to declaration of all main menu binaries:
 #include "TRMenuFiles/ROMs/ccgms_2021_Swiftlink_DE_38400.prg.h"
 #ifdef TDrive_Any
-   #include "TRMenuFiles/ROMs/vdconfig.prg.h"
+   #include "TRMenuFiles/ROMs/tdconfig.prg.h"
 #endif
 #ifdef Fab04_TDrive
    #define IOH_TDriveMenu IOH_TDrive        //TDrive Config runs with the default TDrive Special IO (TDriveSwift_Remap)
@@ -186,7 +186,7 @@ StructMenuItem dirUtilities[] =
 /*2*/rtFilePrg  , IOH_None         , (char*)"Exit to BASIC"                    , (uint8_t*)empty_prg                  , sizeof(empty_prg) ,    //used by location, see ExitToBASIC:
 /*3*/rtFilePrg  , IOH_None         , (char*)"LOAD\"*\",8,1  and  RUN"          , (uint8_t*)Load8Run_prg               , sizeof(Load8Run_prg) , //used by location, see Load8Run:
 #ifdef TDrive_Any
-     rtFilePrg  , IOH_TDriveMenu   , (char*)"TDrive Config             +TDrive", (uint8_t*)vdconfig_prg               , sizeof(vdconfig_prg) ,
+     rtFilePrg  , IOH_TDriveMenu   , (char*)"TDrive Config             +TDrive", (uint8_t*)tdconfig_prg               , sizeof(tdconfig_prg) ,
 #endif
      rtFilePrg  , IOH_None         , (char*)"Exit to C128 BASIC         +C128" , (uint8_t*)c128basic_prg              , sizeof(c128basic_prg) ,
      rtFilePrg  , IOH_TR_BASIC     , (char*)"BASIC with TeensyROM Commands"    , (uint8_t*)TRCBC_prg                  , sizeof(TRCBC_prg) ,
