@@ -46,3 +46,18 @@ test('VERIFY of a file too long for RAM is handed back without reading the whole
   assert.equal(stat, `stat=${NOTMINE}`);
   assert.ok(Number(read.slice('read='.length)) <= ROOM + DMA_PART, read);
 });
+
+// The device number a fast SAVE / LOAD was opened on can move before it ends (a U0> on the command channel, the bus scan). The
+// transfer stays on its unit: before, the close looked the unit up by the old number, read v->unit[-1], left channel 1 open
+// and the file unfinished, and a LOAD read zeros with no end.
+test('a fast SAVE closes cleanly when its device is renumbered with U0> before the close', { skip }, () => {
+  assert.equal(run('save', 'renumber'), 'close=5a data=0 open=0 blocks=1');
+});
+
+test('a fast SAVE closes cleanly when the bus scan releases its device number before the close', { skip }, () => {
+  assert.equal(run('save', 'scan'), 'close=5a data=0 open=0 blocks=1');
+});
+
+test('a fast LOAD ends with its file when its device is renumbered after the open', { skip }, () => {
+  assert.equal(run('load'), 'bytes=598 end=1');   // 600 bytes, the first two came with the open as the load address
+});

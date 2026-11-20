@@ -146,6 +146,9 @@ int  tdrive_pending_err(const tdrive_t *v, int unit);         /* DOS error code 
 /* Returns 1 if the transaction is not ours (fall back to the real IEC bus);
  * 0 if handled, with data and st filled in (st = bits to OR into KERNAL ST). */
 int tdrive_mailbox(tdrive_t *v, uint8_t cmd, uint8_t arg, uint8_t *data, uint8_t *st);
+/* LISTEN (talk 0) or TALK (talk 1) to unit 0/1 by its index, whatever device number it answers to now: a transfer opened on the
+ * unit stays on it across a U0> or a bus scan. Returns the ST bits LISTEN / TALK would ($80: the unit is absent). */
+uint8_t tdrive_select(tdrive_t *v, int unit, int talk);
 
 size_t tdrive_sizeof(void);
 

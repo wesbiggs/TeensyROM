@@ -1121,19 +1121,24 @@ VD_COLD static int read_byte(tdrive_t *v, int unit, vd_unit_t *u, vd_chan_t *c, 
     return 0;
 }
 
+VD_COLD uint8_t tdrive_select(tdrive_t *v, int unit, int talk)
+{
+    v->talking = (uint8_t)(talk != 0);
+    v->wlen = 0;
+    v->act = (int8_t)unit;
+    if (v->unit[unit].disk) v->unit[unit].disk->bad = 0;   /* a bad sector some earlier step read and did not report */
+    if (!v->unit[unit].present) { v->act = 2; return ST_NODEV; }
+    return 0;
+}
+
 VD_COLD int tdrive_mailbox(tdrive_t *v, uint8_t cmd, uint8_t arg, uint8_t *data, uint8_t *st)
 {
     *data = 0; *st = 0;
     if (cmd == VD_LISTEN || cmd == VD_TALK) {
+        int unit = tdrive_unit_for(v, arg);
+        if (unit >= 0) { *st = tdrive_select(v, unit, cmd == VD_TALK); return 0; }
         v->talking = (cmd == VD_TALK);
         v->wlen = 0;
-        int unit = tdrive_unit_for(v, arg);
-        if (unit >= 0) {
-            v->act = (int8_t)unit;
-            if (v->unit[unit].disk) v->unit[unit].disk->bad = 0;   /* a bad sector some earlier step read and did not report */
-            if (!v->unit[v->act].present) { v->act = 2; *st = ST_NODEV; }
-            return 0;
-        }
         v->act = -1;
         return 1;
     }

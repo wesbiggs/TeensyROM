@@ -43,37 +43,41 @@ VD_COLD static int bus(vio_t *v, uint8_t c, uint8_t a, uint8_t *data)
     return st;
 }
 
-VD_COLD static void send_name_open(vio_t *v, uint8_t dev, uint8_t sa)
+/* An open fast LOAD / SAVE is addressed by its unit, not by the device number it was opened with: a U0> or a bus scan can move
+ * that number meanwhile, and the number then reached nobody (the save's channel stayed open, the load read zeros without end). */
+VD_COLD static uint8_t sel(vio_t *v, uint8_t unit, int talk) { return tdrive_select(&v->vd, unit, talk); }
+
+VD_COLD static void send_name_open(vio_t *v, uint8_t unit, uint8_t sa)
 {
-    bus(v, VD_LISTEN, dev, 0);
+    sel(v, unit, 0);
     bus(v, VD_SECOND, sa, 0);
     for (unsigned i = 0; i < v->h->len && i < VIO_WIN; i++) bus(v, VD_CIOUT, v->h->window[i], 0);
     bus(v, VD_UNLSN, 0, 0);
 }
 
-VD_COLD static void close_chan(vio_t *v, uint8_t dev, uint8_t sa)
+VD_COLD static void close_chan(vio_t *v, uint8_t unit, uint8_t sa)
 {
-    bus(v, VD_LISTEN, dev, 0); bus(v, VD_SECOND, sa, 0); bus(v, VD_UNLSN, 0, 0);
+    sel(v, unit, 0); bus(v, VD_SECOND, sa, 0); bus(v, VD_UNLSN, 0, 0);
 }
 
 VD_COLD static void fload_open(vio_t *v)
 {
-    uint8_t dev = v->h->arg, b0, b1 = 0;
+    uint8_t unit = (uint8_t)tdrive_unit_for(&v->vd, v->h->arg), b0, b1 = 0;   /* vio_poll: a unit answers at ARG */
     v->fl_active = 0; v->fl_verify = 0;
-    if (bus(v, VD_LISTEN, dev, 0) & 0x80) { v->h->data = 5; return; }
+    if (sel(v, unit, 0) & 0x80) { v->h->data = 5; return; }
     bus(v, VD_UNLSN, 0, 0);                         /* finish probe transaction */
-    send_name_open(v, dev, 0xF0);
-    bus(v, VD_TALK, dev, 0); bus(v, VD_TKSA, 0x60, 0);
+    send_name_open(v, unit, 0xF0);
+    sel(v, unit, 1); bus(v, VD_TKSA, 0x60, 0);
     int st0 = bus(v, VD_ACPTR, 0, &b0);
     if (st0 & 0x02) {                               /* nothing came back: file not found */
-        bus(v, VD_UNTLK, 0, 0); close_chan(v, dev, 0xE0);
+        bus(v, VD_UNTLK, 0, 0); close_chan(v, unit, 0xE0);
         v->h->data = 4; return;
     }
     v->fl_eof = (st0 & 0x40) != 0;
     if (!v->fl_eof) { int st1 = bus(v, VD_ACPTR, 0, &b1); v->fl_eof = (st1 & 0x40) != 0; }
     bus(v, VD_UNTLK, 0, 0);
     v->h->window[0] = b0; v->h->window[1] = b1;
-    v->fl_active = 1; v->fl_dev = dev;
+    v->fl_active = 1; v->fl_unit = unit;
     v->h->data = 0;
 }
 
@@ -85,9 +89,9 @@ VD_COLD static unsigned fload_read(vio_t *v, uint8_t *buf, unsigned max, uint8_t
     uint8_t d;
     *st_out = 0x40;                                         /* default: EOI, empty */
     if (!v->fl_active) return 0;
-    if (v->fl_eof) { close_chan(v, v->fl_dev, 0xE0); v->fl_active = 0; return 0; }
+    if (v->fl_eof) { close_chan(v, v->fl_unit, 0xE0); v->fl_active = 0; return 0; }
     int eof = 0, tmo = 0;
-    bus(v, VD_TALK, v->fl_dev, 0); bus(v, VD_TKSA, 0x60, 0);
+    sel(v, v->fl_unit, 1); bus(v, VD_TKSA, 0x60, 0);
     while (n < max) {
         int st = bus(v, VD_ACPTR, 0, &d);
         if (st & 0x02) { eof = 1; tmo = 1; break; }       /* a read error (bad sector): the load ends here, ST shows $42 */
@@ -96,7 +100,7 @@ VD_COLD static unsigned fload_read(vio_t *v, uint8_t *buf, unsigned max, uint8_t
     }
     bus(v, VD_UNTLK, 0, 0);
     *st_out = (uint8_t)(eof ? (tmo ? 0x42 : 0x40) : 0);
-    if (eof) { close_chan(v, v->fl_dev, 0xE0); v->fl_active = 0; }
+    if (eof) { close_chan(v, v->fl_unit, 0xE0); v->fl_active = 0; }
     return n;
 }
 
@@ -109,7 +113,7 @@ VD_COLD static void fload_blk(vio_t *v)
 
 VD_COLD static void fload_abandon(vio_t *v)
 {
-    if (v->fl_active) { close_chan(v, v->fl_dev, 0xE0); v->fl_active = 0; }
+    if (v->fl_active) { close_chan(v, v->fl_unit, 0xE0); v->fl_active = 0; }
 }
 
 VD_COLD static int dma_can(const vio_t *v, int need_read)
@@ -199,19 +203,18 @@ VD_COLD void vio_set_dma(vio_t *v, int (*write)(void *ctx, uint16_t addr, const 
 
 VD_COLD static void fsave_open(vio_t *v)
 {
-    uint8_t dev = v->h->arg;
+    uint8_t unit = (uint8_t)tdrive_unit_for(&v->vd, v->h->arg);   /* vio_poll: a unit answers at ARG */
     v->fs_active = 0; v->fs_fail = 0;
-    if (bus(v, VD_LISTEN, dev, 0) & 0x80) { v->h->data = 5; return; }
+    if (sel(v, unit, 0) & 0x80) { v->h->data = 5; return; }
     bus(v, VD_UNLSN, 0, 0);
-    send_name_open(v, dev, 0xF1);
-    int unit = tdrive_unit_for(&v->vd, dev);
-    if (tdrive_chan_mode(&v->vd, unit, 1) == 3) { v->fs_active = 1; v->fs_dev = dev; v->h->data = 0; }
+    send_name_open(v, unit, 0xF1);
+    if (tdrive_chan_mode(&v->vd, unit, 1) == 3) { v->fs_active = 1; v->fs_unit = unit; v->h->data = 0; }
     else { int e = tdrive_pending_err(&v->vd, unit); v->h->data = (uint8_t)(e ? e : 74); }
 }
 
 VD_COLD static void fsave_bytes(vio_t *v, const uint8_t *buf, unsigned n)
 {
-    bus(v, VD_LISTEN, v->fs_dev, 0); bus(v, VD_SECOND, 0x61, 0);
+    sel(v, v->fs_unit, 0); bus(v, VD_SECOND, 0x61, 0);
     for (unsigned i = 0; i < n; i++) bus(v, VD_CIOUT, buf[i], 0);
     bus(v, VD_UNLSN, 0, 0);
 }
@@ -242,7 +245,7 @@ VD_COLD static int fsave_dma(vio_t *v)
     uint32_t nxt = cur + n;
     uint8_t ptr[2] = { (uint8_t)nxt, (uint8_t)(nxt >> 8) };
     if (!v->dma_write(v->dma_ctx, VIO_DMA_SAVE, ptr, 2)) {
-        close_chan(v, v->fs_dev, 0xE1);                     /* what came so far stays in the file, as after a save cut short */
+        close_chan(v, v->fs_unit, 0xE1);                    /* what came so far stays in the file, as after a save cut short */
         v->fs_active = 0; v->fs_fail = 1;
         return 1;
     }
@@ -257,9 +260,9 @@ VD_COLD static int fsave_close(vio_t *v)
     v->h->data = 0;
     if (v->fs_fail) { v->fs_fail = 0; return 1; }
     if (!v->fs_active) return 0;
-    int unit = tdrive_unit_for(&v->vd, v->fs_dev);
+    int unit = v->fs_unit;
     int ok = tdrive_chan_mode(&v->vd, unit, 1) == 3;
-    close_chan(v, v->fs_dev, 0xE1);
+    close_chan(v, v->fs_unit, 0xE1);
     if (!ok) { int e = tdrive_pending_err(&v->vd, unit); v->h->data = (uint8_t)(e ? e : 74); }
     v->fs_active = 0;
     return 0;

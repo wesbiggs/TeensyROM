@@ -104,7 +104,7 @@ typedef struct {
 typedef struct {
     tdrive_t vd;                       /* must stay first: callers pass a vio_t* where a tdrive_t* is wanted */
     vio_hot_t *h;
-    uint8_t fl_active, fl_eof, fl_dev, fs_active, fs_dev;
+    uint8_t fl_active, fl_eof, fl_unit, fs_active, fs_unit;   /* the unit an open fast LOAD / SAVE is on (not its device number) */
     uint8_t fl_verify;                 /* the channel was opened by VIO_FVERIFY_OPEN: VIO_FLOAD_DMA compares instead of writing */
     uint8_t fs_fail;                   /* a VIO_FSAVE_DMA was abandoned: the rest of that save is answered NOTMINE */
     uint8_t scan_state;                /* 0 not needed, 1 to be requested, 2 requested, 3 done */
