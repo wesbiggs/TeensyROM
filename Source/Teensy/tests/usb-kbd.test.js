@@ -92,6 +92,14 @@ test('a full queue says so, drops writes, and still takes a release-all', { skip
   assert.deepEqual(allUp, [EMPTY, report(0, B)], 'the presses queued before it never land');
 });
 
+test('a release-all landing on a full queue mid-poll drops only what came before it', { skip }, () => {
+  const fill = Array.from({ length: 63 }, (_, i) => press(0x04 + (i % 6)));
+  // while A's report goes out a slot frees: G fills it, the release-all finds the queue full,
+  // and while the release's own report goes out B is pressed, after it
+  const out = run([...fill, `onsend 1 0 ${G.toString(16)}`, 'onsend 1 2 0', `onsend 2 0 ${B.toString(16)}`, 'poll']);
+  assert.deepEqual(out, [report(0, A), EMPTY, report(0, B)]);
+});
+
 test('held keys are released after 3 s with no register written', { skip }, () => {
   assert.deepEqual(run([press(A), 'poll', 'ms 2999', 'poll', 'ms 1', 'poll', 'ms 5000', 'poll']),
     [report(0, A), EMPTY]);

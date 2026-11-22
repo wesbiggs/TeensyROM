@@ -9,6 +9,8 @@
 //   ms N           N milliseconds pass
 //   host 0|1       a USB host has configured the device, or not
 //   leds N         the host sets its LEDs to N
+//   onsend N R V   while the Nth report from now is being sent, an IO1 write of V at R lands
+//                  (the C64 writing while the polling handler is mid-queue)
 // Output: "report MM K1 K2 K3 K4 K5 K6" (hex) for each report the core is given, with
 // " (no host)" when it has no host to send it to.
 #include <cstdint>
@@ -18,6 +20,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #define FLASHMEM
 
@@ -47,8 +50,19 @@ uint8_t keyboard_keys[6];
 volatile uint8_t keyboard_leds;
 volatile uint8_t usb_configuration = 1;
 
+struct DeferredWrite { int Countdown; uint8_t Reg, Val; };
+static std::vector<DeferredWrite> Deferred;
+static void IOWrite(uint8_t Reg, uint8_t Val);
+
 static int usb_keyboard_send()
 {
+   std::vector<DeferredWrite> Due;
+   for (auto It = Deferred.begin(); It != Deferred.end();)
+   {
+      if (--It->Countdown == 0) { Due.push_back(*It); It = Deferred.erase(It); }
+      else ++It;
+   }
+   for (const DeferredWrite &W : Due) IOWrite(W.Reg, W.Val);
    std::printf("report %02x", keyboard_modifier_keys);
    for (uint8_t Key : keyboard_keys) std::printf(" %02x", Key);
    std::printf(usb_configuration ? "\n" : " (no host)\n");
@@ -57,19 +71,24 @@ static int usb_keyboard_send()
 
 #include "../MinimalBoot/Common/IO_Handlers/IOH_UsbKbd.c"
 
+static void IOWrite(uint8_t Reg, uint8_t Val)
+{
+   BusData = Val;
+   IOHndlr_UsbKbd.IO1Hndlr(Reg, false);
+}
+
 int main()
 {
    std::string Line;
    while (std::getline(std::cin, Line))
    {
       std::istringstream In(Line);
-      std::string Cmd, A, B;
-      In >> Cmd >> A >> B;
-      if (Cmd == "w")
-      {
-         BusData = (uint8_t)std::strtoul(B.c_str(), NULL, 16);
-         IOHndlr_UsbKbd.IO1Hndlr((uint8_t)std::strtoul(A.c_str(), NULL, 16), false);
-      }
+      std::string Cmd, A, B, C;
+      In >> Cmd >> A >> B >> C;
+      if (Cmd == "w") IOWrite((uint8_t)std::strtoul(A.c_str(), NULL, 16), (uint8_t)std::strtoul(B.c_str(), NULL, 16));
+      else if (Cmd == "onsend")
+         Deferred.push_back({(int)std::strtoul(A.c_str(), NULL, 10), (uint8_t)std::strtoul(B.c_str(), NULL, 16),
+                             (uint8_t)std::strtoul(C.c_str(), NULL, 16)});
       else if (Cmd == "r")
       {
          Driven = -1;

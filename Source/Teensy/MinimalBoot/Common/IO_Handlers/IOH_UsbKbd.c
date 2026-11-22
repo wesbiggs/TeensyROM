@@ -57,7 +57,8 @@ static volatile uint8_t UsbKbd_Regs[UsbKbd_NumRegs] = {0, 0, UsbKbd_Version, 0, 
 // (register << 8) | data, written by the IO ISR at Head, read by the main loop at Tail
 static volatile uint16_t UsbKbd_Queue[UsbKbd_QueueSize];
 static volatile uint8_t UsbKbd_Head, UsbKbd_Tail;
-static volatile bool UsbKbd_AllUpPending;        // a release-all that found the queue full
+static volatile bool UsbKbd_AllUpPending;        // a release-all that found the queue full,
+static volatile uint8_t UsbKbd_AllUpHead;         //  and Head then: what it follows
 static volatile uint32_t UsbKbd_LastWritemS;
 
 // The main loop's
@@ -82,7 +83,11 @@ void IO1Hndlr_UsbKbd(uint8_t Address, bool R_Wn)
    uint8_t Next = (Head + 1) & (UsbKbd_QueueSize - 1);
    if (Next == UsbKbd_Tail)
    {
-      if (Address == UsbKbd_RegAllUp) UsbKbd_AllUpPending = true;
+      if (Address == UsbKbd_RegAllUp)
+      {
+         UsbKbd_AllUpHead = Head;
+         UsbKbd_AllUpPending = true;
+      }
       return;
    }
    UsbKbd_Queue[Head] = (Address << 8) | Data;
@@ -159,18 +164,18 @@ FLASHMEM void InitHndlr_UsbKbd()
 
 FLASHMEM void PollingHndlr_UsbKbd()
 {
-   if (UsbKbd_AllUpPending)
-   {  // the queue is full, so the ISR adds nothing to it until Tail moves
-      UsbKbd_Tail = UsbKbd_Head;
-      UsbKbd_AllUpPending = false;
-      UsbKbd_ReleaseAll();
-   }
-   uint8_t Tail = UsbKbd_Tail;
-   while (Tail != UsbKbd_Head)
+   for (;;)
    {
+      if (UsbKbd_AllUpPending)
+      {  // everything from Tail up to AllUpHead was written before it
+         UsbKbd_AllUpPending = false;
+         UsbKbd_Tail = UsbKbd_AllUpHead;
+         UsbKbd_ReleaseAll();
+      }
+      uint8_t Tail = UsbKbd_Tail;
+      if (Tail == UsbKbd_Head) break;
       uint16_t Entry = UsbKbd_Queue[Tail];
-      Tail = (Tail + 1) & (UsbKbd_QueueSize - 1);
-      UsbKbd_Tail = Tail;
+      UsbKbd_Tail = (Tail + 1) & (UsbKbd_QueueSize - 1);
       uint8_t Data = Entry & 0xff;
       switch (Entry >> 8)
       {
