@@ -106,11 +106,16 @@ export function extensionLinkerScript(linkers, hostCodeKiB = DEFAULT_HOST_CODE_K
     // DTCM, and mbedTLS's tables alone would push the host's data into the module window.
     [...Object.entries(FLASH_RESIDENT_LIBRARIES).map(([name, staying]) => [name, staying, '.text*']),
      ...flashLibraries.map((name) => [name, [], '.text* .rodata*'])].map(([name, staying, sections]) => {
-      const dir = `*${PATH_SEPARATOR}libraries${PATH_SEPARATOR}${name}${PATH_SEPARATOR}*`;
+      // arduino-cli passes object paths relative to the build directory when the
+      // absolute ones would make the link command too long (a deep checkout), so each
+      // rule also has a form that starts at `libraries`.
       const exclude = (prefix) => staying.length
         ? `EXCLUDE_FILE(${staying.map((file) => `${prefix}${file}`).join(' ')}) ` : '';
-      return `\t\t${dir}(${exclude(`*${PATH_SEPARATOR}`)}${sections})\n` +
-        `\t\t${dir}:*(${exclude('*:')}${sections})\n`;
+      return [`*${PATH_SEPARATOR}`, ''].map((lead) => {
+        const dir = `${lead}libraries${PATH_SEPARATOR}${name}${PATH_SEPARATOR}*`;
+        return `\t\t${dir}(${exclude(`*${PATH_SEPARATOR}`)}${sections})\n` +
+          `\t\t${dir}:*(${exclude('*:')}${sections})\n`;
+      }).join('');
     }).join(''));
   // Pin the host to six 32 KiB ITCM blocks, so the module window at 0x18000
   // cannot be pushed around by a change in host code size.

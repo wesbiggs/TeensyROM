@@ -9,11 +9,13 @@
 // WebGet_<label>.zip beside it:
 //
 //   TeensyROM+_<ver>_WebGet.TRH     the host; install it from the TR menu
-//   VMS/WWW/                         the package that claims .www: its manifest,
-//                                    WebGet client cartridge, ca.pem, and the
-//                                    module the package format requires, which
-//                                    this host never runs
+//   VMS/WWW/                         the package that claims .www and .tls: its
+//                                    manifest, WebGet client cartridge, ca.pem,
+//                                    and the module the package format requires,
+//                                    which this host never runs
 //   WebGet.www                       an empty list, which opens the prompt
+//   basic.tls                        empty: BASIC with the SwiftLink modem
+//   tlsterm.tls                      a dumb terminal for the modem
 //   README.txt
 //
 // The label defaults to `git describe` against WebGet_v* tags. --ccache is passed to
@@ -58,7 +60,7 @@ if (!trh) throw new Error(`no *_WebGet.TRH in ${out}`);
 
 const packageOut = path.join(out, 'package');
 fs.rmSync(packageOut, { recursive: true, force: true });
-run(process.execPath, ['tools/build-extension.mjs', '--id', 'WWW', '--extensions', 'www', '--services', '0',
+run(process.execPath, ['tools/build-extension.mjs', '--id', 'WWW', '--extensions', 'www,tls', '--services', '0',
   '--source', 'vm/hello/hello.cpp', '--client-source', 'Source/C64/WebGet/webget.a', '--out', packageOut]);
 
 fs.mkdirSync(path.join(stage, 'VMS'), { recursive: true });
@@ -66,6 +68,8 @@ fs.cpSync(path.join(packageOut, 'VMS', 'WWW'), path.join(stage, 'VMS', 'WWW'), {
 fs.copyFileSync(path.join(hostDir, 'ca.pem'), path.join(stage, 'VMS', 'WWW', 'ca.pem'));
 fs.copyFileSync(trh, path.join(stage, path.basename(trh)));
 fs.writeFileSync(path.join(stage, 'WebGet.www'), '');
+fs.writeFileSync(path.join(stage, 'basic.tls'), '');
+run('acme', ['-f', 'cbm', '-o', path.join(stage, 'tlsterm.tls'), path.join(root, 'Source', 'C64', 'WebGet', 'tlsterm.a')]);
 fs.copyFileSync(path.join(hostDir, 'README.txt'), path.join(stage, 'README.txt'));
 
 // Entries are stored relative to the stage, so the zip unpacks onto a card root as is.

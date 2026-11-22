@@ -52,7 +52,9 @@ stcIOHandlers IOHndlr_SwiftLink =
 #define eepAdBMTitle(BMNum) (eepAdBookmarks+(BMNum)*(eepBMTitleSize+eepBMURLSize)) //EEPROM addr of bookmark title, BMNum zero based
 #define eepAdBMURL(BMNum)   (eepAdBMTitle(BMNum)+eepBMTitleSize)                    //EEPROM addr of bookmark URL
 #define BytesPerDot        (25*1024) //dot every 25k when downloading
+#ifndef RxQueueNumBlocks   //a host that gives the queue flow control (WebGet's modem) takes a smaller one
 #define RxQueueNumBlocks    40 
+#endif
 #define RxQueueBlockSize   (1024*8) // 40*8k=320k
 #define RxQueueSize        (RxQueueNumBlocks*RxQueueBlockSize) 
 #define NMITimeoutuS      7000    //DbgMsgs_SW only: if Rx data reg not read within this time from NMI assert, deassert NMI anyway.  7000uS is just under 1200 baud to read status reg

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //
 // WebGet: an extension host that downloads HTTP and HTTPS URLs to the SD card,
-// with its progress on the C64 screen and a prompt for more.
+// with its progress on the C64 screen and a prompt for more. A .tls file runs
+// it as a SwiftLink modem instead, which TlsModem.h describes.
 //
 // It runs when the user picks a .www file in the menu, which a /VMS package
 // claims (see the package line below). Its inputs are:
@@ -76,8 +77,10 @@ const VmHostId vmHostId = { VM_HOSTID_MAGIC, VM_ABI, 0, 0, "WebGet", VM_HOST_COD
 // heap is 16 KiB of DTCM. Everything stays below VM_FAIL_BASE.
 static constexpr uint32_t Ram2Base    = 0x20200000u;
 static constexpr uint32_t NetHeapSize = 128 * 1024;   // holds RecvWindow of queued segments
-static constexpr uint32_t TlsHeapSize = 160 * 1024;
-static_assert(Ram2Base + NetHeapSize + TlsHeapSize <= VM_FAIL_BASE, "RAM2 carve-out reaches the fail record");
+// The rest, up to the fail record, is mbedTLS's heap, which this host's own
+// buffers of a URL's size share: DTCM has no room for them beside the modem's.
+static constexpr uint32_t HeapSize = VM_FAIL_BASE - (Ram2Base + NetHeapSize);
+static_assert(HeapSize >= 160 * 1024, "the 160 KiB a download's TLS was measured working in");
 
 enum Stage : uint8_t {
    Done = 0, SdInit, UrlFile, UrlParse, CaFile, CaParse, Trng, DrbgSeed, NetInit,
@@ -87,6 +90,8 @@ enum Stage : uint8_t {
    Dns,        // value: milliseconds the lookup took to fail
    Launch,     // value: 0 no readable record, 1 no file selected
    Client,     // the package's client.crt would not load
+   Program,    // a .tls file that is no program: value 0 unreadable or too short, else its load address
+   Boot,       // a .tls start: value 0 the boot cartridge never ran, 1 BASIC never came up, 2 a DMA failed
 };
 
 static constexpr size_t MaxUrlsBytes = 16 * 1024;
@@ -484,17 +489,23 @@ FLASHMEM static unsigned char *ReadFile(const char *path, size_t &len, size_t li
    return buf;
 }
 
+// Before any Ethernet.begin(): the modem's begin is the SwiftLink files' own.
+FLASHMEM static void NetSetup()
+{
+   Ethernet.setStackHeap((uint8_t *)Ram2Base, NetHeapSize);
+   // NativeEthernet's own sockets go unused (DNS runs on FNET's resolver), but
+   // begin() allocates their buffers on the 16 KiB host heap regardless.
+   Ethernet.setSocketNum(1);
+   Ethernet.setSocketSize(512);
+}
+
 FLASHMEM static bool EthernetUp()
 {
    uint8_t mac[6];
    EEPreadNBuf(eepAdMyMAC, mac, 6);
    uint16_t timeout;
    EEPROM.get(eepAdDHCPTimeout, timeout);
-   Ethernet.setStackHeap((uint8_t *)Ram2Base, NetHeapSize);
-   // NativeEthernet's own sockets go unused (DNS runs on FNET's resolver), but
-   // begin() allocates their buffers on the 16 KiB host heap regardless.
-   Ethernet.setSocketNum(1);
-   Ethernet.setSocketSize(512);
+   NetSetup();
    if (EEPROM.read(eepAdDHCPEnabled))
    {
       uint16_t respTimeout;
@@ -535,10 +546,11 @@ FLASHMEM static bool ResolveLocation(const char *value, Url &url)
       strcpy(url.path, value);
       return true;
    }
-   static Url next;
-   if (!ParseUrl(value, next) || (url.tls && !next.tls)) return false;
-   url = next;
-   return true;
+   Url *next = (Url *)mbedtls_calloc(1, sizeof(Url));
+   const bool ok = next && ParseUrl(value, *next) && !(url.tls && !next->tls);
+   if (ok) url = *next;
+   mbedtls_free(next);
+   return ok;
 }
 
 // The body being written to TempPath, outside Connection so that Exit(), which
@@ -710,9 +722,10 @@ static const char *LastName;
 
 // One URL, through its redirects, to its file on the card. Success's value is
 // the bytes saved.
+static Url *DownloadUrl;   // Session's, on the heap
 FLASHMEM static Result Download(const char *text, mbedtls_ssl_config &conf, char *line)
 {
-   static Url url;
+   Url &url = *DownloadUrl;
    if (!ParseUrl(text, url)) return Result{ UrlParse, 0 };
    static char outPath[sizeof(Dir) + MaxNameLen + 1];
    OutputPath(url, outPath);
@@ -767,9 +780,11 @@ FLASHMEM static void DrawPrompt(const char *text, size_t len)
 }
 
 // One line typed at the prompt, or nullptr when the user leaves.
+static constexpr size_t TypedSize = sizeof(Url::path) + sizeof(Url::host) + 16;
+static char *Typed;   // Session's, on the heap
 FLASHMEM static const char *ReadUrl()
 {
-   static char typed[sizeof(Url::path) + sizeof(Url::host) + 16];
+   char *typed = Typed;
    size_t len = 0;
    typed[0] = 0;
    DrawPrompt(typed, len);
@@ -783,12 +798,28 @@ FLASHMEM static const char *ReadUrl()
       if (key == 13 && len) { Prompting = false; return typed; }          // RETURN
       if (key == 20 && len) typed[--len] = 0;                             // DEL
       else if (key == 147) typed[len = 0] = 0;                            // CLR
-      else if (const char c = KeyChar(key); c && len < sizeof(typed) - 1) { typed[len++] = c; typed[len] = 0; }
+      else if (const char c = KeyChar(key); c && len < TypedSize - 1) { typed[len++] = c; typed[len] = 0; }
       DrawPrompt(typed, len);
    }
 }
 
 // ---- Bus and cartridge, as the stock host sets them up (VMBoot.ino) ----------
+
+// RAM_Image as a 16 KiB EasyFlash, booting in Ultimax mode from bank 0.
+FLASHMEM static void PresentEasyFlash()
+{
+   NumCrtChips = 0;
+   memset(EZFlashRAM, 0, sizeof(EZFlashRAM));
+   CurrentEasyFlashBank = 0;
+   SetGameAssert;
+   SetExROMDeassert;
+   for (unsigned i = 0; i < 64; i++) { BankDecode[i][0] = RAM_Image; BankDecode[i][1] = RAM_Image + 8192; }
+   LOROM_Image = RAM_Image;
+   HIROM_Image = RAM_Image + 8192;
+   LOROM_Mask = HIROM_Mask = 8191;
+   CurrentIOHandler = IOH_EasyFlash;
+   EmulateVicCycles = false;
+}
 
 // The client cartridge from the launching package, checked as the stock host
 // checks it (VMHostBoot), then presented to the C64 as a 16 KiB EasyFlash.
@@ -811,17 +842,7 @@ FLASHMEM static bool StartClient(const VmLaunchRecord &launch)
         vm_crc32(RAM_Image, 16384) == *(uint32_t *)(descriptor + 8);
    f.close();
    if (!ok) return false;
-   NumCrtChips = 0;
-   memset(EZFlashRAM, 0, sizeof(EZFlashRAM));
-   CurrentEasyFlashBank = 0;
-   SetGameAssert;
-   SetExROMDeassert;
-   for (unsigned i = 0; i < 64; i++) { BankDecode[i][0] = RAM_Image; BankDecode[i][1] = RAM_Image + 8192; }
-   LOROM_Image = RAM_Image;
-   HIROM_Image = RAM_Image + 8192;
-   LOROM_Mask = HIROM_Mask = 8191;
-   CurrentIOHandler = IOH_EasyFlash;
-   EmulateVicCycles = false;
+   PresentEasyFlash();
    memcpy(EZFlashRAM + 0xf0, "M3TP", 4);
    LinkActive = true;
    doReset = true;
@@ -885,9 +906,11 @@ FLASHMEM static void Session()
    for (uint8_t row = LogTop; row <= LogBottom; row++) Put(row, Green, "");
    Status(PSTR("starting"));
 
-   mbedtls_memory_buffer_alloc_init((unsigned char *)(Ram2Base + NetHeapSize), TlsHeapSize);
+   mbedtls_memory_buffer_alloc_init((unsigned char *)(Ram2Base + NetHeapSize), HeapSize);
    char *line = (char *)mbedtls_calloc(1, LineSize);
-   if (!line) Stop(TlsSetup, 0, PSTR("out of memory"));
+   Typed = (char *)mbedtls_calloc(1, TypedSize);
+   DownloadUrl = (Url *)mbedtls_calloc(1, sizeof(Url));
+   if (!line || !Typed || !DownloadUrl) Stop(TlsSetup, 0, PSTR("out of memory"));
 
    size_t urlsLen = 0;
    char *urls = (char *)ReadFile(LaunchRecord.content, urlsLen, MaxUrlsBytes);
@@ -939,6 +962,8 @@ FLASHMEM static void Session()
    while (const char *text = ReadUrl()) FetchOne(text, conf, line);
    Exit(Done, Saved);
 }
+
+#include "TlsModem.h"
 
 // ---- setup() and loop(), as the stock host's (VMBoot.ino) ---------------------
 
@@ -1007,9 +1032,15 @@ FLASHMEM void setup()
    }
    if (!LaunchRecord.content[0]) ReturnToMenu(Launch, 1);
    ListName = strrchr(LaunchRecord.content, '/') + 1;
+   const char *dot = strrchr(ListName, '.');
+   if (dot && strcasecmp(dot, ".tls") == 0)
+   {
+      ModemSetup(LaunchRecord);
+      BtnPressed = false;
+      return;
+   }
    memcpy(Dir, LaunchRecord.content, ListName - LaunchRecord.content);
    Dir[ListName - LaunchRecord.content] = 0;
-   const char *dot = strrchr(ListName, '.');
    const size_t stem = dot ? (size_t)(dot - ListName) : strlen(ListName);
    snprintf(TempPath, sizeof(TempPath), "%s%s", Dir, TempName);
    snprintf(LogPath, sizeof(LogPath), "%s%.*s.log", Dir, (int)stem, ListName);
@@ -1036,11 +1067,12 @@ FLASHMEM void loop()
       BtnPressed = false;
       Phi2ResetReleased();
    }
+   if (ModemMode) ModemSession();   // does not return
    LinkService();
    if (ClientStarted) Session();   // does not return
 }
 
-void EEPwriteNBuf(uint16_t addr, const uint8_t* buf, uint8_t len)
+void EEPwriteNBuf(uint16_t addr, const uint8_t* buf, uint16_t len)   // the width IOH_Swiftlink.c declares
 {
    while (len--) EEPROM.write(addr+len, buf[len]);
 }
