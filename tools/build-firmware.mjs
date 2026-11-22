@@ -42,10 +42,11 @@
 //            fill. The default, 64, is what the stock host is linked at. 96 lets a
 //            third-party host's code grow up to the module window at 0x18000.
 //   --usb-keyboard  the "TeensyROM + USB keyboard" build: minimal and main present Serial +
-//            MIDI plus a boot keyboard on the Teensy's USB device port, which PETSKEY
-//            Remote types into with ATDT USB (UsbKbd.c). A different USB device (its own
-//            product ID), so it lands under <name>_usbkbd_full.hex, never the shipping
-//            name. The core's usb_desc.h gains the type in the private copy only
+//            MIDI plus a boot keyboard on the Teensy's USB device port, which C64
+//            programs type into through the USB Keyboard Special IO (IOH_UsbKbd.c).
+//            A different USB device (its own product ID), so it lands under
+//            <name>_usbkbd_full.hex, never the shipping name. The core's usb_desc.h
+//            gains the type in the private copy only
 //            (lib/usb-keyboard.mjs). Refused with --host-sketch, which builds no firmware.
 //   --tag <name>  a special build. The name goes on the version string in every image
 //            ("TeensyROM+ v0.9-pr65" on the C64 banner and in the serial version reply) and
