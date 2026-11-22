@@ -480,9 +480,16 @@ enum enumIOHandlers //Synch order/qty with IOHandler[] (IOHandlers.h)
    IOH_ZaxxonSuper,
    IOH_GMod2,
    IOH_MagicDesk2,
+#if !defined(MinimumBuild) && defined(USB_MIDI_SERIAL_KEYBOARD)
+   IOH_UsbKbd,   //selectable, after GeoRAM in the menu (rwRegNextIOHndlr, IOH_TeensyROM.c); last here so a
+                 //  stock image reading the saved choice finds it out of range, not another handler
+#endif
    
    
    IOH_Num_Handlers       //always last
 };
 
 #define LastSelectableIOH  IOH_USBMouse  //127 max.  Used in IOH_TeensyROM.c for Special IO display/select
+#if !defined(MinimumBuild) && defined(USB_MIDI_SERIAL_KEYBOARD)
+   #define IOH_UsbKbd_Selectable          //also selectable, out of order (rwRegNextIOHndlr, IOH_TeensyROM.c)
+#endif

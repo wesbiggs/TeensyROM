@@ -292,6 +292,9 @@ void RemoteLaunch(RegMenuTypes MenuSourceID, const char *FileNamePath, bool DoCa
    FreeGeoRAM();
    TRBlockUnmount();
    FreeSwiftlinkBuffs();
+#ifdef IOH_UsbKbd_Selectable
+   UsbKbd_End();
+#endif
 
    if (MenuSourceID == rmtTeensy)
    {
