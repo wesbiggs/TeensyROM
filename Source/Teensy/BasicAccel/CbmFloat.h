@@ -25,8 +25,9 @@
 // shift-and-add loop, which is done as five multiplies. Stack-page bytes the ROM writes below
 // the stack pointer (return addresses, FDIVT's PHP) are not modeled.
 //
-// Not yet called by the firmware: Source/Teensy/tests/cbm-float.test.js checks it against the
-// ROM, and tools/basic-accel/ uses it to model the speedup in VICE.
+// The firmware does not hook the ROM with it yet. IOH_Debug's float hand-off test runs it for
+// Source/C64/FloatHandoff, to measure the cost on hardware; Source/Teensy/tests/cbm-float.test.js
+// checks it against the ROM, and tools/basic-accel/ models the speedup in VICE.
 //
 // Decimal mode is not modeled. With D set the ROM's ADCs are BCD and its results are garbage;
 // BASIC never runs with D set.
@@ -35,6 +36,15 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+
+// Where the code and its tables go. Nothing here runs on the PHI2 path, so the firmware
+// defines these as FLASHMEM and PROGMEM before including this file.
+#ifndef CBM_FLOAT_FN
+#define CBM_FLOAT_FN
+#endif
+#ifndef CBM_FLOAT_DATA
+#define CBM_FLOAT_DATA
+#endif
 
 #define CBM_FLAG_C 0x01
 #define CBM_FLAG_Z 0x02
@@ -76,28 +86,28 @@ typedef enum {
 
 // ---- one 6502 instruction each, on the registers, flags and zero page ----
 
-static inline void CbmFlag(CbmCpu *Cpu, uint8_t Flag, bool On)
+static inline CBM_FLOAT_FN void CbmFlag(CbmCpu *Cpu, uint8_t Flag, bool On)
 {
    Cpu->P = On ? Cpu->P | Flag : Cpu->P & ~Flag;
    Cpu->Set |= Flag;
 }
 
-static inline uint8_t CbmNZ(CbmCpu *Cpu, uint8_t Value)
+static inline CBM_FLOAT_FN uint8_t CbmNZ(CbmCpu *Cpu, uint8_t Value)
 {
    CbmFlag(Cpu, CBM_FLAG_Z, Value == 0);
    CbmFlag(Cpu, CBM_FLAG_N, Value & 0x80);
    return Value;
 }
 
-static inline bool CbmC(const CbmCpu *Cpu) { return Cpu->P & CBM_FLAG_C; }
-static inline bool CbmN(const CbmCpu *Cpu) { return Cpu->P & CBM_FLAG_N; }
-static inline bool CbmZ(const CbmCpu *Cpu) { return Cpu->P & CBM_FLAG_Z; }
+static inline CBM_FLOAT_FN bool CbmC(const CbmCpu *Cpu) { return Cpu->P & CBM_FLAG_C; }
+static inline CBM_FLOAT_FN bool CbmN(const CbmCpu *Cpu) { return Cpu->P & CBM_FLAG_N; }
+static inline CBM_FLOAT_FN bool CbmZ(const CbmCpu *Cpu) { return Cpu->P & CBM_FLAG_Z; }
 
-static inline void CbmLda(CbmCpu *Cpu, uint8_t Value) { Cpu->A = CbmNZ(Cpu, Value); Cpu->Set |= CBM_SET_A; }
-static inline void CbmLdx(CbmCpu *Cpu, uint8_t Value) { Cpu->X = CbmNZ(Cpu, Value); Cpu->Set |= CBM_SET_X; }
-static inline void CbmLdy(CbmCpu *Cpu, uint8_t Value) { Cpu->Y = CbmNZ(Cpu, Value); Cpu->Set |= CBM_SET_Y; }
+static inline CBM_FLOAT_FN void CbmLda(CbmCpu *Cpu, uint8_t Value) { Cpu->A = CbmNZ(Cpu, Value); Cpu->Set |= CBM_SET_A; }
+static inline CBM_FLOAT_FN void CbmLdx(CbmCpu *Cpu, uint8_t Value) { Cpu->X = CbmNZ(Cpu, Value); Cpu->Set |= CBM_SET_X; }
+static inline CBM_FLOAT_FN void CbmLdy(CbmCpu *Cpu, uint8_t Value) { Cpu->Y = CbmNZ(Cpu, Value); Cpu->Set |= CBM_SET_Y; }
 
-static inline uint8_t CbmAdc(CbmCpu *Cpu, uint8_t A, uint8_t B)
+static inline CBM_FLOAT_FN uint8_t CbmAdc(CbmCpu *Cpu, uint8_t A, uint8_t B)
 {
    unsigned Sum = A + B + CbmC(Cpu);
    uint8_t R = (uint8_t)Sum;
@@ -106,46 +116,46 @@ static inline uint8_t CbmAdc(CbmCpu *Cpu, uint8_t A, uint8_t B)
    return CbmNZ(Cpu, R);
 }
 
-static inline void CbmAdcA(CbmCpu *Cpu, uint8_t Value) { Cpu->A = CbmAdc(Cpu, Cpu->A, Value); Cpu->Set |= CBM_SET_A; }
-static inline void CbmSbcA(CbmCpu *Cpu, uint8_t Value) { CbmAdcA(Cpu, (uint8_t)~Value); }
-static inline void CbmEorA(CbmCpu *Cpu, uint8_t Value) { CbmLda(Cpu, Cpu->A ^ Value); }
+static inline CBM_FLOAT_FN void CbmAdcA(CbmCpu *Cpu, uint8_t Value) { Cpu->A = CbmAdc(Cpu, Cpu->A, Value); Cpu->Set |= CBM_SET_A; }
+static inline CBM_FLOAT_FN void CbmSbcA(CbmCpu *Cpu, uint8_t Value) { CbmAdcA(Cpu, (uint8_t)~Value); }
+static inline CBM_FLOAT_FN void CbmEorA(CbmCpu *Cpu, uint8_t Value) { CbmLda(Cpu, Cpu->A ^ Value); }
 
-static inline void CbmCmp(CbmCpu *Cpu, uint8_t Reg, uint8_t Value)
+static inline CBM_FLOAT_FN void CbmCmp(CbmCpu *Cpu, uint8_t Reg, uint8_t Value)
 {
    CbmFlag(Cpu, CBM_FLAG_C, Reg >= Value);
    CbmNZ(Cpu, (uint8_t)(Reg - Value));
 }
 
-static inline uint8_t CbmAsl(CbmCpu *Cpu, uint8_t Value)
+static inline CBM_FLOAT_FN uint8_t CbmAsl(CbmCpu *Cpu, uint8_t Value)
 {
    CbmFlag(Cpu, CBM_FLAG_C, Value & 0x80);
    return CbmNZ(Cpu, (uint8_t)(Value << 1));
 }
 
-static inline uint8_t CbmLsr(CbmCpu *Cpu, uint8_t Value)
+static inline CBM_FLOAT_FN uint8_t CbmLsr(CbmCpu *Cpu, uint8_t Value)
 {
    CbmFlag(Cpu, CBM_FLAG_C, Value & 1);
    return CbmNZ(Cpu, Value >> 1);
 }
 
-static inline uint8_t CbmRol(CbmCpu *Cpu, uint8_t Value)
+static inline CBM_FLOAT_FN uint8_t CbmRol(CbmCpu *Cpu, uint8_t Value)
 {
    bool In = CbmC(Cpu);
    CbmFlag(Cpu, CBM_FLAG_C, Value & 0x80);
    return CbmNZ(Cpu, (uint8_t)(Value << 1 | In));
 }
 
-static inline uint8_t CbmRor(CbmCpu *Cpu, uint8_t Value)
+static inline CBM_FLOAT_FN uint8_t CbmRor(CbmCpu *Cpu, uint8_t Value)
 {
    bool In = CbmC(Cpu);
    CbmFlag(Cpu, CBM_FLAG_C, Value & 1);
    return CbmNZ(Cpu, (uint8_t)(Value >> 1 | In << 7));
 }
 
-static inline uint8_t CbmInc(CbmCpu *Cpu, uint8_t Value) { return CbmNZ(Cpu, Value + 1); }
-static inline uint8_t CbmDec(CbmCpu *Cpu, uint8_t Value) { return CbmNZ(Cpu, Value - 1); }
+static inline CBM_FLOAT_FN uint8_t CbmInc(CbmCpu *Cpu, uint8_t Value) { return CbmNZ(Cpu, Value + 1); }
+static inline CBM_FLOAT_FN uint8_t CbmDec(CbmCpu *Cpu, uint8_t Value) { return CbmNZ(Cpu, Value - 1); }
 
-static inline void CbmBit(CbmCpu *Cpu, uint8_t Value)
+static inline CBM_FLOAT_FN void CbmBit(CbmCpu *Cpu, uint8_t Value)
 {
    CbmFlag(Cpu, CBM_FLAG_N, Value & 0x80);
    CbmFlag(Cpu, CBM_FLAG_V, Value & 0x40);
@@ -155,7 +165,7 @@ static inline void CbmBit(CbmCpu *Cpu, uint8_t Value)
 // ---- the ROM's shared pieces ----
 
 // $B8F7 (from $B8F9: $B8FB is STA $66 alone): FAC = 0
-static inline CbmFloatResult CbmZeroFac(CbmCpu *Cpu)
+static inline CBM_FLOAT_FN CbmFloatResult CbmZeroFac(CbmCpu *Cpu)
 {
    CbmLda(Cpu, 0);
    Cpu->Zp[0x61] = 0;
@@ -164,7 +174,7 @@ static inline CbmFloatResult CbmZeroFac(CbmCpu *Cpu)
 }
 
 // $B936: a carry out of the mantissa shifts it right into a bumped exponent
-static inline CbmFloatResult CbmCarryIntoFac(CbmCpu *Cpu)
+static inline CBM_FLOAT_FN CbmFloatResult CbmCarryIntoFac(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
    if (!CbmC(Cpu)) return CbmFloat_Done;
@@ -179,7 +189,7 @@ static inline CbmFloatResult CbmCarryIntoFac(CbmCpu *Cpu)
 }
 
 // $B8D7 NORMLZ: whole bytes, then bits; FAC = 0 if it underflows
-static CbmFloatResult CbmNormalize(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmNormalize(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
    CbmLdy(Cpu, 0);
@@ -215,25 +225,25 @@ static CbmFloatResult CbmNormalize(CbmCpu *Cpu)
 }
 
 // $B947: negate FAC, sign and mantissa; from $B94D, the mantissa only
-static void CbmNegate(CbmCpu *Cpu, bool Sign)
+static CBM_FLOAT_FN void CbmNegate(CbmCpu *Cpu, bool Sign)
 {
    uint8_t *Zp = Cpu->Zp;
-   static const uint8_t Bytes[] = { 0x66, 0x62, 0x63, 0x64, 0x65, 0x70 };
+   static const uint8_t CBM_FLOAT_DATA Bytes[] = { 0x66, 0x62, 0x63, 0x64, 0x65, 0x70 };
    for (unsigned i = Sign ? 0 : 1; i < sizeof Bytes; i++) {
       CbmLda(Cpu, Zp[Bytes[i]]);
       CbmEorA(Cpu, 0xff);
       Zp[Bytes[i]] = Cpu->A;
    }
-   static const uint8_t Carry[] = { 0x70, 0x65, 0x64, 0x63, 0x62 };
+   static const uint8_t CBM_FLOAT_DATA Carry[] = { 0x70, 0x65, 0x64, 0x63, 0x62 };
    for (unsigned i = 0; i < sizeof Carry; i++)
       if ((Zp[Carry[i]] = CbmInc(Cpu, Zp[Carry[i]])) != 0) return;
 }
 
-static void CbmNegateFac(CbmCpu *Cpu) { CbmNegate(Cpu, true); }
+static CBM_FLOAT_FN void CbmNegateFac(CbmCpu *Cpu) { CbmNegate(Cpu, true); }
 
 // $B9A6, the bit loop of MULSHF: shift the mantissa at X (and A, its rounding byte) right once
 // per INY until Y reaches 0. Entered at $B9B0 after the caller's own LSR of the top byte.
-static void CbmShiftBits(CbmCpu *Cpu, uint8_t X, bool AtB9B0)
+static CBM_FLOAT_FN void CbmShiftBits(CbmCpu *Cpu, uint8_t X, bool AtB9B0)
 {
    uint8_t *Zp = Cpu->Zp;
    do {
@@ -255,7 +265,7 @@ static void CbmShiftBits(CbmCpu *Cpu, uint8_t X, bool AtB9B0)
 
 // $B999: MULSHF from its ADC, with A a negative shift count: whole bytes (filling with $68),
 // then bits
-static void CbmShift(CbmCpu *Cpu, uint8_t X)
+static CBM_FLOAT_FN void CbmShift(CbmCpu *Cpu, uint8_t X)
 {
    uint8_t *Zp = Cpu->Zp;
    for (;;) {
@@ -278,7 +288,7 @@ static void CbmShift(CbmCpu *Cpu, uint8_t X)
 // drops MULDIV's caller and returns from it).
 typedef enum { CbmMulDiv_Go, CbmMulDiv_Zero, CbmMulDiv_Overflow } CbmMulDivResult;
 
-static CbmMulDivResult CbmMulDiv(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmMulDivResult CbmMulDiv(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
    CbmLda(Cpu, Zp[0x69]);
@@ -303,7 +313,7 @@ static CbmMulDivResult CbmMulDiv(CbmCpu *Cpu)
 }
 
 // $BB8F: product or quotient from $26-$29 into FAC, then normalize
-static CbmFloatResult CbmResultToFac(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmResultToFac(CbmCpu *Cpu)
 {
    for (int i = 0; i < 4; i++) {
       CbmLda(Cpu, Cpu->Zp[0x26 + i]);
@@ -314,9 +324,9 @@ static CbmFloatResult CbmResultToFac(CbmCpu *Cpu)
 
 // ---- the routines ----
 
-static CbmFloatResult CbmFAddFromB877(CbmCpu *Cpu);
+static CBM_FLOAT_FN CbmFloatResult CbmFAddFromB877(CbmCpu *Cpu);
 
-static CbmFloatResult CbmFAddBody(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmFAddBody(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
    if (Zp[0x61] == 0) {  // $BBFC MOVFA: FAC = ARG
@@ -339,7 +349,7 @@ static CbmFloatResult CbmFAddBody(CbmCpu *Cpu)
 
 // $B877, FADDT from its TAY, with A as ARG's exponent and X = $69. MUL10 enters here too, with
 // A two more than FAC's own exponent: ARG + 4 * FAC.
-static CbmFloatResult CbmFAddFromB877(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmFAddFromB877(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
    CbmLdy(Cpu, Cpu->A);
@@ -402,13 +412,13 @@ static CbmFloatResult CbmFAddFromB877(CbmCpu *Cpu)
    return CbmNormalize(Cpu);
 }
 
-static CbmFloatResult CbmFAddT(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmFAddT(CbmCpu *Cpu)
 {
    Cpu->Set = 0;
    return CbmFAddBody(Cpu);
 }
 
-static CbmFloatResult CbmFSubBody(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmFSubBody(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
    CbmLda(Cpu, Zp[0x66]);
@@ -420,18 +430,18 @@ static CbmFloatResult CbmFSubBody(CbmCpu *Cpu)
    return CbmFAddBody(Cpu);
 }
 
-static CbmFloatResult CbmFSubT(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmFSubT(CbmCpu *Cpu)
 {
    Cpu->Set = 0;
    return CbmFSubBody(Cpu);
 }
 
-static inline uint32_t CbmGet32(const uint8_t *Zp, uint8_t At)
+static inline CBM_FLOAT_FN uint32_t CbmGet32(const uint8_t *Zp, uint8_t At)
 {
    return (uint32_t)Zp[At] << 24 | (uint32_t)Zp[At + 1] << 16 | (uint32_t)Zp[At + 2] << 8 | Zp[At + 3];
 }
 
-static CbmFloatResult CbmFMultBody(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmFMultBody(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
    if (Zp[0x61] == 0) return CbmFloat_Done;  // FAC = 0: the ROM returns at once
@@ -474,27 +484,27 @@ static CbmFloatResult CbmFMultBody(CbmCpu *Cpu)
    return CbmResultToFac(Cpu);
 }
 
-static CbmFloatResult CbmFMultT(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmFMultT(CbmCpu *Cpu)
 {
    Cpu->Set = 0;
    return CbmFMultBody(Cpu);
 }
 
 // $BC1B: round FAC's mantissa by its rounding byte
-static CbmFloatResult CbmRoundFac(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmRoundFac(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
    CbmLda(Cpu, Zp[0x61]);
    if (CbmZ(Cpu)) return CbmFloat_Done;
    Zp[0x70] = CbmAsl(Cpu, Zp[0x70]);
    if (!CbmC(Cpu)) return CbmFloat_Done;
-   static const uint8_t Carry[] = { 0x65, 0x64, 0x63, 0x62 };
+   static const uint8_t CBM_FLOAT_DATA Carry[] = { 0x65, 0x64, 0x63, 0x62 };
    for (unsigned i = 0; i < sizeof Carry; i++)
       if ((Zp[Carry[i]] = CbmInc(Cpu, Zp[Carry[i]])) != 0) return CbmFloat_Done;
    return CbmCarryIntoFac(Cpu);  // $B938, carry still set from the ASL
 }
 
-static CbmFloatResult CbmFDivBody(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmFDivBody(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
    if (Zp[0x61] == 0) return CbmFloat_Native;  // $BB8A ?DIVISION BY ZERO ERROR
@@ -519,7 +529,7 @@ static CbmFloatResult CbmFDivBody(CbmCpu *Cpu)
    enum { Compare, Push, Shift } Step = Compare;
    for (;;) {
       if (Step == Compare) {  // $BB29
-         static const uint8_t Pairs[][2] = { { 0x6a, 0x62 }, { 0x6b, 0x63 }, { 0x6c, 0x64 }, { 0x6d, 0x65 } };
+         static const uint8_t CBM_FLOAT_DATA Pairs[][2] = { { 0x6a, 0x62 }, { 0x6b, 0x63 }, { 0x6c, 0x64 }, { 0x6d, 0x65 } };
          for (unsigned i = 0; i < 4; i++) {
             CbmLdy(Cpu, Zp[Pairs[i][0]]);
             CbmCmp(Cpu, Cpu->Y, Zp[Pairs[i][1]]);
@@ -569,7 +579,7 @@ static CbmFloatResult CbmFDivBody(CbmCpu *Cpu)
    }
 }
 
-static CbmFloatResult CbmFDivT(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmFDivT(CbmCpu *Cpu)
 {
    Cpu->Set = 0;
    return CbmFDivBody(Cpu);
@@ -578,7 +588,7 @@ static CbmFloatResult CbmFDivT(CbmCpu *Cpu)
 // ---- FIN and what it calls ----
 
 // $BC0C MOVAF: ARG = FAC, rounded
-static CbmFloatResult CbmMovAF(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmMovAF(CbmCpu *Cpu)
 {
    if (CbmRoundFac(Cpu) != CbmFloat_Done) return CbmFloat_Native;
    for (uint8_t X = 6; X; X--) {
@@ -591,7 +601,7 @@ static CbmFloatResult CbmMovAF(CbmCpu *Cpu)
 }
 
 // $BC3C: FAC = A, as an unsigned byte
-static void CbmFloatByte(CbmCpu *Cpu)
+static CBM_FLOAT_FN void CbmFloatByte(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
    Zp[0x62] = Cpu->A;
@@ -612,7 +622,7 @@ static void CbmFloatByte(CbmCpu *Cpu)
 }
 
 // $BAE2 MUL10: FAC *= 10, as ARG = FAC, then ARG + 4 * FAC, then twice that
-static CbmFloatResult CbmMul10(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmMul10(CbmCpu *Cpu)
 {
    if (CbmMovAF(Cpu) != CbmFloat_Done) return CbmFloat_Native;
    CbmLdx(Cpu, Cpu->A);
@@ -628,9 +638,9 @@ static CbmFloatResult CbmMul10(CbmCpu *Cpu)
 }
 
 // $BAFE DIV10: FAC /= 10, as ARG = FAC, FAC = 10 (MOVFM from $BAF9), then FDIVT
-static CbmFloatResult CbmDiv10(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmDiv10(CbmCpu *Cpu)
 {
-   static const uint8_t Ten[5] = { 0x84, 0x20, 0x00, 0x00, 0x00 };  // the ROM's at $BAF9
+   static const uint8_t CBM_FLOAT_DATA Ten[5] = { 0x84, 0x20, 0x00, 0x00, 0x00 };  // the ROM's at $BAF9
    uint8_t *Zp = Cpu->Zp;
    if (CbmMovAF(Cpu) != CbmFloat_Done) return CbmFloat_Native;
    CbmLda(Cpu, 0xf9);
@@ -639,7 +649,7 @@ static CbmFloatResult CbmDiv10(CbmCpu *Cpu)
    Zp[0x6f] = 0;
    Zp[0x22] = Cpu->A;
    Zp[0x23] = Cpu->Y;
-   static const uint8_t To[5] = { 0x61, 0x66, 0x63, 0x64, 0x65 };
+   static const uint8_t CBM_FLOAT_DATA To[5] = { 0x61, 0x66, 0x63, 0x64, 0x65 };
    for (int Y = 4; Y >= 0; Y--) {
       CbmLdy(Cpu, Y);
       CbmLda(Cpu, Ten[Y]);
@@ -654,15 +664,15 @@ static CbmFloatResult CbmDiv10(CbmCpu *Cpu)
 }
 
 // The ROM's CHRGET, as the KERNAL copies it to $73 from $E3A2; $7A/$7B is TXTPTR
-static const uint8_t CbmChrgetCode[24] = {
+static const uint8_t CBM_FLOAT_DATA CbmChrgetCode[24] = {
    0xe6, 0x7a, 0xd0, 0x02, 0xe6, 0x7b, 0xad, 0x00, 0x00, 0xc9, 0x3a, 0xb0,
    0x0a, 0xc9, 0x20, 0xf0, 0xef, 0x38, 0xe9, 0x30, 0x38, 0xe9, 0xd0, 0x60,
 };
 
-static inline uint16_t CbmTxtPtr(const CbmCpu *Cpu) { return Cpu->Zp[0x7a] | Cpu->Zp[0x7b] << 8; }
+static inline CBM_FLOAT_FN uint16_t CbmTxtPtr(const CbmCpu *Cpu) { return Cpu->Zp[0x7a] | Cpu->Zp[0x7b] << 8; }
 
 // The text byte at TXTPTR, or false past the end of what Text holds
-static bool CbmTextAt(const CbmCpu *Cpu, CbmText *Text, uint16_t Start, uint8_t *Value)
+static CBM_FLOAT_FN bool CbmTextAt(const CbmCpu *Cpu, CbmText *Text, uint16_t Start, uint8_t *Value)
 {
    unsigned At = (uint16_t)(CbmTxtPtr(Cpu) - Start);
    if (At >= Text->Len) return false;
@@ -672,7 +682,7 @@ static bool CbmTextAt(const CbmCpu *Cpu, CbmText *Text, uint16_t Start, uint8_t 
 }
 
 // $0079 CHRGOT: A = the byte at TXTPTR, skipping spaces; C clear for a digit, Z for 0 or ':'
-static bool CbmChrgot(CbmCpu *Cpu, CbmText *Text, uint16_t Start)
+static CBM_FLOAT_FN bool CbmChrgot(CbmCpu *Cpu, CbmText *Text, uint16_t Start)
 {
    uint8_t Byte;
    for (;;) {
@@ -693,7 +703,7 @@ static bool CbmChrgot(CbmCpu *Cpu, CbmText *Text, uint16_t Start)
 }
 
 // $0073 CHRGET: advance TXTPTR, then CHRGOT
-static bool CbmChrget(CbmCpu *Cpu, CbmText *Text, uint16_t Start)
+static CBM_FLOAT_FN bool CbmChrget(CbmCpu *Cpu, CbmText *Text, uint16_t Start)
 {
    Cpu->Zp[0x7a] = CbmInc(Cpu, Cpu->Zp[0x7a]);
    if (CbmZ(Cpu)) Cpu->Zp[0x7b] = CbmInc(Cpu, Cpu->Zp[0x7b]);
@@ -703,7 +713,7 @@ static bool CbmChrget(CbmCpu *Cpu, CbmText *Text, uint16_t Start)
 // $BCF3 FIN: digits, an optional point, an optional E and signed exponent. Each digit is
 // FAC = FAC * 10 + digit; the exponent, less the digits after the point, is then applied one
 // MUL10 or DIV10 at a time.
-static CbmFloatResult CbmFin(CbmCpu *Cpu, CbmText *Text)
+static CBM_FLOAT_FN CbmFloatResult CbmFin(CbmCpu *Cpu, CbmText *Text)
 {
    uint8_t *Zp = Cpu->Zp;
    Cpu->Set = 0;
@@ -842,20 +852,20 @@ ExponentDigit:  // $BD91
 
 // Byte I of the five at Ptr: from the zero page as it now is, or from Mem, the five bytes the
 // cartridge read at Ptr. CONUPK can be pointed into the zero page it writes.
-static inline uint8_t CbmOperand(const CbmCpu *Cpu, uint16_t Ptr, const uint8_t Mem[5], int I)
+static inline CBM_FLOAT_FN uint8_t CbmOperand(const CbmCpu *Cpu, uint16_t Ptr, const uint8_t Mem[5], int I)
 {
    uint16_t At = Ptr + I;
    return At < 0x100 ? Cpu->Zp[At] : Mem[I];
 }
 
 // $BA8C CONUPK: ARG = the float at A/Y
-static void CbmConupk(CbmCpu *Cpu, const uint8_t Mem[5])
+static CBM_FLOAT_FN void CbmConupk(CbmCpu *Cpu, const uint8_t Mem[5])
 {
    uint8_t *Zp = Cpu->Zp;
    Zp[0x22] = Cpu->A;
    Zp[0x23] = Cpu->Y;
    const uint16_t Ptr = Zp[0x22] | Zp[0x23] << 8;
-   static const uint8_t To[5] = { 0x69, 0x6e, 0x6b, 0x6c, 0x6d };
+   static const uint8_t CBM_FLOAT_DATA To[5] = { 0x69, 0x6e, 0x6b, 0x6c, 0x6d };
    for (int Y = 4; Y >= 0; Y--) {
       CbmLdy(Cpu, Y);
       CbmLda(Cpu, CbmOperand(Cpu, Ptr, Mem, Y));
@@ -873,28 +883,28 @@ static void CbmConupk(CbmCpu *Cpu, const uint8_t Mem[5])
 
 // FADD $B867, FSUB $B850, FMULT $BA28, FDIV $BB0F: CONUPK, then the routine. Mem is the five
 // bytes at A/Y, as the CPU sees them.
-static CbmFloatResult CbmFAdd(CbmCpu *Cpu, const uint8_t Mem[5])
+static CBM_FLOAT_FN CbmFloatResult CbmFAdd(CbmCpu *Cpu, const uint8_t Mem[5])
 {
    Cpu->Set = 0;
    CbmConupk(Cpu, Mem);
    return CbmFAddBody(Cpu);
 }
 
-static CbmFloatResult CbmFSub(CbmCpu *Cpu, const uint8_t Mem[5])
+static CBM_FLOAT_FN CbmFloatResult CbmFSub(CbmCpu *Cpu, const uint8_t Mem[5])
 {
    Cpu->Set = 0;
    CbmConupk(Cpu, Mem);
    return CbmFSubBody(Cpu);
 }
 
-static CbmFloatResult CbmFMult(CbmCpu *Cpu, const uint8_t Mem[5])
+static CBM_FLOAT_FN CbmFloatResult CbmFMult(CbmCpu *Cpu, const uint8_t Mem[5])
 {
    Cpu->Set = 0;
    CbmConupk(Cpu, Mem);
    return CbmFMultBody(Cpu);
 }
 
-static CbmFloatResult CbmFDiv(CbmCpu *Cpu, const uint8_t Mem[5])
+static CBM_FLOAT_FN CbmFloatResult CbmFDiv(CbmCpu *Cpu, const uint8_t Mem[5])
 {
    Cpu->Set = 0;
    CbmConupk(Cpu, Mem);
@@ -902,7 +912,7 @@ static CbmFloatResult CbmFDiv(CbmCpu *Cpu, const uint8_t Mem[5])
 }
 
 // $BC31: A = $FF if the carry ROL A shifts out is set, else 1
-static void CbmSignOfCarry(CbmCpu *Cpu)
+static CBM_FLOAT_FN void CbmSignOfCarry(CbmCpu *Cpu)
 {
    Cpu->A = CbmRol(Cpu, Cpu->A);
    CbmLda(Cpu, 0xff);
@@ -911,7 +921,7 @@ static void CbmSignOfCarry(CbmCpu *Cpu)
 
 // $BC5B FCOMP: compare FAC with the float at A/Y. A = 0 if equal, 1 if FAC is larger, $FF if
 // smaller.
-static void CbmFComp(CbmCpu *Cpu, const uint8_t Mem[5])
+static CBM_FLOAT_FN void CbmFComp(CbmCpu *Cpu, const uint8_t Mem[5])
 {
    uint8_t *Zp = Cpu->Zp;
    Zp[0x24] = Cpu->A;
@@ -965,7 +975,7 @@ Differ:  // $BC92
 // ---- FAC to integer ----
 
 // $BC9B QINT: FAC's integer part, as a signed 32-bit number in $62-$65
-static void CbmQintBody(CbmCpu *Cpu)
+static CBM_FLOAT_FN void CbmQintBody(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
    CbmLda(Cpu, Zp[0x61]);
@@ -999,7 +1009,7 @@ static void CbmQintBody(CbmCpu *Cpu)
    Zp[0x68] = Cpu->Y;
 }
 
-static CbmFloatResult CbmQint(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmQint(CbmCpu *Cpu)
 {
    Cpu->Set = 0;
    CbmQintBody(Cpu);
@@ -1008,9 +1018,9 @@ static CbmFloatResult CbmQint(CbmCpu *Cpu)
 
 // $B1BF AYINT: QINT for -32768 to 32767, in $64-$65. FAC from $90 up must be exactly -32768,
 // which FCOMP checks against the ROM's constant at $B1A5.
-static CbmFloatResult CbmAyint(CbmCpu *Cpu)
+static CBM_FLOAT_FN CbmFloatResult CbmAyint(CbmCpu *Cpu)
 {
-   static const uint8_t Minus32768[5] = { 0x90, 0x80, 0x00, 0x00, 0x00 };
+   static const uint8_t CBM_FLOAT_DATA Minus32768[5] = { 0x90, 0x80, 0x00, 0x00, 0x00 };
    Cpu->Set = 0;
    CbmLda(Cpu, Cpu->Zp[0x61]);
    CbmCmp(Cpu, Cpu->A, 0x90);
