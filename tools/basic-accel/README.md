@@ -1,13 +1,19 @@
 # BASIC float acceleration
 
 An experiment in answering BASIC V2's slow float routines from the cartridge, transparently to
-the C64 program. So far it covers the four arithmetic routines (add, subtract, multiply and
-divide) and FIN, which parses a number from text. Nothing here is in the firmware yet. This is
-the C ports, the evidence that they are bit-exact, and a model of what they would gain.
+the C64 program. So far it covers:
+
+- the four arithmetic routines (add, subtract, multiply and divide), from zero page or with an
+  operand in memory;
+- FIN, which parses a number from text;
+- QINT and AYINT, which convert FAC to an integer.
+
+Nothing here is in the firmware yet. This is the C ports, the evidence that they are
+bit-exact, and a model of what they would gain.
 
 | File | What it is |
 |---|---|
-| `Source/Teensy/BasicAccel/CbmFloat.h` | FADDT, FSUBT, FMULTT, FDIVT and FIN in C, bit-exact with the ROM |
+| `Source/Teensy/BasicAccel/CbmFloat.h` | the routines in C, bit-exact with the ROM |
 | `Source/Teensy/tests/cbm-float.test.js` | checks them against the ROM (`npm test`) |
 | `Source/Teensy/tests/cbm-float-vectors.txt` | the ROM's results, so CI checks them without the ROM |
 | `tools/basic-accel/float-cases.mjs` | the test cases, and the ROM routines run in `tools/lib/mos6502.mjs` |
@@ -24,19 +30,45 @@ the C ports, the evidence that they are bit-exact, and a model of what they woul
 | FSUBT | `$B853` | ARG − FAC | `-`; FSUB (`$B850`) after CONUPK; SIN and others |
 | FMULTT | `$BA2B` | ARG × FAC | `*`; FMULT (`$BA28`) after CONUPK |
 | FDIVT | `$BB12` | ARG ÷ FAC | `/`; FDIV (`$BB0F`) after CONUPK; DIV10 |
+| FADD, FSUB, FMULT, FDIV | `$B867`, `$B850`, `$BA28`, `$BB0F` | as above, with ARG first unpacked from A/Y by CONUPK | POLY, SIN, LOG, EXP and the rest of the ROM's math |
 | FIN | `$BCF3` | the number at TXTPTR | a number in program text (`$AE8F`, `$AEAD`); INPUT and READ (`$AC89`); VAL (`$B7DA`) |
+| QINT | `$BC9B` | FAC's integer part, 32-bit in `$62-$65` | INT, GETADR (POKE/PEEK addresses), AYINT |
+| AYINT | `$B1BF` | the same, for -32768 to 32767 | AND, OR, NOT, integer variables and array indexes |
 
-At each arithmetic entry, every input is in zero page (`$61-$70`), and every caller leaves N/Z
-set from `$61`. Every caller of these entries in the BASIC and KERNAL ROMs was checked for that.
-A cartridge can read memory with DMA. It cannot see A, X, Y or the flags. So each port reports
-which registers and flags it determined (`Set`). The test checks that the ROM leaves every
-other one as the caller had it.
+At each T entry (FADDT and the rest), every input is in zero page (`$61-$70`), and every caller
+leaves N/Z set from `$61`. Every caller of these entries in the BASIC and KERNAL ROMs was
+checked for that. A cartridge can read memory with DMA. It cannot see A, X, Y or the flags. So
+each port reports which registers and flags it determined (`Set`). The test checks that the ROM
+leaves every other one as the caller had it.
 
 The ports hand back to the ROM (`CbmFloat_Native`) only when the ROM would raise an error:
-`?OVERFLOW ERROR` or `?DIVISION BY ZERO ERROR`.
+`?OVERFLOW ERROR`, `?DIVISION BY ZERO ERROR` or (AYINT) `?ILLEGAL QUANTITY ERROR`.
 
 The arithmetic writes `$26-$2A`, `$56` and `$61-$70`. `$2A` is FDIVT's: its last quotient
 store, `STA $29,X` with X = 1, lands one byte past the product.
+
+### The operand entries: CONUPK folded in
+
+FADD, FSUB, FMULT and FDIV take their operand's address in A/Y, which a cartridge cannot see.
+It serves `STA $DE00 / STY $DE01` first (8 cycles) to learn them, then reads the operand's five
+bytes, as the CPU sees them (a ROM constant reads as the ROM). Hooking these entries saves
+CONUPK's 60 or so cycles. It also catches the calls POLY, SIN and the like make, which
+otherwise reach the T entries only after CONUPK has run natively.
+
+The operand can be in zero page: in BASIC's temporaries, or in FAC or ARG themselves. CONUPK
+then reads some bytes it has just written. So the port reads operand bytes below `$100` from
+the zero page as it stands at that moment, and the cartridge's five bytes only for the rest
+(`CbmOperand`). The tests point operands into FAC, into ARG, and across the end of zero page.
+These entries also write `$22-$23`, CONUPK's pointer.
+
+### QINT and AYINT
+
+QINT works in zero page only, with no register inputs. AYINT is QINT behind a range check.
+FAC from `$90` up must be exactly -32768, which AYINT checks by FCOMP against its constant at
+`$B1A5` (`90 80 00 00 00`), so FCOMP is ported too. The cartridge holds that constant itself.
+They write `$62-$65`, `$68` and `$70`; AYINT's FCOMP also writes `$24-$25`. QINT's byte shifts
+fill from `$68`: it stores `$FF` there first for a negative number, and the last shift count
+after.
 
 ### FIN
 
@@ -92,34 +124,39 @@ The cycle costs are a model (`COSTS` in the script), not a measurement:
 
 | Model | Per call | Made of |
 |---|---|---|
-| `tr-plus` | ~116–126 | JMP into IO1 (3), thread hand-off (75), /DMA read of `$61-$70` (16; for FIN, `$68`, CHRGET and the text it used) and write-back of the changed bytes, bus turn (4), served register loads and RTS |
-| `tr` | ~225–260 | no DMA: the CPU moves the bytes from served code, `LDA zp / STA $DExx` (7 per byte) and `LDA # / STA zp` (5 per byte) |
-| `tr-plus-isr` | ~42–52 | `tr-plus` with no hand-off to thread mode: the port runs inside the PHI2 interrupt while the C64 is held |
+| `tr-plus` | ~116–147 | JMP into IO1 (3), thread hand-off (75), /DMA read of what the routine reads (16 for a T entry; 21 and a served `STA/STY` of A/Y for an operand entry; for FIN, `$68`, CHRGET and the text it used) and write-back of the changed bytes, bus turn (4), served register loads and RTS |
+| `tr` | ~225–340 | no DMA: the CPU moves the bytes from served code, `LDA zp / STA $DExx` (7 per byte) and `LDA # / STA zp` (5 per byte) |
+| `tr-plus-isr` | ~42–71 | `tr-plus` with no hand-off to thread mode: the port runs inside the PHI2 interrupt while the C64 is held |
 
 The hand-off figure is the 70–80 cycles that [Constraints.md](../../docs/Architecture/Constraints.md)
 gives for a WriteC64Spans slice. `tr-plus-isr` breaks the rule against new work on the PHI2
 path, so it is a bound, not a design. Only a board can say what any of this costs.
 
+VICE is started held at reset (`-initbreak reset`) until the checkpoints are installed. Without
+that, the program is autostarted in warp mode while the script is still connecting, and its
+first calls run unhooked. The benchmark run reports any FMULT calls it missed.
+
 ## Results (VICE 3.7.1, x64sc, PAL)
 
-FMultBench, 4,500 calls. Each call includes the JSR and CONUPK, which still run natively.
+FMultBench, 4,500 calls, hooked at FMULT (`$BA28`), so CONUPK is part of what the cartridge
+answers.
 
 | Model | FMULT cycles/call | Speedup on FMULT | Speedup on the whole pass |
 |---|---|---|---|
 | native | 2026 | 1.0× | 1.0× (12.26 s) |
-| `tr-plus` | 222 | 9.1× | 3.1× |
-| `tr` | 365 | 5.5× | 2.6× |
-| `tr-plus-isr` | 142 | 14.3× | 3.4× |
+| `tr-plus` | 153 | 13.2× | 3.3× |
+| `tr` | 362 | 5.6× | 2.6× |
+| `tr-plus-isr` | 73 | 28.0× | 3.7× |
 
-SinePlot.bas, plotting 320 points, with all five routines hooked. The plot is the same bitmap
-in every run.
+SinePlot.bas, plotting 320 points, with every routine hooked. The plot is the same bitmap in
+every run.
 
 | Model | Plot time | Speedup |
 |---|---|---|
 | native | 38.5 s | 1.0× |
-| `tr-plus` | 13.8 s | 2.79× |
-| `tr` | 17.0 s | 2.26× |
-| `tr-plus-isr` | 12.0 s | 3.21× |
+| `tr-plus` | 11.9 s | 3.24× |
+| `tr` | 16.3 s | 2.36× |
+| `tr-plus-isr` | 9.7 s | 3.97× |
 
 The same plot on `tr-plus`, adding one routine at a time:
 
@@ -131,42 +168,41 @@ The same plot on `tr-plus`, adding one routine at a time:
 | + FADD | 20.4 s |
 | + FSUB | 20.4 s |
 | + FIN | 13.8 s |
+| + FADD, FSUB, FMULT, FDIV (CONUPK folded in) | 12.8 s |
+| + QINT, AYINT | 11.9 s |
 
 FADD is called most often but gains least. It is short natively, so a 116-cycle hand-off
 leaves little of the saving. With a cheaper hand-off it gains much more. FIN gains most: every
 constant in the program (`8192`, `320`, `50.93`) is parsed digit by digit, a MUL10 and an add
-per digit, each time its line runs. Hooked, FIN's ~12,300 calls take the ~18,000 adds and the
-DIV10 divides with them.
+per digit, each time its line runs. Hooked, FIN's calls take about 18,000 adds and the DIV10
+divides with them.
 
 ## What is left
 
 `--profile` samples the C64 at every KERNAL IRQ (50 a second on PAL). It records the routine
 that was running and the routines that called it, from the JSR return addresses on the stack.
-The sine plot on `tr-plus` with all five routines hooked, as a share of the remaining 13.8 s:
+The sine plot on `tr-plus` with every routine hooked, as a share of the remaining 11.9 s:
 
 | Self time | Routine | What it is |
 |---|---|---|
-| 22% | (cartridge) | the modeled hand-offs themselves |
-| 14% | FRMEVL | the expression evaluator |
-| 9% | CONUPK | unpack a float from memory into ARG |
-| 8% | MULSHF | QINT (`INT`, `AND`, POKE addresses) shifting by itself |
-| 8% | CHRGET | the interpreter reading program text, in RAM |
-| 6% | FADD region | FADDT's body and NORMLZ, entered below the hook by other routines |
+| 30% | (cartridge) | the modeled hand-offs themselves |
+| 17% | FRMEVL | the expression evaluator |
+| 10% | CHRGET | the interpreter reading program text, in RAM |
+| 8% | FADD region | NORMLZ and FADDT's body, entered below the hooks, by INT (`$BCE6`) among others |
 | 3% | ORDVAR | variable lookup |
+| 3% | PTRGET | variable lookup |
+| 3% | EVAL | the expression evaluator |
 
 The candidates, roughly in order:
 
-1. **A cheaper hand-off.** It is now the largest single item, and every further hook pays it.
-2. **Folding CONUPK into the hooks.** Hooking FMULT at `$BA28` instead of `$BA2B` (and FADD,
-   FSUB and FDIV at theirs) saves CONUPK's time, but needs the A/Y pointer. Served code can
-   store those registers to IO1 in 8 cycles.
-3. **QINT** (`$BC9B`) and **AYINT** (`$B1BF`). They work in zero page only, like the
-   arithmetic.
-4. **MOVAF, MOVFM, MOV2F.** They are short. They only pay off with a cheap hand-off, or merged
+1. **A cheaper hand-off.** At 30% it is the largest single item, and every further hook pays
+   it. On `tr-plus-isr` the same plot takes 9.7 s.
+2. **INT** (`$BCCC`). It calls the hooked QINT, then normalizes natively through `$B8D2`.
+3. **MOVFM, MOV2F, MOVAF.** They are short. They only pay off with a cheap hand-off, or merged
    into a neighboring hook.
 
-The interpreter itself (FRMEVL, CHRGET, EVAL, PTRGET/ORDVAR, about a third of what is left)
-does not break into routines a hook could take.
+The interpreter itself (FRMEVL, CHRGET, EVAL, PTRGET/ORDVAR, about 36% of what is left) does
+not break into routines a hook could take.
 
 ## Running it
 
@@ -188,6 +224,7 @@ node tools/basic-accel/vice-float.mjs --program sine --model tr-plus --profile
 
 This needs `x64sc` with the C64 ROMs and symbol file that VICE ships (looked for in
 `/usr/share/vice/C64`), a C compiler, and `petcat` for the sine plot. On a machine without a
-display it also needs `xvfb-run`. `--routines` limits which routines are hooked. Some Linux
+display it also needs `xvfb-run`. `--routines` limits which routines are hooked, by the names in `ROUTINES` in
+`float-cases.mjs` (`faddt`, `fadd`, `fin`, `qint` and so on). Some Linux
 packages of VICE leave the ROMs out; `C64_BASIC_ROM` points the test at a copy of
 `basic-901226-01.bin`.

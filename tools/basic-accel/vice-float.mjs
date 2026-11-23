@@ -3,7 +3,7 @@
 // routines answered by Source/Teensy/BasicAccel/CbmFloat.h the way a cartridge would.
 //
 //   node tools/basic-accel/vice-float.mjs [--program bench|sine] [--model native|tr-plus|tr|tr-plus-isr|all]
-//        [--routines fadd,fsub,fmult,fdiv,fin] [--ntsc]
+//        [--routines faddt,fsubt,...,qint,ayint] [--ntsc]
 //
 // VICE has no TeensyROM, so the cartridge is modeled through VICE's binary monitor. An exec
 // checkpoint stops the C64 at a routine's entry; this script reads the zero page and registers,
@@ -44,8 +44,10 @@ const NTSC_HZ = 1022727;
 //   could be far less.
 // tr-plus: the C64 held with /DMA while the TR reads what the routine reads and writes back the
 //   bytes the result changed (it holds both copies), one cycle each, plus 4 to take and release
-//   the bus. The arithmetic reads $61-$70 (16 bytes); FIN reads $68, CHRGET at $73-$8A to check
-//   it is the ROM's (25), and the text bytes it used.
+//   the bus. The T entries read $61-$70 (16 bytes). FADD, FSUB, FMULT and FDIV need A/Y, the
+//   operand's address: the cartridge serves STA $DE00 / STY $DE01 first (8 cycles), then reads
+//   those 16 and the operand's 5. FIN reads $68, CHRGET at $73-$8A to check it is the ROM's
+//   (25), and the text bytes it used. QINT and AYINT read $61-$66, $68 and $70 (8).
 // tr: no bus mastering, so the CPU moves the bytes itself: LDA zp / STA $DExx (7 cycles) per
 //   byte read, LDA #imm / STA zp (5) per byte written.
 // tr-plus-isr: tr-plus with no thread-mode hand-off, as if the computation ran inside the DMA
@@ -57,11 +59,17 @@ export const COSTS = {
   tr: { handshake: 75, perRead: 7, perWrite: 5, busTurn: 0 },
   'tr-plus-isr': { handshake: 0, perRead: 1, perWrite: 1, busTurn: 4 },
 };
-const readsFor = (routine, textUsed) => (routine === 'fin' ? 25 + textUsed : 16);
+const OPERAND_ENTRIES = new Set(['fadd', 'fsub', 'fmult', 'fdiv']);
+function readsFor(routine, textUsed) {
+  if (routine === 'fin') return 25 + textUsed;
+  if (routine === 'qint' || routine === 'ayint') return 8;
+  return OPERAND_ENTRIES.has(routine) ? 21 : 16;
+}
 
-function costFor(model, set, reads, writes) {
+function costFor(model, routine, set, reads, writes) {
   const c = COSTS[model];
   let served = 6;  // RTS
+  if (OPERAND_ENTRIES.has(routine)) served += 8;
   if (set & 0x100) served += 2;
   if (set & 0x200) served += 2;
   if (set & 0x400) served += 2;
@@ -350,6 +358,9 @@ async function runModel(model, program, { ntsc, routines, profiler }) {
   const port = 6510 + Math.floor(Math.random() * 1000);
   const vice = ['x64sc', '-default', '-warp', '-sounddev', 'dummy', ntsc ? '-ntsc' : '-pal',
     '-binarymonitor', '-binarymonitoraddress', `ip4://127.0.0.1:${port}`,
+    // Held at reset until the checkpoints are in: autostarting in warp, the program can
+    // otherwise be well into its run before this script has connected
+    '-initbreak', 'reset',
     '-autostartprgmode', '1', '-autostart', program.prg()];
   const [cmd, ...args] = process.env.DISPLAY || !commandExists('xvfb-run') ? vice : ['xvfb-run', '-a', ...vice];
   const child = spawn(cmd, args, { stdio: 'ignore' });
@@ -394,7 +405,13 @@ async function runModel(model, program, { ntsc, routines, profiler }) {
       const r = await mon.registers();
       const zp = await mon.read(0, 0xff);
       let out;
-      for (const window of routine === 'fin' ? [32, 256] : [0]) {
+      if (OPERAND_ENTRIES.has(routine)) {
+        const at = r[reg.A] | r[reg.Y] << 8;
+        const operand = Buffer.alloc(5);
+        for (let i = 0; i < 5; i++) operand[i] = (await mon.read((at + i) & 0xffff, (at + i) & 0xffff))[0];
+        out = await port_.run(routine, r[reg.A], r[reg.X], r[reg.Y], r[reg.FL], zp, operand);
+      }
+      else for (const window of routine === 'fin' ? [32, 256] : [0]) {
         const txtPtr = zp[0x7a] | zp[0x7b] << 8;
         const text = window ? await mon.read(txtPtr, Math.min(0xffff, txtPtr + window - 1)) : null;
         out = await port_.run(routine, r[reg.A], r[reg.X], r[reg.Y], r[reg.FL], zp, text);
@@ -408,7 +425,7 @@ async function runModel(model, program, { ntsc, routines, profiler }) {
       }
       const changed = [];
       for (let at = 0; at < 256; at++) if (out.zp[at] !== zp[at]) changed.push(at);
-      const cost = costFor(model, out.set, readsFor(routine, out.used), changed.length);
+      const cost = costFor(model, routine, out.set, readsFor(routine, out.used), changed.length);
       const nops = Math.max(0, Math.round((cost - 6) / 2));
       stats.hooked++;
       stats.calls[routine] = (stats.calls[routine] ?? 0) + 1;
@@ -444,7 +461,7 @@ const COUNT = 4500;  // FMultBench.asm's Count
 if (!program || models.some((m) => m !== 'native' && !COSTS[m]) || routines.some((r) => !ROUTINES[r]) ||
     (profile && !program.sampling)) {
   console.error('Usage: node tools/basic-accel/vice-float.mjs [--program bench|sine] [--model native|tr-plus|tr|tr-plus-isr|all]');
-  console.error('         [--routines fadd,fsub,fmult,fdiv,fin] [--profile (sine only)] [--ntsc]');
+  console.error('         [--routines faddt,fsubt,...,qint,ayint] [--profile (sine only)] [--ntsc]');
   process.exit(2);
 }
 if (!commandExists('x64sc')) {
@@ -471,6 +488,9 @@ for (const model of models) {
   else {
     const calls = Object.entries(r.stats.calls).map(([n, c]) => `${n} ${c}`).join(', ');
     line.push(`hooked ${calls} (model ${(r.stats.modeled / r.stats.hooked).toFixed(0)} cycles each), handed back ${r.stats.native}`);
+    if (programName === 'bench' && routines.includes('fmult') && r.stats.calls.fmult !== COUNT) {
+      line.push(`MISSED ${COUNT - (r.stats.calls.fmult ?? 0)} of the ${COUNT} FMULT calls`);
+    }
     if (native && programName === 'bench') {
       line.push(`${((native.full - native.empty) / (r.full - r.empty)).toFixed(1)}x on FMULT, ${(native.full / r.full).toFixed(1)}x on the pass`);
     }
