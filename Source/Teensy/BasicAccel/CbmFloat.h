@@ -7,12 +7,15 @@
 //   CbmFSubT  FSUBT $B853  FAC = ARG - FAC   `-`, and FSUB ($B850) after CONUPK
 //   CbmFMultT FMULTT $BA2B FAC = ARG * FAC   `*`, and FMULT ($BA28) after CONUPK
 //   CbmFDivT  FDIVT $BB12  FAC = ARG / FAC   `/`, and FDIV ($BB0F) after CONUPK
+//   CbmFin    FIN   $BCF3  FAC = the number in the text at TXTPTR ($7A/$7B)
 //
-// Each entry is where the ROM's routes into the routine meet. Every caller leaves N/Z set from
-// $61 (FIN's digit loop, $BD8E, does it with LDX $61, so A is not always $61); the C reads $61
-// instead. A cartridge sees only the zero page, not X, Y or the flags, so each call reports in
-// CbmCpu.Set the registers and flags it determined. The rest keep whatever the caller had,
-// exactly as the ROM leaves them.
+// Each entry is where the ROM's routes into the routine meet. Every caller of the arithmetic
+// leaves N/Z set from $61 (FIN's digit loop, $BD8E, does it with LDX $61, so A is not always
+// $61); the C reads $61 instead. Every caller of FIN arrives from CHRGET or CHRGOT, or ($AEAD)
+// with a CMP that leaves the carry as CHRGET would, so A and C follow from the byte at TXTPTR.
+// A cartridge sees only memory, not the registers or flags, so each call reports in CbmCpu.Set
+// the registers and flags it determined. The rest keep whatever the caller had, exactly as the
+// ROM leaves them.
 //
 // The code follows the ROM instruction by instruction, with the flags, except FMULTT's
 // shift-and-add loop, which is done as five multiplies. Stack-page bytes the ROM writes below
@@ -38,9 +41,12 @@
 #define CBM_SET_X  0x0200
 #define CBM_SET_Y  0x0400
 
-// The zero page these routines read: $61-$70. They write $26-$2A (FDIVT's last quotient store,
+// The zero page the arithmetic reads: $61-$70. It writes $26-$2A (FDIVT's last quotient store,
 // STA $29,X with X = 1, lands in $2A), $56 (FADDT's copy of FAC's rounding byte) and $61-$70.
-// After a Native result Cpu->Zp holds scratch, none of it the ROM's: nothing is written back.
+// FIN reads $68 and CHRGET ($73-$8A, TXTPTR included) and the text; it writes $22-$23 (DIV10's
+// MOVFM pointer), $26-$2A, $56, $5D-$70 and TXTPTR.
+// After a result other than Done Cpu->Zp holds scratch, none of it the ROM's: nothing is
+// written back.
 #define CBM_FLOAT_READ_FIRST  0x61
 #define CBM_FLOAT_READ_LAST   0x70
 
@@ -50,9 +56,18 @@ typedef struct {
    uint16_t Set;  // CBM_SET_* and CBM_FLAG_* this call determined
 } CbmCpu;
 
+// FIN's view of the text: Bytes[0] is at TXTPTR on entry. Used is how many it read.
+typedef struct {
+   const uint8_t *Bytes;
+   unsigned Len;
+   unsigned Used;
+} CbmText;
+
 typedef enum {
-   CbmFloat_Done,    // Cpu holds the ROM's result; the ROM routine would RTS to its caller
-   CbmFloat_Native,  // let the ROM run: it raises ?OVERFLOW or ?DIVISION BY ZERO itself
+   CbmFloat_Done,      // Cpu holds the ROM's result; the ROM routine would RTS to its caller
+   CbmFloat_Native,    // let the ROM run: it raises ?OVERFLOW or ?DIVISION BY ZERO itself, or
+                       // (FIN) CHRGET is not the ROM's own
+   CbmFloat_MoreText,  // FIN read past Text.Len: run it again with more of the text
 } CbmFloatResult;
 
 // ---- one 6502 instruction each, on the registers, flags and zero page ----
@@ -124,6 +139,14 @@ static inline uint8_t CbmRor(CbmCpu *Cpu, uint8_t Value)
 }
 
 static inline uint8_t CbmInc(CbmCpu *Cpu, uint8_t Value) { return CbmNZ(Cpu, Value + 1); }
+static inline uint8_t CbmDec(CbmCpu *Cpu, uint8_t Value) { return CbmNZ(Cpu, Value - 1); }
+
+static inline void CbmBit(CbmCpu *Cpu, uint8_t Value)
+{
+   CbmFlag(Cpu, CBM_FLAG_N, Value & 0x80);
+   CbmFlag(Cpu, CBM_FLAG_V, Value & 0x40);
+   CbmFlag(Cpu, CBM_FLAG_Z, (Cpu->A & Value) == 0);
+}
 
 // ---- the ROM's shared pieces ----
 
@@ -285,6 +308,8 @@ static CbmFloatResult CbmResultToFac(CbmCpu *Cpu)
 
 // ---- the routines ----
 
+static CbmFloatResult CbmFAddFromB877(CbmCpu *Cpu);
+
 static CbmFloatResult CbmFAddBody(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
@@ -303,6 +328,14 @@ static CbmFloatResult CbmFAddBody(CbmCpu *Cpu)
    Zp[0x56] = Cpu->X;
    CbmLdx(Cpu, 0x69);
    CbmLda(Cpu, Zp[0x69]);
+   return CbmFAddFromB877(Cpu);
+}
+
+// $B877, FADDT from its TAY, with A as ARG's exponent and X = $69. MUL10 enters here too, with
+// A two more than FAC's own exponent: ARG + 4 * FAC.
+static CbmFloatResult CbmFAddFromB877(CbmCpu *Cpu)
+{
+   uint8_t *Zp = Cpu->Zp;
    CbmLdy(Cpu, Cpu->A);
    if (CbmZ(Cpu)) return CbmFloat_Done;  // ARG = 0
    CbmFlag(Cpu, CBM_FLAG_C, true);
@@ -445,10 +478,9 @@ static CbmFloatResult CbmRoundFac(CbmCpu *Cpu)
    return CbmCarryIntoFac(Cpu);  // $B938, carry still set from the ASL
 }
 
-static CbmFloatResult CbmFDivT(CbmCpu *Cpu)
+static CbmFloatResult CbmFDivBody(CbmCpu *Cpu)
 {
    uint8_t *Zp = Cpu->Zp;
-   Cpu->Set = 0;
    if (Zp[0x61] == 0) return CbmFloat_Native;  // $BB8A ?DIVISION BY ZERO ERROR
    if (CbmRoundFac(Cpu) == CbmFloat_Native) return CbmFloat_Native;
    CbmLda(Cpu, 0);
@@ -519,6 +551,275 @@ static CbmFloatResult CbmFDivT(CbmCpu *Cpu)
       else if (CbmN(Cpu)) Step = Compare;
       else Step = Push;
    }
+}
+
+static CbmFloatResult CbmFDivT(CbmCpu *Cpu)
+{
+   Cpu->Set = 0;
+   return CbmFDivBody(Cpu);
+}
+
+// ---- FIN and what it calls ----
+
+// $BC0C MOVAF: ARG = FAC, rounded
+static CbmFloatResult CbmMovAF(CbmCpu *Cpu)
+{
+   if (CbmRoundFac(Cpu) != CbmFloat_Done) return CbmFloat_Native;
+   for (uint8_t X = 6; X; X--) {
+      CbmLda(Cpu, Cpu->Zp[0x60 + X]);
+      Cpu->Zp[0x68 + X] = Cpu->A;
+      CbmLdx(Cpu, X - 1);
+   }
+   Cpu->Zp[0x70] = 0;
+   return CbmFloat_Done;
+}
+
+// $BC3C: FAC = A, as an unsigned byte
+static void CbmFloatByte(CbmCpu *Cpu)
+{
+   uint8_t *Zp = Cpu->Zp;
+   Zp[0x62] = Cpu->A;
+   CbmLda(Cpu, 0);
+   Zp[0x63] = 0;
+   CbmLdx(Cpu, 0x88);
+   CbmLda(Cpu, Zp[0x62]);
+   CbmEorA(Cpu, 0xff);
+   Cpu->A = CbmRol(Cpu, Cpu->A);
+   CbmLda(Cpu, 0);
+   Zp[0x65] = 0;
+   Zp[0x64] = 0;
+   Zp[0x61] = Cpu->X;
+   Zp[0x70] = 0;
+   Zp[0x66] = 0;
+   if (!CbmC(Cpu)) CbmNegateFac(Cpu);  // $B8D2
+   CbmNormalize(Cpu);  // cannot overflow: the exponent only falls
+}
+
+// $BAE2 MUL10: FAC *= 10, as ARG = FAC, then ARG + 4 * FAC, then twice that
+static CbmFloatResult CbmMul10(CbmCpu *Cpu)
+{
+   if (CbmMovAF(Cpu) != CbmFloat_Done) return CbmFloat_Native;
+   CbmLdx(Cpu, Cpu->A);
+   if (CbmZ(Cpu)) return CbmFloat_Done;
+   CbmFlag(Cpu, CBM_FLAG_C, false);
+   CbmAdcA(Cpu, 2);
+   if (CbmC(Cpu)) return CbmFloat_Native;
+   CbmLdx(Cpu, 0);
+   Cpu->Zp[0x6f] = 0;
+   if (CbmFAddFromB877(Cpu) != CbmFloat_Done) return CbmFloat_Native;
+   Cpu->Zp[0x61] = CbmInc(Cpu, Cpu->Zp[0x61]);
+   return CbmZ(Cpu) ? CbmFloat_Native : CbmFloat_Done;
+}
+
+// $BAFE DIV10: FAC /= 10, as ARG = FAC, FAC = 10 (MOVFM from $BAF9), then FDIVT
+static CbmFloatResult CbmDiv10(CbmCpu *Cpu)
+{
+   static const uint8_t Ten[5] = { 0x84, 0x20, 0x00, 0x00, 0x00 };  // the ROM's at $BAF9
+   uint8_t *Zp = Cpu->Zp;
+   if (CbmMovAF(Cpu) != CbmFloat_Done) return CbmFloat_Native;
+   CbmLda(Cpu, 0xf9);
+   CbmLdy(Cpu, 0xba);
+   CbmLdx(Cpu, 0);
+   Zp[0x6f] = 0;
+   Zp[0x22] = Cpu->A;
+   Zp[0x23] = Cpu->Y;
+   static const uint8_t To[5] = { 0x61, 0x66, 0x63, 0x64, 0x65 };
+   for (int Y = 4; Y >= 0; Y--) {
+      CbmLdy(Cpu, Y);
+      CbmLda(Cpu, Ten[Y]);
+      Zp[To[Y]] = Cpu->A;
+      if (Y == 1) {
+         CbmLda(Cpu, Cpu->A | 0x80);
+         Zp[0x62] = Cpu->A;
+      }
+   }
+   Zp[0x70] = Cpu->Y;
+   return CbmFDivBody(Cpu);
+}
+
+// The ROM's CHRGET, as the KERNAL copies it to $73 from $E3A2; $7A/$7B is TXTPTR
+static const uint8_t CbmChrgetCode[24] = {
+   0xe6, 0x7a, 0xd0, 0x02, 0xe6, 0x7b, 0xad, 0x00, 0x00, 0xc9, 0x3a, 0xb0,
+   0x0a, 0xc9, 0x20, 0xf0, 0xef, 0x38, 0xe9, 0x30, 0x38, 0xe9, 0xd0, 0x60,
+};
+
+static inline uint16_t CbmTxtPtr(const CbmCpu *Cpu) { return Cpu->Zp[0x7a] | Cpu->Zp[0x7b] << 8; }
+
+// The text byte at TXTPTR, or false past the end of what Text holds
+static bool CbmTextAt(const CbmCpu *Cpu, CbmText *Text, uint16_t Start, uint8_t *Value)
+{
+   unsigned At = (uint16_t)(CbmTxtPtr(Cpu) - Start);
+   if (At >= Text->Len) return false;
+   if (At + 1 > Text->Used) Text->Used = At + 1;
+   *Value = Text->Bytes[At];
+   return true;
+}
+
+// $0079 CHRGOT: A = the byte at TXTPTR, skipping spaces; C clear for a digit, Z for 0 or ':'
+static bool CbmChrgot(CbmCpu *Cpu, CbmText *Text, uint16_t Start)
+{
+   uint8_t Byte;
+   for (;;) {
+      if (!CbmTextAt(Cpu, Text, Start, &Byte)) return false;
+      CbmLda(Cpu, Byte);
+      CbmCmp(Cpu, Cpu->A, 0x3a);
+      if (CbmC(Cpu)) return true;
+      CbmCmp(Cpu, Cpu->A, 0x20);
+      if (!CbmZ(Cpu)) break;
+      Cpu->Zp[0x7a] = CbmInc(Cpu, Cpu->Zp[0x7a]);  // $0073
+      if (CbmZ(Cpu)) Cpu->Zp[0x7b] = CbmInc(Cpu, Cpu->Zp[0x7b]);
+   }
+   CbmFlag(Cpu, CBM_FLAG_C, true);
+   CbmSbcA(Cpu, 0x30);
+   CbmFlag(Cpu, CBM_FLAG_C, true);
+   CbmSbcA(Cpu, 0xd0);
+   return true;
+}
+
+// $0073 CHRGET: advance TXTPTR, then CHRGOT
+static bool CbmChrget(CbmCpu *Cpu, CbmText *Text, uint16_t Start)
+{
+   Cpu->Zp[0x7a] = CbmInc(Cpu, Cpu->Zp[0x7a]);
+   if (CbmZ(Cpu)) Cpu->Zp[0x7b] = CbmInc(Cpu, Cpu->Zp[0x7b]);
+   return CbmChrgot(Cpu, Text, Start);
+}
+
+// $BCF3 FIN: digits, an optional point, an optional E and signed exponent. Each digit is
+// FAC = FAC * 10 + digit; the exponent, less the digits after the point, is then applied one
+// MUL10 or DIV10 at a time.
+static CbmFloatResult CbmFin(CbmCpu *Cpu, CbmText *Text)
+{
+   uint8_t *Zp = Cpu->Zp;
+   Cpu->Set = 0;
+   Text->Used = 0;
+   for (unsigned i = 0; i < sizeof CbmChrgetCode; i++)
+      if (i != 7 && i != 8 && Zp[0x73 + i] != CbmChrgetCode[i]) return CbmFloat_Native;
+   const uint16_t Start = CbmTxtPtr(Cpu);
+
+   // What the caller's CHRGET or CHRGOT left: A, and C clear for a digit
+   uint8_t Byte;
+   if (!CbmTextAt(Cpu, Text, Start, &Byte)) return CbmFloat_MoreText;
+   Cpu->A = Byte;
+   Cpu->P = Byte >= '0' && Byte <= '9' ? Cpu->P & ~CBM_FLAG_C : Cpu->P | CBM_FLAG_C;
+
+   CbmLdy(Cpu, 0);
+   for (int X = 10; X >= 0; X--) Zp[0x5d + X] = 0;
+   CbmLdx(Cpu, 0xff);
+   uint8_t Digit;
+   if (!CbmC(Cpu)) goto AddDigit;
+   CbmCmp(Cpu, Cpu->A, '-');
+   if (CbmZ(Cpu)) Zp[0x67] = Cpu->X;
+   else {
+      CbmCmp(Cpu, Cpu->A, '+');
+      if (!CbmZ(Cpu)) goto NotSign;
+   }
+Next:  // $BD0A
+   if (!CbmChrget(Cpu, Text, Start)) return CbmFloat_MoreText;
+   if (!CbmC(Cpu)) goto AddDigit;
+NotSign:  // $BD0F
+   CbmCmp(Cpu, Cpu->A, '.');
+   if (CbmZ(Cpu)) {  // $BD41: a second point ends the number
+      Zp[0x5f] = CbmRor(Cpu, Zp[0x5f]);
+      CbmBit(Cpu, Zp[0x5f]);
+      if (!(Cpu->P & CBM_FLAG_V)) goto Next;
+      goto Scale;
+   }
+   CbmCmp(Cpu, Cpu->A, 'E');
+   if (!CbmZ(Cpu)) goto Scale;
+   if (!CbmChrget(Cpu, Text, Start)) return CbmFloat_MoreText;
+   if (!CbmC(Cpu)) goto ExponentDigit;
+   CbmCmp(Cpu, Cpu->A, 0xab);  // the `-` token
+   if (CbmZ(Cpu)) goto ExponentMinus;
+   CbmCmp(Cpu, Cpu->A, '-');
+   if (CbmZ(Cpu)) goto ExponentMinus;
+   CbmCmp(Cpu, Cpu->A, 0xaa);  // the `+` token
+   if (CbmZ(Cpu)) goto ExponentNext;
+   CbmCmp(Cpu, Cpu->A, '+');
+   if (CbmZ(Cpu)) goto ExponentNext;
+   goto ExponentEnd;
+ExponentMinus:  // $BD2E
+   Zp[0x60] = CbmRor(Cpu, Zp[0x60]);
+ExponentNext:  // $BD30
+   if (!CbmChrget(Cpu, Text, Start)) return CbmFloat_MoreText;
+   if (!CbmC(Cpu)) goto ExponentDigit;
+ExponentEnd:  // $BD35
+   CbmBit(Cpu, Zp[0x60]);
+   if (!CbmN(Cpu)) goto Scale;
+   CbmLda(Cpu, 0);
+   CbmFlag(Cpu, CBM_FLAG_C, true);
+   CbmSbcA(Cpu, Zp[0x5e]);
+   goto ScaleBy;
+Scale:  // $BD47
+   CbmLda(Cpu, Zp[0x5e]);
+ScaleBy:  // $BD49
+   CbmFlag(Cpu, CBM_FLAG_C, true);
+   CbmSbcA(Cpu, Zp[0x5d]);
+   Zp[0x5e] = Cpu->A;
+   if (!CbmZ(Cpu)) {
+      if (CbmN(Cpu)) {
+         do {
+            if (CbmDiv10(Cpu) != CbmFloat_Done) return CbmFloat_Native;
+            Zp[0x5e] = CbmInc(Cpu, Zp[0x5e]);
+         } while (!CbmZ(Cpu));
+      }
+      else {
+         do {
+            if (CbmMul10(Cpu) != CbmFloat_Done) return CbmFloat_Native;
+            Zp[0x5e] = CbmDec(Cpu, Zp[0x5e]);
+         } while (!CbmZ(Cpu));
+      }
+   }
+   CbmLda(Cpu, Zp[0x67]);  // $BD62
+   if (!CbmN(Cpu)) return CbmFloat_Done;
+   CbmLda(Cpu, Zp[0x61]);  // $BFB4 NEGOP
+   if (CbmZ(Cpu)) return CbmFloat_Done;
+   CbmLda(Cpu, Zp[0x66]);
+   CbmEorA(Cpu, 0xff);
+   Zp[0x66] = Cpu->A;
+   return CbmFloat_Done;
+
+AddDigit:  // $BD6A
+   Digit = Cpu->A;  // PHA
+   CbmBit(Cpu, Zp[0x5f]);
+   if (CbmN(Cpu)) Zp[0x5d] = CbmInc(Cpu, Zp[0x5d]);
+   if (CbmMul10(Cpu) != CbmFloat_Done) return CbmFloat_Native;
+   CbmLda(Cpu, Digit);  // PLA
+   CbmFlag(Cpu, CBM_FLAG_C, true);
+   CbmSbcA(Cpu, 0x30);
+   Digit = Cpu->A;  // $BD7E: PHA
+   if (CbmMovAF(Cpu) != CbmFloat_Done) return CbmFloat_Native;
+   CbmLda(Cpu, Digit);  // PLA
+   CbmFloatByte(Cpu);
+   CbmLda(Cpu, Zp[0x6e]);
+   CbmEorA(Cpu, Zp[0x66]);
+   Zp[0x6f] = Cpu->A;
+   CbmLdx(Cpu, Zp[0x61]);
+   if (CbmFAddBody(Cpu) != CbmFloat_Done) return CbmFloat_Native;
+   goto Next;
+
+ExponentDigit:  // $BD91
+   CbmLda(Cpu, Zp[0x5e]);
+   CbmCmp(Cpu, Cpu->A, 10);
+   if (CbmC(Cpu)) {
+      CbmLda(Cpu, 0x64);
+      CbmBit(Cpu, Zp[0x60]);
+      if (!CbmN(Cpu)) return CbmFloat_Native;  // $B97E ?OVERFLOW ERROR
+   }
+   else {
+      Cpu->A = CbmAsl(Cpu, Cpu->A);
+      Cpu->A = CbmAsl(Cpu, Cpu->A);
+      CbmFlag(Cpu, CBM_FLAG_C, false);
+      CbmAdcA(Cpu, Zp[0x5e]);
+      Cpu->A = CbmAsl(Cpu, Cpu->A);
+      CbmFlag(Cpu, CBM_FLAG_C, false);
+      CbmLdy(Cpu, 0);
+      if (!CbmTextAt(Cpu, Text, Start, &Byte)) return CbmFloat_MoreText;
+      CbmAdcA(Cpu, Byte);
+      CbmFlag(Cpu, CBM_FLAG_C, true);
+      CbmSbcA(Cpu, 0x30);
+   }
+   Zp[0x5e] = Cpu->A;
+   goto ExponentNext;
 }
 
 #endif
