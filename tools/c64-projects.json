@@ -181,7 +181,7 @@
     },
     {
       "name": "FMultBench",
-      "description": "Times a long series of BASIC ROM float multiplies, for tools/basic-accel/vice-fmult.mjs. Not embedded in the firmware, so it has no header.",
+      "description": "Times a long series of BASIC ROM float multiplies, for tools/basic-accel/vice-float.mjs. Not embedded in the firmware, so it has no header.",
       "dir": "Source/C64/FMultBench",
       "steps": [
         { "assembler": "acme", "source": "source/FMultBench.asm", "output": "FMultBench.prg", "format": "cbm", "labels": "FMultBench.labels" }

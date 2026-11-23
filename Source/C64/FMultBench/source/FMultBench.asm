@@ -6,7 +6,7 @@
 ; between the two passes is FMULT's own time. CIA2's timers A and B, chained, count the cycles.
 ;
 ; The sum is the check: a run that replaces FMULT has to print the same sum as the ROM.
-; tools/basic-accel/vice-fmult.mjs runs it in VICE and reads Results.
+; tools/basic-accel/vice-float.mjs runs it in VICE and reads Results.
 
    !cpu 6510
 

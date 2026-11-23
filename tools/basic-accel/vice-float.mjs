@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
-// Runs Source/C64/FMultBench in VICE and reports how long its FMULTs take: natively, or with
-// FMULTT ($BA2B) answered by Source/Teensy/BasicAccel/CbmFMult.h the way a cartridge would.
+// Runs a C64 program in VICE and reports how long it takes: natively, or with BASIC's float
+// routines answered by Source/Teensy/BasicAccel/CbmFloat.h the way a cartridge would.
 //
-//   node tools/basic-accel/vice-fmult.mjs [--program bench|sine] [--model native|tr-plus|tr|tr-plus-isr|all] [--ntsc]
+//   node tools/basic-accel/vice-float.mjs [--program bench|sine] [--model native|tr-plus|tr|tr-plus-isr|all]
+//        [--routines fadd,fsub,fmult,fdiv] [--ntsc]
 //
 // VICE has no TeensyROM, so the cartridge is modeled through VICE's binary monitor. An exec
-// checkpoint stops the C64 at $BA2B; this script reads the zero page and registers, runs the
-// C port, writes back what it computed, and points the PC at a run of NOPs ending in RTS that
+// checkpoint stops the C64 at a routine's entry; this script reads the zero page and registers,
+// runs the C port, writes back what it computed, and points the PC at a run of NOPs ending in RTS that
 // takes as many C64 cycles as the modeled cartridge would hold the C64 for (costFor, below). The
 // C64's own clock, CIA2 in the benchmark, then measures the modeled run, and the benchmark's sum
 // shows whether the results matched the ROM's. While the monitor holds it the C64 does not run,
@@ -22,25 +23,27 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { commandExists } from '../lib/toolchain.mjs';
+import { ROUTINES } from './float-cases.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const BENCH = path.join(root, 'Source/C64/FMultBench/build');
-const HARNESS_SOURCE = path.join(root, 'Source/Teensy/tests/cbm_fmult_harness.c');
-const FMULTT = 0xba2b;
+const HARNESS_SOURCE = path.join(root, 'Source/Teensy/tests/cbm_float_harness.c');
+const VICE_ROMS = '/usr/share/vice/C64';
+const VICE_SYMBOLS = path.join(VICE_ROMS, 'c64mem.sym');
 const SLED = 0xc000;      // free RAM in the benchmark: NOPs from here, then RTS
 const SLED_NOPS = 0x200;
 const PAL_HZ = 985248;
 const NTSC_HZ = 1022727;
 
-// C64 cycles from the fetch at $BA2B to the caller's next instruction, by model. Both start the
-// same way: the cartridge answers that fetch with JMP $DE00 (3 cycles), and the CPU runs on
-// in IO1, where the cartridge serves what it executes.
+// C64 cycles from the fetch at the routine's entry to the caller's next instruction, by model.
+// All start the same way: the cartridge answers that fetch with JMP $DE00 (3 cycles), and the
+// CPU runs on in IO1, where the cartridge serves what it executes.
 //
 // handshake: the IO1/ISR hand-off to thread mode and back. 75 is the 70-80 cycles
 //   docs/Architecture/Constraints.md gives for a WriteC64Spans slice; an ISR-resident version
 //   could be far less.
-// tr-plus: the C64 held with /DMA while the TR reads $61-$70 (16 bytes) and writes back $26-$29,
-//   $61-$66 and $70 (11), one cycle each, plus 4 to take and release the bus.
+// tr-plus: the C64 held with /DMA while the TR reads $61-$70 (16 bytes) and writes back the bytes
+//   the result changed (it holds both copies), one cycle each, plus 4 to take and release the bus.
 // tr: no bus mastering, so the CPU moves the bytes itself: LDA zp / STA $DExx (7 cycles) per
 //   byte read, LDA #imm / STA zp (5) per byte written.
 // tr-plus-isr: tr-plus with no thread-mode hand-off, as if the computation ran inside the DMA
@@ -54,9 +57,8 @@ export const COSTS = {
 };
 const READS = 16;
 
-function costFor(model, set, wroteProduct) {
+function costFor(model, set, writes) {
   const c = COSTS[model];
-  const writes = wroteProduct ? 11 : 2;
   let served = 6;  // RTS
   if (set & 0x100) served += 2;
   if (set & 0x200) served += 2;
@@ -208,7 +210,7 @@ class Monitor {
 
 // ---- the C port, as a coprocess speaking the harness's line format ----
 function startPort() {
-  const exe = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cbm-fmult-')), 'cbm_fmult_harness');
+  const exe = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cbm-float-')), 'cbm_float_harness');
   const built = spawnSync('cc', ['-std=c99', '-O2', '-Wall', '-Wextra', '-Werror', '-o', exe, HARNESS_SOURCE], { encoding: 'utf8' });
   if (built.status !== 0) throw new Error(built.stderr);
   const child = spawn(exe, [], { stdio: ['pipe', 'pipe', 'inherit'] });
@@ -224,14 +226,14 @@ function startPort() {
     }
   });
   return {
-    run(a, x, y, p, zp) {
+    run(routine, a, x, y, p, zp) {
       const h = (v) => v.toString(16).padStart(2, '0');
       return new Promise((resolve) => {
         queue.push((line) => {
           const [result, set, A, X, Y, P, z] = line.split(' ');
           resolve({ result, set: parseInt(set, 16), a: parseInt(A, 16), x: parseInt(X, 16), y: parseInt(Y, 16), p: parseInt(P, 16), zp: Buffer.from(z, 'hex') });
         });
-        child.stdin.write(`${h(a)} ${h(x)} ${h(y)} ${h(p)} ${Buffer.from(zp).toString('hex')}\n`);
+        child.stdin.write(`${routine} ${h(a)} ${h(x)} ${h(y)} ${h(p)} ${Buffer.from(zp).toString('hex')}\n`);
       });
     },
     stop() { child.stdin.end(); },
@@ -284,10 +286,64 @@ const PROGRAMS = {
       for (const b of bitmap) check = (check * 31 + b) >>> 0;
       return { jiffies: r.readUInt16LE(2), check: check & 0xffff };
     },
+    sampling: async (mon) => (await mon.read(829, 829))[0] === 1,  // SinePlot.bas sets it as the plot starts
   },
 };
 
-async function runModel(model, program, { ntsc }) {
+// ---- a sampling profiler: the KERNAL's IRQ entry, 50 or 60 times a second ----
+const IRQ_ENTRY = 0xff48;
+
+function romSymbols() {
+  const text = fs.readFileSync(VICE_SYMBOLS, 'utf8');
+  return [...text.matchAll(/^al ([0-9a-f]{4}) \.(\w+)/gim)]
+    .map((m) => ({ at: parseInt(m[1], 16), name: m[2].replace(/^[bk]/, '') }))
+    .filter((s) => s.at >= 0xa000 && s.at < 0xc000 || s.at >= 0xe000)
+    .sort((a, b) => a.at - b.at);
+}
+
+function makeProfiler() {
+  const rom = { basic: fs.readFileSync(path.join(VICE_ROMS, 'basic-901226-01.bin')), kernal: fs.readFileSync(path.join(VICE_ROMS, 'kernal-901227-03.bin')) };
+  const romByte = (a) => (a >= 0xa000 && a < 0xc000 ? rom.basic[a - 0xa000] : a >= 0xe000 ? rom.kernal[a - 0xe000] : undefined);
+  const symbols = romSymbols();
+  const where = (pc) => {
+    if (pc >= SLED && pc <= SLED + SLED_NOPS) return '(cartridge)';
+    if (pc >= 0x73 && pc < 0x8b) return 'CHRGET (RAM)';
+    if (romByte(pc) === undefined) return '(RAM)';
+    let name = '(ROM)';
+    for (const s of symbols) { if (s.at > pc) break; name = s.name; }
+    return name;
+  };
+  const self = new Map();
+  const total = new Map();
+  let samples = 0;
+  return {
+    // stack: page 1, sp: the stack pointer at IRQ_ENTRY. The hardware pushed P, then the PC it
+    // interrupted; above them, any address whose byte two below is a JSR in ROM is taken as a
+    // return address, and the routine that JSR called as active. BASIC's own stack frames can
+    // pass that test by chance, so the totals are a guide.
+    sample(stack, sp) {
+      samples++;
+      const pc = stack[(sp + 2) & 0xff] | stack[(sp + 3) & 0xff] << 8;
+      const here = where(pc);
+      self.set(here, (self.get(here) ?? 0) + 1);
+      const active = new Set([here]);
+      for (let i = sp + 4; i < 0xff; i++) {
+        const ret = stack[i] | stack[i + 1] << 8;
+        if (romByte(ret - 2) === 0x20) active.add(where(romByte(ret - 1) | romByte(ret) << 8));
+      }
+      for (const name of active) total.set(name, (total.get(name) ?? 0) + 1);
+    },
+    report(limit = 25) {
+      const pct = (n) => `${((100 * n) / samples).toFixed(1).padStart(5)}%`;
+      const rows = [...total.entries()].sort((a, b) => (self.get(b[0]) ?? 0) - (self.get(a[0]) ?? 0) || b[1] - a[1]).slice(0, limit);
+      const lines = [`${samples} samples. self: time in the routine itself; total: with what it called.`];
+      for (const [name, n] of rows) lines.push(`  ${name.padEnd(14)} self ${pct(self.get(name) ?? 0)}   total ${pct(n)}`);
+      return lines.join('\n');
+    },
+  };
+}
+
+async function runModel(model, program, { ntsc, routines, profiler }) {
   const port = 6510 + Math.floor(Math.random() * 1000);
   const vice = ['x64sc', '-default', '-warp', '-sounddev', 'dummy', ntsc ? '-ntsc' : '-pal',
     '-binarymonitor', '-binarymonitoraddress', `ip4://127.0.0.1:${port}`,
@@ -300,17 +356,32 @@ async function runModel(model, program, { ntsc }) {
     mon.bank = await mon.bankId('cpu');
     const reg = await mon.registerIds();
     await mon.checkpoint(program.done(), 2);
+    const hooks = new Map();
     if (port_) {
       await mon.write(SLED, [...Array(SLED_NOPS).fill(0xea), 0x60]);
-      await mon.checkpoint(FMULTT, 4);
+      for (const routine of routines) {
+        hooks.set(ROUTINES[routine], routine);
+        await mon.checkpoint(ROUTINES[routine], 4);
+      }
     }
-    const stats = { hooked: 0, native: 0, modeled: 0 };
+    if (profiler) await mon.checkpoint(IRQ_ENTRY, 4);
+    const stats = { hooked: 0, native: 0, modeled: 0, calls: {} };
     mon.dropEvents();
     await mon.resume();
     for (;;) {
       const stop = await mon.event(0x62);
       const pc = stop.readUInt16LE(0);
-      if (pc !== FMULTT) {
+      const routine = hooks.get(pc);
+      if (profiler && pc === IRQ_ENTRY) {
+        if (await program.sampling(mon)) {
+          const r = await mon.registers();
+          profiler.sample(Buffer.from(await mon.read(0x100, 0x1ff)), r[reg.SP]);
+        }
+        mon.dropEvents();
+        await mon.resume();
+        continue;
+      }
+      if (!routine) {
         const result = await program.finish(mon);
         if (result) return { model, ...result, stats };
         mon.dropEvents();
@@ -319,21 +390,21 @@ async function runModel(model, program, { ntsc }) {
       }
       const r = await mon.registers();
       const zp = await mon.read(0, 0xff);
-      const out = await port_.run(r[reg.A], r[reg.X], r[reg.Y], r[reg.FL], zp);
+      const out = await port_.run(routine, r[reg.A], r[reg.X], r[reg.Y], r[reg.FL], zp);
       if (out.result === 'native') {
         stats.native++;
         mon.dropEvents();
         await mon.resume();
         continue;
       }
-      const wroteProduct = Boolean(out.set & 0x200);
-      const cost = costFor(model, out.set, wroteProduct);
+      const changed = [];
+      for (let at = 0; at < 256; at++) if (out.zp[at] !== zp[at]) changed.push(at);
+      const cost = costFor(model, out.set, changed.length);
       const nops = Math.max(0, Math.round((cost - 6) / 2));
       stats.hooked++;
+      stats.calls[routine] = (stats.calls[routine] ?? 0) + 1;
       stats.modeled += 6 + nops * 2;
-      for (let at = 0; at < 256; at++) {
-        if (out.zp[at] !== zp[at]) await mon.write(at, [out.zp[at]]);
-      }
+      for (const at of changed) await mon.write(at, [out.zp[at]]);
       await mon.setRegisters({ [reg.A]: out.a, [reg.X]: out.x, [reg.Y]: out.y, [reg.FL]: out.p, [reg.PC]: SLED + SLED_NOPS - nops });
       mon.dropEvents();
       await mon.resume();
@@ -356,11 +427,15 @@ const models = opt('--model', 'all') === 'all' ? ['native', ...Object.keys(COSTS
 const programName = opt('--program', 'bench');
 const program = PROGRAMS[programName];
 const ntsc = argv.includes('--ntsc');
+const routines = opt('--routines', Object.keys(ROUTINES).join(',')).split(',');
+const profile = argv.includes('--profile');
 const hz = ntsc ? NTSC_HZ : PAL_HZ;
 const COUNT = 4500;  // FMultBench.asm's Count
 
-if (!program || models.some((m) => m !== 'native' && !COSTS[m])) {
-  console.error('Usage: node tools/basic-accel/vice-fmult.mjs [--program bench|sine] [--model native|tr-plus|tr|tr-plus-isr|all] [--ntsc]');
+if (!program || models.some((m) => m !== 'native' && !COSTS[m]) || routines.some((r) => !ROUTINES[r]) ||
+    (profile && !program.sampling)) {
+  console.error('Usage: node tools/basic-accel/vice-float.mjs [--program bench|sine] [--model native|tr-plus|tr|tr-plus-isr|all]');
+  console.error('         [--routines fadd,fsub,fmult,fdiv] [--profile (sine only)] [--ntsc]');
   process.exit(2);
 }
 if (!commandExists('x64sc')) {
@@ -374,7 +449,8 @@ if (programName === 'bench' && !fs.existsSync(program.prg())) {
 
 let native;
 for (const model of models) {
-  const r = await runModel(model, program, { ntsc });
+  const profiler = profile ? makeProfiler() : null;
+  const r = await runModel(model, program, { ntsc, routines, profiler });
   const line = [model.padEnd(11)];
   if (programName === 'bench') {
     const fmult = r.full - r.empty;
@@ -384,7 +460,8 @@ for (const model of models) {
   line.push(`check $${r.check.toString(16).padStart(4, '0')}`);
   if (model === 'native') native = r;
   else {
-    line.push(`hooked ${r.stats.hooked} (model ${(r.stats.modeled / r.stats.hooked).toFixed(0)} cycles each), handed back ${r.stats.native}`);
+    const calls = Object.entries(r.stats.calls).map(([n, c]) => `${n} ${c}`).join(', ');
+    line.push(`hooked ${calls} (model ${(r.stats.modeled / r.stats.hooked).toFixed(0)} cycles each), handed back ${r.stats.native}`);
     if (native && programName === 'bench') {
       line.push(`${((native.full - native.empty) / (r.full - r.empty)).toFixed(1)}x on FMULT, ${(native.full / r.full).toFixed(1)}x on the pass`);
     }
@@ -392,4 +469,5 @@ for (const model of models) {
     if (native) line.push(r.check === native.check ? 'same result' : 'RESULT DIFFERS');
   }
   console.log(line.join('  |  '));
+  if (profiler) console.log(profiler.report());
 }
