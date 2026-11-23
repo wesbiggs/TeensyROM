@@ -204,6 +204,43 @@ The candidates, roughly in order:
 The interpreter itself (FRMEVL, CHRGET, EVAL, PTRGET/ORDVAR, about 36% of what is left) does
 not break into routines a hook could take.
 
+## On hardware: the hand-off test
+
+Every cost above rests on a modeled hand-off. `Source/C64/FloatHandoff` measures it on a TR+
+through the Debug handler (`IOH_Debug.c`, "float hand-off test"). Nothing there hooks the ROM.
+The C64 program asks for each answer itself, by writing `$DEF0`:
+
+| `$DEF0` command | What the TR does |
+|---|---|
+| 1, ping polled | thread mode sets the status while the C64 polls for it; no hold |
+| 2, ping held | holds the C64 by DMA from the ISR (as the REU does), takes it up in thread mode, lets it go |
+| 3, routine `$DEF1` | holds the C64, reads `$22-$2A` and `$56-$70` by DMA, runs the port, writes back the spans that changed, lets it go |
+
+`$DEF0` reads back the status. `$DEF2-$DEF7` hold the result's A, X, Y, P and Set.
+`$DEF8-$DEFD` hold three TR-side times in nS: from the command write to thread mode taking
+it up, in the port itself, and from taking it up to letting go. `$DEFF` reads `F`.
+
+To run it:
+
+1. Flash the TR+ with a build of this branch.
+2. Put `floathandoff` on SD or USB. The disk image built alongside it also has `fmultbench`
+   and `sineplot`, for native timings on the same machine.
+3. In the TR menu, set the Special IO to **Debug**, then launch `floathandoff`.
+
+It runs for about ten seconds with the screen blank, then shows:
+
+- the ping times, polled and held, in C64 cycles (min, avg, max);
+- per routine, the average C64 cycles natively and answered by the TR+, and how many of the
+  256 answers differed from the ROM's;
+- per routine, the TR's average latency, compute and whole-job times in nS.
+
+The held cycles include the DMA's own reads and writes. The real hook's served code and RTS,
+about 15–25 cycles, are not included.
+
+`floathandoff-run.test.mjs` runs the program on the ROMs against a model of the Debug
+handler, so its logic is checked off the board. On a TR, the held commands report that
+there is no DMA.
+
 ## Running it
 
 ```bash
