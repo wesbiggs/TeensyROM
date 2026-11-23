@@ -10,8 +10,13 @@ import { Mos6502, FLAG } from '../lib/mos6502.mjs';
 
 export const BASIC_ROM_SHA1 = '79015323128650c742a3694c9429aa91f355905e';  // 901226-01
 
-// Where each routine is entered, the point both its routes in share
-export const ROUTINES = { fadd: 0xb86a, fsub: 0xb853, fmult: 0xba2b, fdiv: 0xbb12, fin: 0xbcf3 };
+// Where each routine is entered. The T entries are where their routes in meet, with both
+// operands in zero page; the others take a float in memory at A/Y and unpack it first.
+export const ROUTINES = {
+  faddt: 0xb86a, fsubt: 0xb853, fmultt: 0xba2b, fdivt: 0xbb12,
+  fadd: 0xb867, fsub: 0xb850, fmult: 0xba28, fdiv: 0xbb0f,
+  fin: 0xbcf3, qint: 0xbc9b, ayint: 0xb1bf,
+};
 
 const ERROR = 0xa437;  // every BASIC error, ?OVERFLOW and ?DIVISION BY ZERO among them
 const RETURN_TO = 0x0400;
@@ -79,6 +84,47 @@ export function makeCases(count, seed = 0x6502) {
   return cases;
 }
 
+// Cases for the entries that unpack a float from A/Y: makeCases', with ARG's value moved into
+// memory at A/Y. Mostly RAM; sometimes BASIC's own zero-page temporaries, FAC or ARG itself
+// (CONUPK then reads bytes it has just written), or a pointer whose last byte is in page 1.
+const ZERO_PAGE_OPERANDS = [0x57, 0x5c, 0x61, 0x69, 0x6a, 0x26, 0xfc];
+export function makeOperandCases(count, seed = 0x6502) {
+  const next = random(seed ^ 0x5a5a5a5a);
+  return makeCases(count, seed).map((c) => {
+    const zp = c.zp.slice();
+    const value = [zp[0x69], (zp[0x6e] & 0x80) | (zp[0x6a] & 0x7f), zp[0x6b], zp[0x6c], zp[0x6d]];
+    for (const at of [0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f]) zp[at] = next() & 0xff;
+    const ptr = next() % 4 === 0 ? ZERO_PAGE_OPERANDS[next() % ZERO_PAGE_OPERANDS.length] : 0x0200 + (next() % 0x9dfb);
+    const page1 = [];
+    value.forEach((v, i) => { if (ptr + i < 0x100) zp[ptr + i] = v; else page1.push([ptr + i, v]); });
+    const mem = Uint8Array.from(value.map((v, i) => (ptr + i < 0x100 ? zp[ptr + i] : v)));
+    return { a: ptr & 0xff, x: c.x, y: ptr >> 8, p: c.p, zp, mem, memAt: ptr };
+  });
+}
+
+// Cases for QINT and AYINT: FAC near the integer limits they work to ($90 for AYINT, $A0 for
+// QINT), now and then exactly -32768, which AYINT has to compare against its constant
+export function makeIntCases(count, seed = 0x6502) {
+  const next = random(seed);
+  const byte = () => next() & 0xff;
+  const chance = (n) => next() % n === 0;
+  const cases = [];
+  for (let i = 0; i < count; i++) {
+    const zp = new Uint8Array(256);
+    for (let j = 0; j < 256; j++) zp[j] = byte();
+    zp[0x61] = chance(15) ? 0 : chance(4) ? [0x8f, 0x90, 0x91, 0x9f, 0xa0, 0xa1][next() % 6] : chance(5) ? byte() : 0x78 + (next() % 0x30);
+    for (const at of [0x62, 0x63, 0x64, 0x65, 0x70]) zp[at] = chance(3) ? 0 : byte();
+    if (!chance(8)) zp[0x62] |= 0x80;
+    if (chance(10)) {
+      zp[0x61] = 0x90; zp[0x62] = 0x80; zp[0x63] = 0; zp[0x64] = 0; zp[0x65] = 0; zp[0x66] |= 0x80;
+      zp[0x70] = chance(2) ? byte() & 0x7f : byte();
+    }
+    if (chance(2)) zp[0x68] = chance(2) ? 0 : 0xff;
+    cases.push({ a: byte(), x: byte(), y: byte(), p: (byte() & ~FLAG.D & ~FLAG.B) | FLAG.U, zp });
+  }
+  return cases;
+}
+
 // The ROM's CHRGET, as the KERNAL copies it to $73; bytes 7 and 8 are TXTPTR
 export const CHRGET = [
   0xe6, 0x7a, 0xd0, 0x02, 0xe6, 0x7b, 0xad, 0x00, 0x00, 0xc9, 0x3a, 0xb0,
@@ -137,7 +183,13 @@ export function makeFinCases(count, seed = 0x6502) {
   return cases;
 }
 
-export const casesFor = (routine, count, seed) => (routine === 'fin' ? makeFinCases : makeCases)(count, seed);
+const OPERAND_ENTRIES = new Set(['fadd', 'fsub', 'fmult', 'fdiv']);
+export function casesFor(routine, count, seed) {
+  if (routine === 'fin') return makeFinCases(count, seed);
+  if (routine === 'qint' || routine === 'ayint') return makeIntCases(count, seed);
+  if (OPERAND_ENTRIES.has(routine)) return makeOperandCases(count, seed);
+  return makeCases(count, seed);
+}
 
 // Runs the ROM's routine on one case. result is 'done' when it returned, or 'native' when it
 // raised a BASIC error, which the ports hand back to the ROM; FIN also hands back when CHRGET
@@ -147,6 +199,7 @@ export function runRom(rom, routine, c) {
   const ram = new Uint8Array(0x10000);
   ram.set(c.zp, 0);
   if (c.text) ram.set(c.text, c.textAt);
+  if (c.mem) c.mem.forEach((v, i) => { if (c.memAt + i >= 0x100) ram[c.memAt + i] = v; });
   const cpu = new Mos6502({
     read: (a) => (a >= 0xa000 && a < 0xc000 ? rom[a - 0xa000] : ram[a]),
     write: (a, v) => { ram[a] = v; },
@@ -163,13 +216,13 @@ export const TEXT_SLACK = 16;
 const hex = (bytes) => Buffer.from(bytes).toString('hex');
 export const caseLine = (routine, c) =>
   `${routine} ${hex([c.a])} ${hex([c.x])} ${hex([c.y])} ${hex([c.p])} ${hex(c.zp)}` +
-  (c.text ? ` ${hex(c.text)}${'00'.repeat(TEXT_SLACK)}` : '');
+  (c.text ? ` ${hex(c.text)}${'00'.repeat(TEXT_SLACK)}` : c.mem ? ` ${hex(c.mem)}` : '');
 
 // A result as the vectors file lists it: the registers and the zero page the routines write, or
 // only 'native', since what the ROM then does is the ROM's
 export const OUTPUT_ZP = [
-  0x22, 0x23, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x56, 0x5d, 0x5e, 0x5f, 0x60,
-  0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x7a, 0x7b,
+  0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x56, 0x5d, 0x5e, 0x5f, 0x60,
+  0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x7a, 0x7b,
 ];
 export const resultLine = (r) =>
   r.result === 'native' ? 'native' : `done ${hex([r.a, r.x, r.y, r.p])} ${hex(OUTPUT_ZP.map((at) => r.zp[at]))}`;

@@ -29,23 +29,40 @@ const FLAGS = FLAG.N | FLAG.V | FLAG.Z | FLAG.C;
 const range = (from, to) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
 
 // What each routine may read and write in zero page, and what of the caller's state it relies on
-// (so the test may not change it): the arithmetic takes N/Z from $61; FIN takes A and C from the
-// text at TXTPTR.
-const ARITHMETIC = {
-  reads: range(0x61, 0x70),
-  writes: [0x26, 0x27, 0x28, 0x29, 0x2a, 0x56, ...range(0x61, 0x70)],
+// (so the test may not change it): the T entries take N/Z from $61; the operand entries take
+// A/Y as the operand's address; FIN takes A and C from the text at TXTPTR.
+const ARITHMETIC_WRITES = [0x26, 0x27, 0x28, 0x29, 0x2a, 0x56, ...range(0x61, 0x70)];
+const T_ENTRY = {
+  reads: () => range(0x61, 0x70),
+  writes: ARITHMETIC_WRITES,
   flip: { a: 0xff, x: 0xff, y: 0xff, p: FLAG.C | FLAG.V },
 };
+const OPERAND_ENTRY = {
+  reads: (c) => [...range(0x61, 0x70), ...range(c.memAt, c.memAt + 4).filter((at) => at < 0x100)],
+  writes: [0x22, 0x23, ...ARITHMETIC_WRITES],
+  flip: { a: 0, x: 0xff, y: 0, p: FLAG.C | FLAG.V | FLAG.N | FLAG.Z },
+};
+const INTEGER = {
+  reads: () => range(0x61, 0x70),
+  writes: [0x24, 0x25, 0x62, 0x63, 0x64, 0x65, 0x68, 0x70],
+  flip: { a: 0xff, x: 0xff, y: 0xff, p: FLAG.C | FLAG.V | FLAG.N | FLAG.Z },
+};
 const SPEC = {
-  fadd: ARITHMETIC,
-  fsub: ARITHMETIC,
-  fmult: ARITHMETIC,
-  fdiv: ARITHMETIC,
+  faddt: T_ENTRY,
+  fsubt: T_ENTRY,
+  fmultt: T_ENTRY,
+  fdivt: T_ENTRY,
+  fadd: OPERAND_ENTRY,
+  fsub: OPERAND_ENTRY,
+  fmult: OPERAND_ENTRY,
+  fdiv: OPERAND_ENTRY,
   fin: {
-    reads: [0x68, ...range(0x73, 0x8a)],
+    reads: () => [0x68, ...range(0x73, 0x8a)],
     writes: [0x22, 0x23, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x56, ...range(0x5d, 0x70), 0x7a, 0x7b],
     flip: { a: 0, x: 0xff, y: 0xff, p: FLAG.V | FLAG.N | FLAG.Z },
   },
+  qint: INTEGER,
+  ayint: INTEGER,
 };
 
 let harnessPath;
@@ -96,9 +113,11 @@ for (const routine of Object.keys(ROUTINES)) {
 
   test(`${routine}: the port reads and writes only the zero page it should`, { skip }, () => {
     const cases = casesFor(routine, 2000, 0x1541);
-    const keep = new Set(spec.reads);
     const writes = new Set(spec.writes);
-    const scrambled = cases.map((c) => ({ ...c, zp: c.zp.map((v, at) => (keep.has(at) ? v : v ^ 0x5a)) }));
+    const scrambled = cases.map((c) => {
+      const keep = new Set(spec.reads(c));
+      return { ...c, zp: c.zp.map((v, at) => (keep.has(at) ? v : v ^ 0x5a)) };
+    });
     const plain = port(routine, cases);
     const other = port(routine, scrambled);
     plain.forEach((r, i) => {

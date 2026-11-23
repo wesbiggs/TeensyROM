@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { findBasicRom, casesFor, runRom, resultLine, ROUTINES } from './float-cases.mjs';
 
-const LISTED = 64;
+const LISTED = 32;
 const HASHED = 20_000;
 const SEED = 0x6502;
 
