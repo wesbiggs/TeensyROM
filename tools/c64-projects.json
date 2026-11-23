@@ -187,6 +187,15 @@
         { "assembler": "acme", "source": "source/FMultBench.asm", "output": "FMultBench.prg", "format": "cbm", "labels": "FMultBench.labels" }
       ],
       "headers": []
+    },
+    {
+      "name": "FloatHandoff",
+      "description": "Times, on hardware, the TR+ answering BASIC float routines through IOH_Debug's float hand-off test, and checks its results against the ROM. Run with the Special IO set to Debug. Not embedded in the firmware, so it has no header.",
+      "dir": "Source/C64/FloatHandoff",
+      "steps": [
+        { "assembler": "acme", "source": "source/FloatHandoff.asm", "output": "FloatHandoff.prg", "format": "cbm", "labels": "FloatHandoff.labels" }
+      ],
+      "headers": []
     }
   ]
 }
