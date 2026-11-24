@@ -43,3 +43,13 @@ test('the sine plot is the same bitmap natively and on BasicEmu, hooked or not',
   assert.deepEqual(hooked.hookNative, hooked.hookNative.map(() => 0));
   assert.ok(hooked.instructions < plain.instructions / 2);
 });
+
+test('the jiffy clock keeps the C64\'s time at every speed', { skip }, () => {
+  const run = prepare(roms, fs.readFileSync(SINE_PLOT, 'utf8'));
+  // the KERNAL's PAL timer A latch, $4025: one IRQ every 16422 cycles
+  for (const options of [{ native: true }, { speed: 10 }, { speed: 40 }]) {
+    const r = run(options);
+    // a jiffy either side for where RUN and the end fall in the period
+    assert.ok(Math.abs(r.runJiffies - r.runCycles / 16422) <= 1.5, `${JSON.stringify(options)}: ${r.runJiffies} jiffies in ${r.runCycles} cycles`);
+  }
+});

@@ -6,8 +6,8 @@
 // Boots the ROMs, types RUN for PROGRAM at BASIC's first prompt, and runs until the program
 // writes 1 to $033C (SinePlot.bas does when it has drawn). Prints what it took as JSON.
 //
-// The model's clock is the C64's, in its cycles. The 6502 here runs --speed native cycles per
-// C64 cycle; each bus read stalls it --read cycles and each bus write (an I/O write, or a dirty
+// The model's clock is the C64's, in its cycles. From RUN, the 6502 here runs --speed native
+// cycles per C64 cycle; each bus read stalls it --read cycles and each bus write (an I/O write, or a dirty
 // byte flushed to the VIC once a frame) costs --write. --native models the C64's own CPU
 // instead: speed 1, the bus free, no flush, and the cycles the VIC takes on badlines. --hook is
 // what one answered float routine costs, in C64 cycles. The counts in the output start at RUN.
@@ -37,6 +37,7 @@ static struct {
 
 static struct {
    double Time;  // C64 cycles since reset
+   uint64_t CiaCycles;  // whole cycles of Time the timer has counted
    uint8_t Io[0x1000];
    int32_t TimerA;
    uint16_t LatchA;
@@ -64,8 +65,11 @@ static void VicUpdate(void)
    C64.LastLine = Lines;
 }
 
-static void CiaUpdate(double Elapsed)
+// The timer counts whole cycles of the clock, so the fractions the slices leave add up
+static void CiaUpdate(void)
 {
+   uint64_t Now = (uint64_t)C64.Time, Elapsed = Now - C64.CiaCycles;
+   C64.CiaCycles = Now;
    if (!(C64.Io[0xc0e] & 1)) return;
    C64.TimerA -= (int32_t)Elapsed;
    while (C64.TimerA < 0)
@@ -84,7 +88,7 @@ static void CiaUpdate(double Elapsed)
 static void Advance(double Cycles)
 {
    C64.Time += Cycles;
-   CiaUpdate(Cycles);
+   CiaUpdate();
    VicUpdate();
 }
 
@@ -190,6 +194,9 @@ static uint32_t Checksum(uint16_t From, uint16_t To)
    return Check;
 }
 
+// TI, the jiffy clock the KERNAL's IRQ counts at $A0-$A2
+static uint32_t Ti(void) { return (uint32_t)BasicEmu.Ram[0xa0] << 16 | BasicEmu.Ram[0xa1] << 8 | BasicEmu.Ram[0xa2]; }
+
 int main(int argc, char **argv)
 {
    if (argc < 5)
@@ -236,6 +243,7 @@ int main(int argc, char **argv)
    uint64_t NextFrame = PAL_FRAME;
    double RunAt = -1;
    uint64_t CyclesAtRun = 0, InstrAtRun = 0;
+   uint32_t TiAtRun = 0;
    clock_t Began = clock();
    for (;;)
    {
@@ -243,7 +251,10 @@ int main(int argc, char **argv)
       uint32_t Calls = HookCalls();
       Cpu6502Stop Stop = BasicEmuRun(&Cpu, Cpu.Cycles + Slice);
       // the bus accesses advanced the clock themselves
-      double Ran = (double)(Cpu.Cycles - Cycles) / Opt.Speed + (HookCalls() - Calls) * Opt.HookCost;
+      // The boot runs at the C64's speed: faster, the KERNAL clears the screen in under a frame,
+      // its PAL check ($FF5E) finds the raster latch for line 311 unset, and TI runs NTSC-slow
+      double Speed = RunAt < 0 ? 1 : Opt.Speed;
+      double Ran = (double)(Cpu.Cycles - Cycles) / Speed + (HookCalls() - Calls) * Opt.HookCost;
       if (Opt.Native && (C64.Io[0x011] & 0x10)) Ran *= (double)PAL_FRAME / (PAL_FRAME - BADLINE_STEAL);
       Advance(Ran);
       if (Stop == Cpu6502_Jam && Cpu.PC == Main && RunAt < 0)
@@ -258,6 +269,7 @@ int main(int argc, char **argv)
          RunAt = C64.Time;
          CyclesAtRun = Cpu.Cycles;
          InstrAtRun = Cpu.Instructions;
+         TiAtRun = Ti();
          memset(&Bus, 0, sizeof Bus);
          continue;
       }
@@ -294,7 +306,8 @@ int main(int argc, char **argv)
 
    printf("{\"speed\":%g,\"read\":%g,\"write\":%g,\"hook\":%g,\"native\":%s,\"hooks\":%u,", Opt.Speed, Opt.ReadCost,
           Opt.WriteCost, Opt.HookCost, Opt.Native ? "true" : "false", Opt.Hooks);
-   printf("\"runCycles\":%.0f,\"jiffies\":%u,", C64.Time - RunAt, BasicEmu.Ram[830] | BasicEmu.Ram[831] << 8);
+   printf("\"runCycles\":%.0f,\"runJiffies\":%u,\"jiffies\":%u,", C64.Time - RunAt, Ti() - TiAtRun,
+          BasicEmu.Ram[830] | BasicEmu.Ram[831] << 8);
    printf("\"instructions\":%llu,\"cpuCycles\":%llu,", (unsigned long long)(Cpu.Instructions - InstrAtRun),
           (unsigned long long)(Cpu.Cycles - CyclesAtRun));
    printf("\"busReads\":%llu,\"busWrites\":%llu,\"flushed\":%llu,\"frames\":%llu,\"dirtyLeft\":%u,",

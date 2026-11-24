@@ -284,25 +284,26 @@ side of the bus. It models CIA1's timer A and its IRQ, the VIC's raster and its 
 KERNAL's PAL/NTSC check reads both), and every other register as plain storage. At BASIC's first
 prompt the model puts the listing in memory and types `RUN`.
 
-Time is the C64's clock. The 6502 runs `--speed` native cycles per C64 cycle. A bus read
+Time is the C64's clock. From `RUN`, the 6502 runs `--speed` native cycles per C64 cycle; the
+boot runs at the C64's own speed, since faster the KERNAL's PAL check finds NTSC. A bus read
 stalls it `--read` cycles, a bus write or flushed byte costs `--write`, and an answered hook
 costs `--hook`. `--native` is the C64's own CPU: speed 1, the bus free, and the VIC's badline
 cycles taken.
 
-The native run checks the model: the plot takes 2284 jiffies (38.1 s), against VICE's 38.5 s.
+The native run checks the model: the plot takes 2301 jiffies (38.4 s), against VICE's 38.5 s.
 Every run below draws the same bitmap, and no hook handed back to the ROM. "RUN to done"
 includes clearing the bitmap and screen, which the program's own TI leaves out. A write costs
 1 cycle and a hook 2.
 
 | Run | RUN to done | Speedup | Plot, in TI jiffies | Bus reads | Bus writes |
 |---|---|---|---|---|---|
-| native | 72.6 s | 1.0× | 2284 | 17302 | 8655 |
-| 10×, no hooks | 6.83 s | 10.6× | 191 | 1450 | 18514 |
-| 10×, hooks | 2.59 s | 28.1× | 44 | 554 | 18000 |
-| 20×, no hooks | 3.42 s | 21.2× | 95 | 726 | 17801 |
-| 20×, hooks | 1.37 s | 53.2× | 23 | 294 | 17490 |
-| 40×, no hooks | 1.72 s | 42.2× | 32 | 246 | 18375 |
-| 40×, hooks | 0.76 s | 96.0× | 10 | 122 | 18494 |
+| native | 72.6 s | 1.0× | 2301 | 17430 | 8719 |
+| 10×, no hooks | 6.83 s | 10.6× | 216 | 1642 | 20616 |
+| 10×, hooks | 2.59 s | 28.1× | 50 | 626 | 17793 |
+| 20×, no hooks | 3.42 s | 21.2× | 107 | 826 | 17915 |
+| 20×, hooks | 1.37 s | 53.1× | 26 | 330 | 17624 |
+| 40×, no hooks | 1.72 s | 42.3× | 54 | 414 | 17684 |
+| 40×, hooks | 0.76 s | 96.1× | 15 | 186 | 17507 |
 
 The read cost is 3 cycles in that table. At 75, roughly the cost of waking `loop()` for each
 read, no run changes by more than 3%. The plot makes about 13 reads a jiffy, all of them the
