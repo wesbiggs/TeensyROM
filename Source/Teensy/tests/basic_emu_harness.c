@@ -198,6 +198,21 @@ static void Flush(void)
    Check("bank 1 flushes its screen and sprite 0", N == 2 && Bus.Addr[0] == 0x4000 && Bus.Addr[1] == 0x5000,
          "wrong bytes flushed");
    Check("everything else waits for a full flush", BasicEmuFlushAll() == 1, "dirty bytes lost");
+
+   // RAM under I/O: DMA would reach the chip, not the RAM, so the byte stays dirty
+   Setup(0);
+   BasicEmu.Port = 0x34;
+   Cpu6502Write(0xd020, 0x00);
+   BasicEmu.IoLast[0xd00] = 0;     // bank 3, $C000
+   BasicEmu.IoLast[0x018] = 0x04;  // characters at $D000
+   BasicEmu.IoLast[0x011] = 0x1b;
+   Cpu6502Write(0xd000, 0xaa);
+   memset(&Bus, 0, sizeof Bus);
+   N = BasicEmuFlushVideo() + BasicEmuFlushAll();
+   Check("RAM under I/O is never flushed to the bus, and stays dirty",
+         N == 0 && Bus.Writes == 0 && (BasicEmu.Dirty[0xd020 >> 3] & (1 << (0xd020 & 7))) &&
+            (BasicEmu.Dirty[0xd000 >> 3] & 1),
+         "a RAM byte under I/O went to the bus");
 }
 
 int main(void)

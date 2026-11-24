@@ -238,12 +238,19 @@ static BASIC_EMU_FN __attribute__((unused)) Cpu6502Stop BasicEmuRun(Cpu6502 *Cpu
    }
 }
 
-// Writes the dirty bytes in Addr..Addr+Len-1 to the C64 and clears them; returns how many
+// Writes the dirty bytes in Addr..Addr+Len-1 to the C64 and clears them; returns how many.
+// RAM under I/O stays dirty: the held 6510's port maps I/O there, so DMA would write the chip.
+// Only giving the 6510 back, with its port set to RAM, reaches it.
 static inline unsigned BasicEmuFlushRange(uint32_t Addr, uint32_t Len)
 {
    unsigned Count = 0;
    for (uint32_t End = Addr + Len; Addr < End && Addr < 0x10000;)
    {
+      if (Addr >= 0xd000 && Addr < 0xe000)
+      {
+         Addr = 0xe000;
+         continue;
+      }
       uint8_t *D = &BasicEmu.Dirty[Addr >> 3];
       if (!*D && (Addr & 7) == 0 && Addr + 8 <= End)
       {
@@ -289,7 +296,7 @@ static BASIC_EMU_FN __attribute__((unused)) unsigned BasicEmuFlushVideo(void)
    return Count;
 }
 
-// Every dirty byte, as handing the C64 back to its own CPU needs; returns how many
+// Every dirty byte DMA can reach, as handing the C64 back to its own CPU needs; returns how many
 static BASIC_EMU_FN __attribute__((unused)) unsigned BasicEmuFlushAll(void) { return BasicEmuFlushRange(2, 0x10000 - 2); }
 
 #endif

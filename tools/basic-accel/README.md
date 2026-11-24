@@ -257,7 +257,9 @@ Teensy, against a copy of the C64's RAM, with the 6510 held as the REU holds it:
   what it writes, and about once a frame the bytes the VIC displays go to the C64. Those are
   the screen, the character set or bitmap, and the enabled sprites, by the `$DD00`, `$D018`,
   `$D011` and `$D015` values last written. Everything else stays dirty until the C64 gets its
-  CPU back (`BasicEmuFlushAll`).
+  CPU back (`BasicEmuFlushAll`). RAM under I/O (`$D000-$DFFF`) is never flushed. The held
+  6510's port maps I/O there, so a DMA write would reach the chip instead. A character set or
+  bitmap the VIC reads there, in bank 3, does not show until the hand-back.
 - **I/O goes to the bus** (`$D000-$DFFF` while the port maps it in), one access for each the
   6502 makes. Reads stall the 6502; writes need not. A read-modify-write on I/O writes the old
   value first, as the NMOS part does (`INC $D019` relies on it).
