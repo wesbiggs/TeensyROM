@@ -9,7 +9,8 @@ the C64 program. So far it covers:
 - QINT and AYINT, which convert FAC to an integer.
 
 Nothing here is in the firmware yet. This is the C ports, the evidence that they are
-bit-exact, and a model of what they would gain.
+bit-exact, and a model of what they would gain. [Running the ROM on the Teensy](#running-the-rom-on-the-teensy)
+is a second design built on the same ports.
 
 | File | What it is |
 |---|---|
@@ -21,6 +22,10 @@ bit-exact, and a model of what they would gain.
 | `Source/C64/FMultBench/` | C64 benchmark: 4,500 FMULTs, timed with CIA2 |
 | `tools/basic-accel/SinePlot.bas` | a type-in style hi-res sine plot in BASIC |
 | `tools/basic-accel/vice-float.mjs` | runs either one in VICE, natively or with a modeled cartridge, optionally profiling |
+| `Source/Teensy/BasicAccel/Cpu6502.h` | a 6502 core, for running the ROM on the Teensy |
+| `Source/Teensy/BasicAccel/BasicEmu.h` | the C64 around it: a copy of RAM, banking, the bus, the hooks |
+| `tools/basic-accel/emu-model.mjs`, `emu_model.c` | runs a listing on `BasicEmu.h` against a model of the C64, and times it |
+| `tools/basic-accel/basic-tokenize.mjs` | a listing to a `.prg`, as the C64 crunches it |
 
 ## Where the hooks go
 
@@ -241,6 +246,87 @@ about 15–25 cycles, are not included.
 handler, so its logic is checked off the board. On a TR, the held commands report that
 there is no DMA.
 
+## Running the ROM on the Teensy
+
+The hooks above leave two costs they cannot remove. Every hooked call pays a hand-off, 30% of
+what is left of the sine plot. And the interpreter itself, about a third of the rest, does not
+break into routines a hook could take. The other design runs the BASIC and KERNAL ROMs on the
+Teensy, against a copy of the C64's RAM, with the 6510 held as the REU holds it:
+
+- **RAM is a copy.** The 6502 reads and writes it at the Teensy's speed. A dirty bitmap marks
+  what it writes, and about once a frame the bytes the VIC displays go to the C64. Those are
+  the screen, the character set or bitmap, and the enabled sprites, by the `$DD00`, `$D018`,
+  `$D011` and `$D015` values last written. Everything else stays dirty until the C64 gets its
+  CPU back (`BasicEmuFlushAll`).
+- **I/O goes to the bus** (`$D000-$DFFF` while the port maps it in), one access for each the
+  6502 makes. Reads stall the 6502; writes need not. A read-modify-write on I/O writes the old
+  value first, as the NMOS part does (`INC $D019` relies on it).
+- **The 6510's port** (`$00/$01`) is inside the CPU, where DMA cannot reach, so the banking is
+  modeled.
+- **The hooks are direct calls.** `BasicEmuInit` puts a JAM in the copy of the ROM at each
+  entry in the table above. The 6502 stops there and calls the C port with the real registers.
+  The operand entries need no `STA $DE00` and FIN no text window. If the port declines, the
+  instruction it covered runs. There is no hand-off.
+- **Interrupts** come from the C64's chips through `Cpu6502IrqLine`, since with the 6510 held
+  nothing else takes them. The KERNAL's IRQ runs on the 6502 here, keyboard scan included.
+
+`Cpu6502.h` runs the 151 documented opcodes and counts the cycles each would take on the real
+part. It stops at a JAM or any other undocumented opcode, and makes none of the real part's
+dummy reads. `cpu6502.test.js` checks every documented opcode against `mos6502.mjs`: registers,
+flags, cycles and every write, from random states steered onto page crossings, wraps and
+interrupts. `basic-emu.test.js` checks the banking, the bus, the hooks and the flush on
+made-up ROMs.
+
+### The model
+
+`emu-model.mjs` boots the real ROMs in `emu_model.c`, which stands in for the C64 on the other
+side of the bus. It models CIA1's timer A and its IRQ, the VIC's raster and its latch (the
+KERNAL's PAL/NTSC check reads both), and every other register as plain storage. At BASIC's first
+prompt the model puts the listing in memory and types `RUN`.
+
+Time is the C64's clock. The 6502 runs `--speed` native cycles per C64 cycle. A bus read
+stalls it `--read` cycles, a bus write or flushed byte costs `--write`, and an answered hook
+costs `--hook`. `--native` is the C64's own CPU: speed 1, the bus free, and the VIC's badline
+cycles taken.
+
+The native run checks the model: the plot takes 2284 jiffies (38.1 s), against VICE's 38.5 s.
+Every run below draws the same bitmap, and no hook handed back to the ROM. "RUN to done"
+includes clearing the bitmap and screen, which the program's own TI leaves out. A write costs
+1 cycle and a hook 2.
+
+| Run | RUN to done | Speedup | Plot, in TI jiffies | Bus reads | Bus writes |
+|---|---|---|---|---|---|
+| native | 72.6 s | 1.0× | 2284 | 17302 | 8655 |
+| 10×, no hooks | 6.83 s | 10.6× | 191 | 1450 | 18514 |
+| 10×, hooks | 2.59 s | 28.1× | 44 | 554 | 18000 |
+| 20×, no hooks | 3.42 s | 21.2× | 95 | 726 | 17801 |
+| 20×, hooks | 1.37 s | 53.2× | 23 | 294 | 17490 |
+| 40×, no hooks | 1.72 s | 42.2× | 32 | 246 | 18375 |
+| 40×, hooks | 0.76 s | 96.0× | 10 | 122 | 18494 |
+
+The read cost is 3 cycles in that table. At 75, roughly the cost of waking `loop()` for each
+read, no run changes by more than 3%. The plot makes about 13 reads a jiffy, all of them the
+KERNAL's IRQ acknowledging CIA1 and scanning the keyboard. Nearly all the writes are bitmap and
+screen bytes flushed to the VIC. The hooks remove 65% of the 6502's cycles (7.3 million
+instructions from RUN, against 20.4 million). So what decides the result is the emulator's own
+speed, which the model only assumes.
+
+### What it does not do yet
+
+- **Measure its speed on the Teensy.** That depends on `isrPHI2`, which still runs every cycle
+  while the 6510 is held, and on where the code and the 92 KB of state live. The firmware
+  would want the core in flash (`FLASHMEM`) and the state in RAM2 (`DMAMEM`). On the host it
+  runs about 90 million instructions a second.
+- **Start from a running C64.** The model boots from reset. On the board, entry would copy 64K
+  by DMA, read the VIC's and CIA2's registers into `IoLast`, and take the 6510's registers
+  from the C64.
+- **Give the C64 its CPU back.** The serial bus, and anything that counts cycles, needs the
+  real 6510. That means flushing every dirty byte, serving the registers back from IO1, and
+  catching the return.
+- **Keep time.** Raster effects, SID playback and anything else timed run at the 6502's
+  speed, not the C64's.
+- **Cartridges, undocumented opcodes, the NMI.** None is modeled.
+
 ## Running it
 
 ```bash
@@ -259,7 +345,13 @@ node tools/basic-accel/vice-float.mjs --program sine
 node tools/basic-accel/vice-float.mjs --program sine --model tr-plus --profile
 ```
 
-This needs `x64sc` with the C64 ROMs and symbol file that VICE ships (looked for in
+```bash
+node tools/basic-accel/emu-model.mjs --speed 10,20,40 --read 3,75
+```
+
+`emu-model.mjs` needs only a C compiler and the BASIC, KERNAL and character ROMs, found as VICE
+ships them or through `C64_BASIC_ROM`, `C64_KERNAL_ROM` and `C64_CHARGEN_ROM`. The VICE scripts
+need `x64sc` with the C64 ROMs and symbol file that VICE ships (looked for in
 `/usr/share/vice/C64`), a C compiler, and `petcat` for the sine plot. On a machine without a
 display it also needs `xvfb-run`. `--routines` limits which routines are hooked, by the names in `ROUTINES` in
 `float-cases.mjs` (`faddt`, `fadd`, `fin`, `qint` and so on). Some Linux
