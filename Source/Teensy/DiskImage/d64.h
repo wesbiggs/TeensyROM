@@ -45,13 +45,13 @@ enum {
     D64_E_BAM = -13      /* the BAM shows a sector free that the directory holds */
 };
 
-enum { D64_FMT_D64 = 0, D64_FMT_D71 = 1, D64_FMT_D81 = 2 };
+enum { D64_FMT_D64 = 0, D64_FMT_D71 = 1, D64_FMT_D81 = 2, D64_FMT_DNP = 3 };
 
 typedef struct {
     d64_read_fn  read;
     d64_write_fn write;
     void       *ctx;
-    uint8_t     tracks;          /* 35 or 40 (d64), 70 (d71), 80 (d81) */
+    uint8_t     tracks;          /* 35 or 40 (d64), 70 (d71), 80 (d81), 1-255 (dnp) */
     uint8_t     fmt;             /* D64_FMT_* */
     uint8_t     ro;              /* write protect set from the C64 (W-1): writes fail as on a read-only image; d64_open clears it */
     /* Error table (the byte per sector some images carry after the data, as written by copiers / VICE): NULL = none. A read of a
@@ -59,10 +59,11 @@ typedef struct {
      * first such failure is kept in bad / bad_t / bad_s until the caller clears bad. Writes ignore the table. d64_open clears it. */
     const uint8_t *errtab;
     uint8_t     bad, bad_t, bad_s;
+    uint8_t     hdr_t, hdr_s;    /* dnp: the header of the directory in use (1/1 = the root; d64_open_dnp sets it), else 0 */
 } d64_t;
 
 typedef struct {
-    uint8_t  type;               /* raw type byte: bit7 closed, bit6 locked, low 3 = DEL/SEQ/PRG/USR/REL */
+    uint8_t  type;               /* raw type byte: bit7 closed, bit6 locked, low 3 = DEL/SEQ/PRG/USR/REL (dnp also 6 = DIR) */
     uint8_t  track, sector;      /* first data sector */
     uint16_t blocks;
     char     name[17];           /* PETSCII, $A0 padding stripped, NUL terminated */
@@ -119,13 +120,22 @@ typedef struct {
 } d64_rel_t;
 
 /* Memory-image backend (host tests / mock). Writable if data is. */
-typedef struct { uint8_t *data; size_t len; } d64_mem_t;
+typedef struct { uint8_t *data; size_t len; uint8_t dnp; } d64_mem_t;
 void d64_mem_init(d64_mem_t *m, uint8_t *data, size_t len);
 int  d64_open_mem(d64_t *d, d64_mem_t *m);          /* image size selects the format */
+int  d64_open_mem_dnp(d64_t *d, d64_mem_t *m);      /* a CMD native partition (see d64_open_dnp) */
 int  d64_open(d64_t *d, d64_read_fn rd, void *ctx, uint8_t tracks);   /* tracks: 35/40 = d64, 70 = d71, 80 = d81 */
 int  d64_open_size(d64_t *d, d64_read_fn rd, void *ctx, size_t file_size);   /* format from the file size (error bytes allowed); -1 if too small */
 int  d64_open_exact(d64_t *d, d64_read_fn rd, void *ctx, size_t file_size);  /* as d64_open_size, but -1 unless the size is exactly
                                                                                  one kind's, with or without error bytes */
+/* .dnp, a CMD native partition: 256 sectors per track, file_size / 64 KB tracks (a multiple of 64 KB, at most 255 tracks).
+ * Never chosen by size (a 3-track dnp is as long as a 40-track d64): the caller knows it from the name, and the open checks the
+ * content: it reads 1/1 and 1/2 and returns -1 unless d64_dnp_check passes (or the size is wrong). Read-only for now: every write
+ * answers D64_E_RO. Opens on the root directory.
+ * d64_dnp_check: 0 when the size is whole tracks, the root header (1/1) and the BAM (1/2) both have 'H' at byte 2, and the BAM's
+ * track count (byte 8) matches the size; else -1. For a caller that reads those two sectors itself before switching to an image. */
+int  d64_open_dnp(d64_t *d, d64_read_fn rd, void *ctx, size_t file_size);
+int  d64_dnp_check(const uint8_t *hdr, const uint8_t *bam, size_t file_size);
 /* Error table: d64_errtab_offset = where it starts in a file of this size (-1: the file has none; after d64_open_size), d64_sectors =
  * the image's sector count (= the table's length). d64_open_mem sets errtab itself. d64_errcode: an error byte -> DOS code, 0 = no
  * read error (1 = OK; 2..6, 9, 11, 15 = 20..24, 27, 29, 74; the write errors 25 / 26 / 28 and unknown bytes read fine). */
@@ -145,7 +155,15 @@ int  d64_dir_next(d64_t *d, d64_dir_t *it, d64_entry_t *e);   /* 1 entry, 0 end,
 
 /* CBM wildcard match: '?' any one char, '*' rest of name. */
 int  d64_match(const char *name, const char *pattern);
-int  d64_find(d64_t *d, const char *pattern, d64_entry_t *e); /* 1 found, 0 not found, <0 error */
+int  d64_find(d64_t *d, const char *pattern, d64_entry_t *e); /* 1 found, 0 not found, <0 error; never a DIR entry */
+
+/* dnp sub-directories (other formats: enter = D64_E_NOTFOUND, up = 0, root does nothing). The directory in use is d64_t.hdr_t/hdr_s;
+ * d64_header, d64_dir_first, d64_find and the listing work on it.
+ *   d64_dir_enter: the closed DIR entry of exactly this name in the directory in use; 0, D64_E_NOTFOUND or a read error
+ *   d64_dir_up:    to the parent; 1 moved, 0 already at the root, <0 error */
+int  d64_dir_enter(d64_t *d, const char *name);
+int  d64_dir_up(d64_t *d);
+void d64_dir_root(d64_t *d);
 
 int  d64_file_open(d64_t *d, const d64_entry_t *e, d64_file_t *f);
 int  d64_file_read(d64_t *d, d64_file_t *f, uint8_t *out, size_t n); /* bytes read; 0 = EOF; <0 error */
