@@ -21,21 +21,24 @@ export const ROUTINES = {
 const ERROR = 0xa437;  // every BASIC error, ?OVERFLOW and ?DIVISION BY ZERO among them
 const RETURN_TO = 0x0400;
 
-export function findBasicRom() {
+// A C64 ROM image as VICE ships it, from the file ENV names or VICE's usual folders, checked
+// against its SHA-1
+export function findC64Rom(file, sha1, env, size) {
   const candidates = [
-    process.env.C64_BASIC_ROM,
-    '/usr/share/vice/C64/basic-901226-01.bin',
-    '/usr/lib/vice/C64/basic-901226-01.bin',
-    '/usr/local/share/vice/C64/basic-901226-01.bin',
-    '/opt/homebrew/share/vice/C64/basic-901226-01.bin',
-    path.join(os.homedir(), '.local/share/vice/C64/basic-901226-01.bin'),
+    process.env[env],
+    ...['/usr/share/vice', '/usr/lib/vice', '/usr/local/share/vice', '/opt/homebrew/share/vice', path.join(os.homedir(), '.local/share/vice')]
+      .map((dir) => path.join(dir, 'C64', file)),
   ].filter(Boolean);
-  for (const file of candidates) {
-    if (!fs.existsSync(file)) continue;
-    const rom = fs.readFileSync(file);
-    if (rom.length === 0x2000 && createHash('sha1').update(rom).digest('hex') === BASIC_ROM_SHA1) return rom;
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) continue;
+    const rom = fs.readFileSync(candidate);
+    if (rom.length === size && createHash('sha1').update(rom).digest('hex') === sha1) return rom;
   }
   return null;
+}
+
+export function findBasicRom() {
+  return findC64Rom('basic-901226-01.bin', BASIC_ROM_SHA1, 'C64_BASIC_ROM', 0x2000);
 }
 
 // xorshift32, so a case list is the same on every host
