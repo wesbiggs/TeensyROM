@@ -26,6 +26,8 @@ is a second design built on the same ports.
 | `Source/Teensy/BasicAccel/BasicEmu.h` | the C64 around it: a copy of RAM, banking, the bus, the hooks |
 | `tools/basic-accel/emu-model.mjs`, `emu_model.c` | runs a listing on `BasicEmu.h` against a model of the C64, and times it |
 | `tools/basic-accel/basic-tokenize.mjs` | a listing to a `.prg`, as the C64 crunches it |
+| `Source/Teensy/BasicAccel/EmuBench.h` | a run of a listing on `BasicEmu.h` against a model of the C64, for the host model and the TR+ |
+| `Source/C64/EmuBench/` | C64 side of the TR+ emulator benchmark |
 
 ## Where the hooks go
 
@@ -364,6 +366,43 @@ speed, which the model only assumes.
 - **Keep time.** Raster effects, SID playback and anything else timed run at the 6502's
   speed, not the C64's.
 - **Cartridges, undocumented opcodes, the NMI.** None is modeled.
+
+### On hardware: the emulator benchmark
+
+`Source/C64/EmuBench` measures how fast `Cpu6502.h` runs on a TR+, which the model can only
+assume. It uses the float hand-off test's routine command with `$DEF1` = 6 (float routines
+emulated) or 7 (answered by `CbmFloat.h`). For each run the TR+:
+
+1. holds the C64 and reads its BASIC and KERNAL ROMs by DMA;
+2. boots them in `EmuBench.h` on the Teensy and runs `SinePlot.bas` (`SinePlotPrg.h`) to the end;
+3. writes what it took to `$C000`, 32 bytes a run (`struct FTBench` in `IOH_Debug.c`), and lets go.
+
+It is the work `emu_model.c` does with `--speed 1 --read 0 --write 0 --hook 0`, against the
+same model of the C64's chips, so nothing reaches the real ones but the ROM reads. The C64
+stays held for each whole run, and `loop()` waits with it. The emulator's ~96 KB of state is
+on the heap (RAM2) for the run only; the code is in flash, where the firmware version would
+put it. The PHI2 interrupt runs on every cycle throughout, as it would in real use.
+
+To run it, build the program with `npm run build:c64 -- --project EmuBench`, set the Special IO
+to Debug, and launch `EmuBench.prg`. It reports, per run:
+
+| Line | What it is |
+|---|---|
+| run to done, ms | the Teensy's time from RUN to the plot's end |
+| x a 1 mhz 6502 | emulated 6502 cycles per µs: the speed `emu-model.mjs --speed` assumes |
+| mips | emulated instructions per µs |
+| hook calls | the float routines answered in C |
+| bitmap | the plot's checksum, against the model's on BASIC 901226-01 and KERNAL 901227-03 |
+
+`roms read` sums the ROMs the TR+ read from the C64; on 901226-01 and 901227-03 they are
+`$3D56` and `$C70A`. Other ROMs can draw the same plot, but the check assumes those.
+`emubench-run.test.mjs` runs the program against a model of the handler.
+
+Adding the emulator to the firmware's one translation unit raised the compiler's inlining
+budget. It now also inlines four existing functions into their callers, among them
+`DMAWaitAssertReady` into `isrPHI2`. That is 192 bytes more of RAM1 code. The DMA assert's
+timing is set by `WaitUntil_nS`, not by code length, but rerunning `FloatHandoff` with this
+build checks the DMA paths on the board.
 
 ## Running it
 
