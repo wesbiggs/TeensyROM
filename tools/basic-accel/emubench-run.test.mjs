@@ -113,8 +113,11 @@ test('EmuBench shows a bitmap that differs, a run that stopped, and a refused co
     { status: 2, stopPc: 0xa480 },
     { trStatus: 4 },
   ]);
-  assert.match(out, /EMULATED:\n STOPPED, +2 AT \$A480/);
+  assert.match(out, /EMULATED:\n STOPPED AT \$A480/);
   assert.match(out, /ANSWERED IN C:\n TR STATUS +4/);
+  const limits = run(build(), [{ status: 1, stopPc: 0xb8d2 }, { status: 3 }]);
+  assert.match(limits, /EMULATED:\n TIME LIMIT AT \$B8D2/);
+  assert.match(limits, /ANSWERED IN C:\n NO MEMORY FOR THE EMULATOR/);
   const differs = run(build(), [{ bitmap: 0x12345678 }, {}]);
   assert.match(differs, /EMULATED:[^]*BITMAP +DIFFERS: \$12345678/);
 });

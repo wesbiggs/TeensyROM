@@ -33,6 +33,9 @@ RBitmap  = 12
 RBasic   = 16
 RKernal  = 18
 RStopPc  = 20
+; RStatus, as IOH_Debug's FTBenchStatuses numbers them; 2 is a JAM or undocumented opcode
+BenchTimeLimit = 1
+BenchNoMemory  = 3
 
 ; EmuBenchChecksum of SinePlot's bitmap, as emu_model.c draws it on BASIC 901226-01 and
 ; KERNAL 901227-03, natively or emulated, hooked or not
@@ -152,18 +155,20 @@ Report
    jmp LINPRT
 +  ldy #RStatus
    lda (Ptr),y
-   beq +
-   pha
-   lda #<MsgStopped
+   beq ReportDone
+   cmp #BenchNoMemory
+   bne +
+   lda #<MsgNoMemory
+   ldy #>MsgNoMemory
+   jmp PrintMsg
++  cmp #BenchTimeLimit
+   bne +
+   lda #<MsgTimeLimit
+   ldy #>MsgTimeLimit
+   bne ++
++  lda #<MsgStopped
    ldy #>MsgStopped
-   jsr PrintMsg
-   pla
-   tax
-   lda #0
-   jsr LINPRT
-   lda #<MsgAt
-   ldy #>MsgAt
-   jsr PrintMsg
+++ jsr PrintMsg
    ldy #RStopPc+1
    lda (Ptr),y
    jsr PrintHex
@@ -171,7 +176,8 @@ Report
    lda (Ptr),y
    jmp PrintHex
 
-+  lda #<MsgTime
+ReportDone
+   lda #<MsgTime
    ldy #>MsgTime
    ldx #RMs
    jsr PrintWord
@@ -293,8 +299,9 @@ MsgKernal  !pet " kernal $", 0
 MsgPlain   !pet $0d, $0d, "float routines emulated:", 0
 MsgHooked  !pet $0d, $0d, "float routines answered in c:", 0
 MsgTRStatus !pet $0d, " tr status ", 0
-MsgStopped !pet $0d, " stopped, ", 0
-MsgAt      !pet " at $", 0
+MsgStopped !pet $0d, " stopped at $", 0
+MsgTimeLimit !pet $0d, " time limit at $", 0
+MsgNoMemory !pet $0d, " no memory for the emulator", 0
 MsgTime    !pet $0d, " run to done, ms ", 0
 MsgSpeed   !pet $0d, " x a 1 mhz 6502  ", 0
 MsgMips    !pet $0d, " mips            ", 0
