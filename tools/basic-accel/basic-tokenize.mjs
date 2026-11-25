@@ -73,3 +73,14 @@ export function tokenize(listing, load = 0x0801) {
   body.push(0, 0);
   return Uint8Array.from([load & 0xff, load >> 8, ...body]);
 }
+
+//   node tools/basic-accel/basic-tokenize.mjs LISTING.bas OUT.prg
+if (process.argv[1] === import.meta.filename) {
+  const [listing, out] = process.argv.slice(2);
+  if (!listing || !out) {
+    console.error('Usage: node tools/basic-accel/basic-tokenize.mjs LISTING.bas OUT.prg');
+    process.exit(2);
+  }
+  const fs = await import('node:fs');
+  fs.writeFileSync(out, tokenize(fs.readFileSync(listing, 'utf8')));
+}

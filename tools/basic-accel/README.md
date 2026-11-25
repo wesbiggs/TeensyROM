@@ -228,8 +228,12 @@ it up, in the port itself, and from taking it up to letting go. `$DEFF` reads `F
 To run it:
 
 1. Flash the TR+ with a build of this branch.
-2. Put `floathandoff` on SD or USB. The disk image built alongside it also has `fmultbench`
-   and `sineplot`, for native timings on the same machine.
+2. Build the programs and put them on SD or USB. `FloatHandoff.prg` and `FMultBench.prg` come
+   out of `npm run build:c64 -- --project FloatHandoff,FMultBench`, in each project's `build/`
+   folder. `node tools/basic-accel/basic-tokenize.mjs tools/basic-accel/SinePlot.bas SinePlot.prg`
+   makes the sine plot. The last two give native timings on the same machine. The sine plot
+   loops when it is done: RUN/STOP and RESTORE, then `PRINT PEEK(830)+256*PEEK(831)` gives its
+   time in jiffies.
 3. In the TR menu, set the Special IO to **Debug**, then launch `floathandoff`.
 
 It runs for about ten seconds with the screen blank, then shows:
