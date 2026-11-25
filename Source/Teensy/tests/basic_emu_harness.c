@@ -80,7 +80,7 @@ static void Banking(void)
    for (size_t i = 0; i < sizeof Modes / sizeof Modes[0]; i++)
    {
       Setup(0);
-      BasicEmu.Port = Modes[i].Port;
+      Cpu6502Write(1, Modes[i].Port);
       uint8_t A = Cpu6502Read(0xa000), D = Cpu6502Read(0xd000), E = Cpu6502Read(0xe000);
       char Got[4] = { A == 0x22 ? 'B' : A == 0x11 ? 'R' : '?', D == 0x55 ? 'C' : D == 0x66 ? 'R' : D == 0xb5 ? 'I' : '?',
                       E == 0x33 ? 'K' : E == 0x44 ? 'R' : '?', 0 };
@@ -98,7 +98,7 @@ static void Banking(void)
          BasicEmu.Ram[0xa000] == 0x99 && BasicEmu.Ram[0xe000] == 0x98 && BasicEmu.Ram[0xd020] == 0 && Bus.Writes == 1 &&
             Bus.Addr[0] == 0xd020 && Bus.Value[0] == 0x97,
          "a write landed in the wrong place");
-   BasicEmu.Port = 0x34;
+   Cpu6502Write(1, 0x34);
    Cpu6502Write(0xd020, 0x96);
    Check("with I/O banked out, $D000-$DFFF is RAM", BasicEmu.Ram[0xd020] == 0x96 && Bus.Writes == 1, "it went to the bus");
    Check("$01 reads its outputs and pulled-up inputs", Cpu6502Read(1) == 0x34 && Cpu6502Read(0) == 0x2f, "wrong port value");
@@ -155,7 +155,7 @@ static void Hooks(void)
    // BASIC banked out: $BA28 is RAM, and no hook runs
    Setup(1u << BasicEmuHook_FMult);
    BasicEmu.Ram[0xba28] = 0x60;
-   BasicEmu.Port = 0x36;
+   Cpu6502Write(1, 0x36);
    Cpu = Call(Code, sizeof Code);
    Check("no hook while BASIC is banked out", Cpu.PC == 0x1000 + sizeof Code && BasicEmu.HookCalls[BasicEmuHook_FMult] == 0,
          "the hook ran on RAM");
@@ -201,7 +201,7 @@ static void Flush(void)
 
    // RAM under I/O: DMA would reach the chip, not the RAM, so the byte stays dirty
    Setup(0);
-   BasicEmu.Port = 0x34;
+   Cpu6502Write(1, 0x34);
    Cpu6502Write(0xd020, 0x00);
    BasicEmu.IoLast[0xd00] = 0;     // bank 3, $C000
    BasicEmu.IoLast[0x018] = 0x04;  // characters at $D000

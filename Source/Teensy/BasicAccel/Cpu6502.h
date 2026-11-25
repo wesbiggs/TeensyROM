@@ -32,9 +32,11 @@
 #include <stdint.h>
 
 // Where the code goes. The firmware defines it as FLASHMEM: none of this runs on the PHI2 path.
+// The helpers are always inlined: one the compiler declined would land, on the Teensy, in ITCM.
 #ifndef CPU6502_FN
 #define CPU6502_FN
 #endif
+#define CPU6502_INLINE static inline __attribute__((always_inline))
 
 #define CPU6502_C 0x01
 #define CPU6502_Z 0x02
@@ -59,41 +61,41 @@ typedef enum {
    Cpu6502_Undefined,  // PC is on another undocumented opcode
 } Cpu6502Stop;
 
-static inline uint8_t Cpu6502Read(uint16_t Addr);
-static inline void Cpu6502Write(uint16_t Addr, uint8_t Value);
-static inline void Cpu6502Modify(uint16_t Addr, uint8_t Old, uint8_t New);
-static inline bool Cpu6502IrqLine(void);
-static inline bool Cpu6502TakeNmi(void);
+CPU6502_INLINE uint8_t Cpu6502Read(uint16_t Addr);
+CPU6502_INLINE void Cpu6502Write(uint16_t Addr, uint8_t Value);
+CPU6502_INLINE void Cpu6502Modify(uint16_t Addr, uint8_t Old, uint8_t New);
+CPU6502_INLINE bool Cpu6502IrqLine(void);
+CPU6502_INLINE bool Cpu6502TakeNmi(void);
 
 #define CPU6502_VECTOR_NMI   0xfffa
 #define CPU6502_VECTOR_RESET 0xfffc
 #define CPU6502_VECTOR_IRQ   0xfffe
 
-static inline uint16_t Cpu6502Read16(uint16_t Addr)
+CPU6502_INLINE uint16_t Cpu6502Read16(uint16_t Addr)
 {
    return Cpu6502Read(Addr) | Cpu6502Read((uint16_t)(Addr + 1)) << 8;
 }
 
-static inline void Cpu6502Reset(Cpu6502 *Cpu)
+CPU6502_INLINE void Cpu6502Reset(Cpu6502 *Cpu)
 {
    Cpu->S = 0xfd;
    Cpu->P = CPU6502_U | CPU6502_I;
    Cpu->PC = Cpu6502Read16(CPU6502_VECTOR_RESET);
 }
 
-static inline void Cpu6502Push(Cpu6502 *R, uint8_t Value)
+CPU6502_INLINE void Cpu6502Push(Cpu6502 *R, uint8_t Value)
 {
    Cpu6502Write(0x100 | R->S, Value);
    R->S--;
 }
 
-static inline uint8_t Cpu6502Pull(Cpu6502 *R)
+CPU6502_INLINE uint8_t Cpu6502Pull(Cpu6502 *R)
 {
    R->S++;
    return Cpu6502Read(0x100 | R->S);
 }
 
-static inline void Cpu6502Interrupt(Cpu6502 *R, uint16_t Vector, uint8_t Break)
+CPU6502_INLINE void Cpu6502Interrupt(Cpu6502 *R, uint16_t Vector, uint8_t Break)
 {
    Cpu6502Push(R, R->PC >> 8);
    Cpu6502Push(R, (uint8_t)R->PC);
@@ -104,25 +106,25 @@ static inline void Cpu6502Interrupt(Cpu6502 *R, uint16_t Vector, uint8_t Break)
 }
 
 // RTS, for a caller that answered a routine itself: return to whoever called it
-static inline void Cpu6502Rts(Cpu6502 *R)
+CPU6502_INLINE void Cpu6502Rts(Cpu6502 *R)
 {
    uint16_t Lo = Cpu6502Pull(R);
    R->PC = (uint16_t)((Lo | Cpu6502Pull(R) << 8) + 1);
    R->Cycles += 6;
 }
 
-static inline uint8_t Cpu6502NZ(Cpu6502 *R, uint8_t V)
+CPU6502_INLINE uint8_t Cpu6502NZ(Cpu6502 *R, uint8_t V)
 {
    R->P = (R->P & ~(CPU6502_N | CPU6502_Z)) | (V & CPU6502_N) | (V ? 0 : CPU6502_Z);
    return V;
 }
 
-static inline void Cpu6502Adc(Cpu6502 *R, uint8_t V);
-static inline void Cpu6502Sbc(Cpu6502 *R, uint8_t V);
+CPU6502_INLINE void Cpu6502Adc(Cpu6502 *R, uint8_t V);
+CPU6502_INLINE void Cpu6502Sbc(Cpu6502 *R, uint8_t V);
 
 // One instruction, with PC already past the opcode. Inlined into its two callers so that R, a
 // local copy, stays in registers: the bus writes through uint8_t, which may alias anything.
-static inline __attribute__((always_inline)) Cpu6502Stop Cpu6502Op(Cpu6502 *R, uint8_t Op)
+CPU6502_INLINE Cpu6502Stop Cpu6502Op(Cpu6502 *R, uint8_t Op)
 {
    uint16_t Ea = 0;
    uint8_t V, T;
@@ -318,7 +320,7 @@ static inline __attribute__((always_inline)) Cpu6502Stop Cpu6502Op(Cpu6502 *R, u
 }
 
 // https://www.6502.org/tutorials/decimal_mode.html appendix A, the NMOS flags
-static inline void Cpu6502Adc(Cpu6502 *R, uint8_t V)
+CPU6502_INLINE void Cpu6502Adc(Cpu6502 *R, uint8_t V)
 {
    unsigned Carry = R->P & CPU6502_C;
    unsigned Binary = R->A + V + Carry;
@@ -343,7 +345,7 @@ static inline void Cpu6502Adc(Cpu6502 *R, uint8_t V)
    R->A = (uint8_t)Total;
 }
 
-static inline void Cpu6502Sbc(Cpu6502 *R, uint8_t V)
+CPU6502_INLINE void Cpu6502Sbc(Cpu6502 *R, uint8_t V)
 {
    int Borrow = 1 - (R->P & CPU6502_C);
    int Binary = R->A - V - Borrow;
@@ -364,9 +366,11 @@ static inline void Cpu6502Sbc(Cpu6502 *R, uint8_t V)
    R->A = (uint8_t)Difference;
 }
 
+// Run and Exec each hold their own copy of the instruction switch, not inlined into their
+// callers, so the loop that runs nearly everything is one function the cache can hold.
 // Runs until Cycles reaches Until or a JAM or undefined opcode, taking an NMI or IRQ between
 // instructions. On a stop other than the budget, PC is on the opcode that stopped it.
-static CPU6502_FN __attribute__((unused)) Cpu6502Stop Cpu6502Run(Cpu6502 *Cpu, uint64_t Until)
+static CPU6502_FN __attribute__((unused, noinline)) Cpu6502Stop Cpu6502Run(Cpu6502 *Cpu, uint64_t Until)
 {
    Cpu6502 R = *Cpu;
    Cpu6502Stop Stop = Cpu6502_Budget;
@@ -388,7 +392,7 @@ static CPU6502_FN __attribute__((unused)) Cpu6502Stop Cpu6502Run(Cpu6502 *Cpu, u
 
 // Runs one instruction whose opcode is Op rather than the byte at PC, which a caller uses to run
 // the instruction it patched over with a JAM. PC is on the patched byte, and moves past it.
-static CPU6502_FN __attribute__((unused)) Cpu6502Stop Cpu6502Exec(Cpu6502 *Cpu, uint8_t Op)
+static CPU6502_FN __attribute__((unused, noinline)) Cpu6502Stop Cpu6502Exec(Cpu6502 *Cpu, uint8_t Op)
 {
    Cpu6502 R = *Cpu;
    R.PC++;

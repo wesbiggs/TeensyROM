@@ -32,16 +32,17 @@
 #include "CbmFloat.h"
 #include "Cpu6502.h"
 
-// Where the code and the 92 KB of state go: FLASHMEM and DMAMEM (RAM2) on the board
+// Where the code and the tables go: FLASHMEM and PROGMEM on the board. The 92 KB of state is a
+// static, or with BASIC_EMU_ON_HEAP defined, wherever the includer points BasicEmuHeap.
 #ifndef BASIC_EMU_FN
 #define BASIC_EMU_FN
 #endif
-#ifndef BASIC_EMU_DATA
-#define BASIC_EMU_DATA
+#ifndef BASIC_EMU_CONST
+#define BASIC_EMU_CONST
 #endif
 
-static inline uint8_t BasicEmuBusRead(uint16_t Addr);
-static inline void BasicEmuBusWrite(uint16_t Addr, uint8_t Value);
+CPU6502_INLINE uint8_t BasicEmuBusRead(uint16_t Addr);
+CPU6502_INLINE void BasicEmuBusWrite(uint16_t Addr, uint8_t Value);
 
 typedef enum {
    BasicEmuHook_FAddT, BasicEmuHook_FSubT, BasicEmuHook_FMultT, BasicEmuHook_FDivT,
@@ -51,92 +52,122 @@ typedef enum {
 } BasicEmuHookId;
 
 // the entries tools/basic-accel/float-cases.mjs ROUTINES names
-static const uint16_t BasicEmuHookAddr[BasicEmuHook_Count] = {
+static const uint16_t BasicEmuHookAddr[BasicEmuHook_Count] BASIC_EMU_CONST = {
    0xb86a, 0xb853, 0xba2b, 0xbb12, 0xb867, 0xb850, 0xba28, 0xbb0f, 0xbcf3, 0xbc9b, 0xb1bf,
 };
 
 typedef struct {
-   uint8_t Ram[0x10000];
+   const uint8_t *ReadMap[256];  // each page as a read sees it, by the port; NULL where it is I/O
+   uint8_t Ram[0x10000];         // $00 and $01 hold what the port reads, for ReadMap
    uint8_t Basic[0x2000], Kernal[0x2000], Chargen[0x1000];
    uint8_t Dirty[0x10000 / 8];
    uint8_t IoLast[0x1000];  // the last value the 6502 wrote to each I/O address
    uint8_t Ddr, Port;       // the 6510's $00 and $01
    uint8_t Original[BasicEmuHook_Count];  // the ROM byte each JAM replaced
    uint32_t HookCalls[BasicEmuHook_Count], HookNative[BasicEmuHook_Count];
+   CbmCpu Cbm;  // a hook's registers and zero page
 } BasicEmuState;
 
-BASIC_EMU_DATA static BasicEmuState BasicEmu;
+#ifdef BASIC_EMU_ON_HEAP
+static BasicEmuState *BasicEmuHeap;
+#define BasicEmu (*BasicEmuHeap)
+#else
+static BasicEmuState BasicEmu;
+#endif
 
 // The port's lines as the PLA sees them: an input bit is pulled up
-static inline uint8_t BasicEmuLines(void) { return (uint8_t)((BasicEmu.Port & BasicEmu.Ddr) | ~BasicEmu.Ddr); }
-static inline bool BasicEmuIoVisible(uint8_t L) { return (L & 3) && (L & 4); }
+CPU6502_INLINE uint8_t BasicEmuLines(void) { return (uint8_t)((BasicEmu.Port & BasicEmu.Ddr) | ~BasicEmu.Ddr); }
+CPU6502_INLINE bool BasicEmuIoVisible(uint8_t L) { return (L & 3) && (L & 4); }
 
-static inline void BasicEmuMarkDirty(uint16_t Addr) { BasicEmu.Dirty[Addr >> 3] |= (uint8_t)(1 << (Addr & 7)); }
+CPU6502_INLINE void BasicEmuMarkDirty(uint16_t Addr) { BasicEmu.Dirty[Addr >> 3] |= (uint8_t)(1 << (Addr & 7)); }
 
-// A read without side effects, for the hooks' operands: false where it would reach I/O
-static inline bool BasicEmuPeek(uint16_t Addr, uint8_t *Value)
+// ReadMap and $00/$01 from the port, after a write to either
+static BASIC_EMU_FN void BasicEmuRemap(void)
 {
    uint8_t L = BasicEmuLines();
-   if (Addr >= 0xa000 && Addr < 0xc000 && (L & 3) == 3) *Value = BasicEmu.Basic[Addr - 0xa000];
-   else if (Addr >= 0xe000 && (L & 2)) *Value = BasicEmu.Kernal[Addr - 0xe000];
-   else if (Addr >= 0xd000 && Addr < 0xe000 && (L & 3))
+   for (int Page = 0; Page < 256; Page++)
    {
-      if (L & 4) return false;
-      *Value = BasicEmu.Chargen[Addr - 0xd000];
+      const uint8_t *At = &BasicEmu.Ram[Page << 8];
+      if (Page >= 0xa0 && Page < 0xc0 && (L & 3) == 3) At = &BasicEmu.Basic[(Page - 0xa0) << 8];
+      else if (Page >= 0xe0 && (L & 2)) At = &BasicEmu.Kernal[(Page - 0xe0) << 8];
+      else if (Page >= 0xd0 && Page < 0xe0 && (L & 3)) At = (L & 4) ? NULL : &BasicEmu.Chargen[(Page - 0xd0) << 8];
+      BasicEmu.ReadMap[Page] = At;
    }
-   else if (Addr < 2) *Value = Addr ? (uint8_t)((BasicEmu.Port & BasicEmu.Ddr) | (~BasicEmu.Ddr & 0x17)) : BasicEmu.Ddr;
-   else *Value = BasicEmu.Ram[Addr];
+   BasicEmu.Ram[0] = BasicEmu.Ddr;
+   BasicEmu.Ram[1] = (uint8_t)((BasicEmu.Port & BasicEmu.Ddr) | (~BasicEmu.Ddr & 0x17));
+}
+
+// A read without side effects, for the hooks' operands: false where it would reach I/O
+CPU6502_INLINE bool BasicEmuPeek(uint16_t Addr, uint8_t *Value)
+{
+   const uint8_t *Page = BasicEmu.ReadMap[Addr >> 8];
+   if (!Page) return false;
+   *Value = Page[Addr & 0xff];
    return true;
 }
 
-static inline uint8_t Cpu6502Read(uint16_t Addr)
+CPU6502_INLINE uint8_t Cpu6502Read(uint16_t Addr)
 {
-   // RAM below BASIC is most reads: the program, its variables, zero page and the stack
-   if (Addr < 0xa000 && Addr >= 2) return BasicEmu.Ram[Addr];
-   uint8_t Value;
-   if (BasicEmuPeek(Addr, &Value)) return Value;
+   const uint8_t *Page = BasicEmu.ReadMap[Addr >> 8];
+   if (Page) return Page[Addr & 0xff];
    return BasicEmuBusRead(Addr);
 }
 
-static inline void Cpu6502Write(uint16_t Addr, uint8_t Value)
+// Writes to the port, and to $D000-$DFFF, which is I/O or RAM by the port
+static BASIC_EMU_FN __attribute__((noinline)) void BasicEmuWriteSlow(uint16_t Addr, uint8_t Value)
 {
-   if (Addr >= 0xd000 && Addr < 0xe000 && BasicEmuIoVisible(BasicEmuLines()))
-   {
-      BasicEmu.IoLast[Addr - 0xd000] = Value;
-      BasicEmuBusWrite(Addr, Value);
-      return;
-   }
    if (Addr < 2)
    {
       if (Addr) BasicEmu.Port = Value;
       else BasicEmu.Ddr = Value;
+      BasicEmuRemap();
+      return;
+   }
+   if (!BasicEmu.ReadMap[Addr >> 8])
+   {
+      BasicEmu.IoLast[Addr - 0xd000] = Value;
+      BasicEmuBusWrite(Addr, Value);
       return;
    }
    BasicEmu.Ram[Addr] = Value;
    BasicEmuMarkDirty(Addr);
 }
 
-static inline void Cpu6502Modify(uint16_t Addr, uint8_t Old, uint8_t New)
+CPU6502_INLINE void Cpu6502Write(uint16_t Addr, uint8_t Value)
 {
-   if (Addr >= 0xd000 && Addr < 0xe000 && BasicEmuIoVisible(BasicEmuLines())) BasicEmuBusWrite(Addr, Old);
+   if (Addr >= 2 && (uint16_t)(Addr - 0xd000) >= 0x1000)
+   {
+      BasicEmu.Ram[Addr] = Value;
+      BasicEmuMarkDirty(Addr);
+   }
+   else BasicEmuWriteSlow(Addr, Value);
+}
+
+CPU6502_INLINE void Cpu6502Modify(uint16_t Addr, uint8_t Old, uint8_t New)
+{
+   if ((uint16_t)(Addr - 0xd000) < 0x1000 && !BasicEmu.ReadMap[Addr >> 8]) BasicEmuBusWrite(Addr, Old);
    Cpu6502Write(Addr, New);
 }
 
-// Ram, Basic, Kernal and Chargen as the C64 holds them; Hooks is a mask of 1 << BasicEmuHookId
+// Ram, Basic, Kernal and Chargen as the C64 holds them, Ram and Chargen NULL for zeros; Hooks is
+// a mask of 1 << BasicEmuHookId
 static BASIC_EMU_FN __attribute__((unused)) void BasicEmuInit(const uint8_t Ram[0x10000], const uint8_t Basic[0x2000],
                                                              const uint8_t Kernal[0x2000], const uint8_t Chargen[0x1000],
                                                              uint32_t Hooks)
 {
-   memcpy(BasicEmu.Ram, Ram, sizeof BasicEmu.Ram);
+   if (Ram) memcpy(BasicEmu.Ram, Ram, sizeof BasicEmu.Ram);
+   else memset(BasicEmu.Ram, 0, sizeof BasicEmu.Ram);
    memcpy(BasicEmu.Basic, Basic, sizeof BasicEmu.Basic);
    memcpy(BasicEmu.Kernal, Kernal, sizeof BasicEmu.Kernal);
-   memcpy(BasicEmu.Chargen, Chargen, sizeof BasicEmu.Chargen);
+   if (Chargen) memcpy(BasicEmu.Chargen, Chargen, sizeof BasicEmu.Chargen);
+   else memset(BasicEmu.Chargen, 0, sizeof BasicEmu.Chargen);
    memset(BasicEmu.Dirty, 0, sizeof BasicEmu.Dirty);
    memset(BasicEmu.IoLast, 0, sizeof BasicEmu.IoLast);
    memset(BasicEmu.HookCalls, 0, sizeof BasicEmu.HookCalls);
    memset(BasicEmu.HookNative, 0, sizeof BasicEmu.HookNative);
    BasicEmu.Ddr = 0x2f;
    BasicEmu.Port = 0x37;
+   BasicEmuRemap();
    for (int i = 0; i < BasicEmuHook_Count; i++)
    {
       uint8_t *At = &BasicEmu.Basic[BasicEmuHookAddr[i] - 0xa000];
@@ -146,7 +177,7 @@ static BASIC_EMU_FN __attribute__((unused)) void BasicEmuInit(const uint8_t Ram[
 }
 
 // The hooks' registers and zero page in and out
-static inline void BasicEmuToCbm(const Cpu6502 *Cpu, CbmCpu *C)
+static BASIC_EMU_FN void BasicEmuToCbm(const Cpu6502 *Cpu, CbmCpu *C)
 {
    memcpy(C->Zp, BasicEmu.Ram, 256);
    C->A = Cpu->A;
@@ -156,7 +187,7 @@ static inline void BasicEmuToCbm(const Cpu6502 *Cpu, CbmCpu *C)
    C->Set = 0;
 }
 
-static inline void BasicEmuFromCbm(Cpu6502 *Cpu, const CbmCpu *C)
+static BASIC_EMU_FN void BasicEmuFromCbm(Cpu6502 *Cpu, const CbmCpu *C)
 {
    for (int i = 2; i < 256; i++)
       if (BasicEmu.Ram[i] != C->Zp[i])
@@ -172,7 +203,7 @@ static inline void BasicEmuFromCbm(Cpu6502 *Cpu, const CbmCpu *C)
 }
 
 // FIN's text: from TXTPTR up to whatever stops a side-effect-free read, at most 255 bytes
-static inline unsigned BasicEmuText(uint16_t From, uint8_t Text[255])
+static BASIC_EMU_FN unsigned BasicEmuText(uint16_t From, uint8_t Text[255])
 {
    unsigned Len = 0;
    while (Len < 255 && BasicEmuPeek((uint16_t)(From + Len), &Text[Len])) Len++;
@@ -187,8 +218,8 @@ static BASIC_EMU_FN bool BasicEmuHook(Cpu6502 *Cpu)
    while (Id < BasicEmuHook_Count && BasicEmuHookAddr[Id] != Cpu->PC) Id++;
    if (Id >= BasicEmuHook_Count || BasicEmu.Basic[Cpu->PC - 0xa000] != 0x02) return false;
 
-   static CbmCpu C;
-   BasicEmuToCbm(Cpu, &C);
+   CbmCpu *C = &BasicEmu.Cbm;
+   BasicEmuToCbm(Cpu, C);
    CbmFloatResult Result = CbmFloat_Native;
    uint8_t Operand[5];
    uint16_t At = (uint16_t)(Cpu->A | Cpu->Y << 8);
@@ -197,28 +228,28 @@ static BASIC_EMU_FN bool BasicEmuHook(Cpu6502 *Cpu)
       for (int i = 0; i < 5; i++) OperandOk &= BasicEmuPeek((uint16_t)(At + i), &Operand[i]);
    switch (Id)
    {
-      case BasicEmuHook_FAddT: Result = CbmFAddT(&C); break;
-      case BasicEmuHook_FSubT: Result = CbmFSubT(&C); break;
-      case BasicEmuHook_FMultT: Result = CbmFMultT(&C); break;
-      case BasicEmuHook_FDivT: Result = CbmFDivT(&C); break;
-      case BasicEmuHook_FAdd: if (OperandOk) Result = CbmFAdd(&C, Operand); break;
-      case BasicEmuHook_FSub: if (OperandOk) Result = CbmFSub(&C, Operand); break;
-      case BasicEmuHook_FMult: if (OperandOk) Result = CbmFMult(&C, Operand); break;
-      case BasicEmuHook_FDiv: if (OperandOk) Result = CbmFDiv(&C, Operand); break;
+      case BasicEmuHook_FAddT: Result = CbmFAddT(C); break;
+      case BasicEmuHook_FSubT: Result = CbmFSubT(C); break;
+      case BasicEmuHook_FMultT: Result = CbmFMultT(C); break;
+      case BasicEmuHook_FDivT: Result = CbmFDivT(C); break;
+      case BasicEmuHook_FAdd: if (OperandOk) Result = CbmFAdd(C, Operand); break;
+      case BasicEmuHook_FSub: if (OperandOk) Result = CbmFSub(C, Operand); break;
+      case BasicEmuHook_FMult: if (OperandOk) Result = CbmFMult(C, Operand); break;
+      case BasicEmuHook_FDiv: if (OperandOk) Result = CbmFDiv(C, Operand); break;
       case BasicEmuHook_Fin:
       {
          uint8_t Bytes[255];
          CbmText Text = { Bytes, BasicEmuText((uint16_t)(BasicEmu.Ram[0x7a] | BasicEmu.Ram[0x7b] << 8), Bytes), 0 };
-         Result = CbmFin(&C, &Text);
+         Result = CbmFin(C, &Text);
          break;
       }
-      case BasicEmuHook_Qint: Result = CbmQint(&C); break;
-      case BasicEmuHook_Ayint: Result = CbmAyint(&C); break;
+      case BasicEmuHook_Qint: Result = CbmQint(C); break;
+      case BasicEmuHook_Ayint: Result = CbmAyint(C); break;
    }
    BasicEmu.HookCalls[Id]++;
    if (Result == CbmFloat_Done)
    {
-      BasicEmuFromCbm(Cpu, &C);
+      BasicEmuFromCbm(Cpu, C);
       Cpu6502Rts(Cpu);
       return true;
    }
@@ -241,7 +272,7 @@ static BASIC_EMU_FN __attribute__((unused)) Cpu6502Stop BasicEmuRun(Cpu6502 *Cpu
 // Writes the dirty bytes in Addr..Addr+Len-1 to the C64 and clears them; returns how many.
 // RAM under I/O stays dirty: the held 6510's port maps I/O there, so DMA would write the chip.
 // Only giving the 6510 back, with its port set to RAM, reaches it.
-static inline unsigned BasicEmuFlushRange(uint32_t Addr, uint32_t Len)
+static BASIC_EMU_FN unsigned BasicEmuFlushRange(uint32_t Addr, uint32_t Len)
 {
    unsigned Count = 0;
    for (uint32_t End = Addr + Len; Addr < End && Addr < 0x10000;)
@@ -270,7 +301,7 @@ static inline unsigned BasicEmuFlushRange(uint32_t Addr, uint32_t Len)
 }
 
 // The VIC sees RAM in its 16K bank, except the character ROM at $1000-$1FFF of banks 0 and 2
-static inline unsigned BasicEmuFlushVic(uint32_t Bank, uint32_t Offset, uint32_t Len)
+static BASIC_EMU_FN unsigned BasicEmuFlushVic(uint32_t Bank, uint32_t Offset, uint32_t Len)
 {
    uint32_t End = Offset + Len;
    if ((Bank != 0 && Bank != 0x8000) || End <= 0x1000 || Offset >= 0x2000) return BasicEmuFlushRange(Bank + Offset, Len);
