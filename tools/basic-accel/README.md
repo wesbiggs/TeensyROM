@@ -250,6 +250,37 @@ about 15–25 cycles, are not included.
 handler, so its logic is checked off the board. On a TR, the held commands report that
 there is no DMA.
 
+### Results on hardware
+
+TR+, NTSC C128 in C64 mode, main image built from 901f006. Native runs had no Special IO;
+the hand-off test ran with Debug.
+
+Native, against the PAL model and VICE scaled to NTSC's clock and badlines:
+
+| | Measured | Expected | |
+|---|---|---|---|
+| SinePlot | 2244 jiffies (37.4 s) | about 2234 | +0.4% |
+| FMULT, per call (FMultBench) | 2049 cycles | about 2042 | +0.3% |
+| FMultBench sum | `$EECA` | `$EECA`, on the ROMs in `mos6502.mjs` | same |
+
+The hand-off test, 256 runs each, no answer different from the ROM's:
+
+| | ROM | TR+ | TR side |
+|---|---|---|---|
+| Ping, polled | | 14 cycles | |
+| Ping, held | | 8 cycles | taken up about 1.1 µs after the `$DEF0` write |
+| FADDT | 354 | 95 | port 2.6 µs |
+| FSUBT | 379 | 95 | port 2.2 µs |
+| FMULTT | 1825 | 109 | port 1.1 µs |
+| FDIVT | 2412 | 123 | port 14.6 µs |
+| QINT | 432 | 95 | port 2.3 µs |
+| AYINT | 443 | 95 | port 2.4 µs |
+
+The test's third TR time reads 65535 for every routine. It is in nS, 16 bits, and the whole
+job takes longer than 65.5 µs; the TR+ column gives it in C64 cycles. Most of a call is the
+DMA: the zero page in, the changed span back, about a cycle a byte plus a few cycles a
+transfer. The model's `tr-plus` cost (116-147 cycles a call) was a little pessimistic.
+
 ## Running the ROM on the Teensy
 
 The hooks above leave two costs they cannot remove. Every hooked call pays a hand-off, 30% of
