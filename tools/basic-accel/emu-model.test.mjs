@@ -4,12 +4,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
 
 import { commandExists } from '../lib/toolchain.mjs';
 import { crunch, tokenize } from './basic-tokenize.mjs';
 import { findRoms, prepare, SINE_PLOT, ALL_HOOKS } from './emu-model.mjs';
 
 const bytes = (text) => [...text].map((c) => c.charCodeAt(0));
+const ROOT = path.resolve(import.meta.dirname, '../..');
 
 test('crunch tokenizes keywords outside strings, REM and DATA, as the ROM does', () => {
   assert.deepEqual(crunch('poke 53265,peek(53265)or32'),
@@ -51,5 +53,23 @@ test('the jiffy clock keeps the C64\'s time at every speed', { skip }, () => {
     const r = run(options);
     // a jiffy either side for where RUN and the end fall in the period
     assert.ok(Math.abs(r.runJiffies - r.runCycles / 16422) <= 1.5, `${JSON.stringify(options)}: ${r.runJiffies} jiffies in ${r.runCycles} cycles`);
+  }
+});
+
+test("the firmware's copy of SinePlot is SinePlot.bas tokenized", () => {
+  const header = fs.readFileSync(path.join(ROOT, 'Source/Teensy/BasicAccel/SinePlotPrg.h'), 'utf8');
+  const embedded = [...header.matchAll(/0x([0-9a-f]{2})/g)].map((m) => parseInt(m[1], 16));
+  assert.deepEqual(embedded, [...tokenize(fs.readFileSync(SINE_PLOT, 'utf8'))],
+    'regenerate it: node tools/basic-accel/basic-tokenize.mjs tools/basic-accel/SinePlot.bas SinePlot.prg, then ' +
+    'node tools/bin2header.mjs -t PROGMEM -n SinePlotPrg -o Source/Teensy/BasicAccel/SinePlotPrg.h SinePlot.prg');
+});
+
+test("EmuBench expects the bitmap the model draws with the TR+ benchmark's options", { skip }, () => {
+  const source = fs.readFileSync(path.join(ROOT, 'Source/C64/EmuBench/source/EmuBench.asm'), 'utf8');
+  const expected = parseInt(/^Expected = \$([0-9a-f]{8})/m.exec(source)[1], 16);
+  const run = prepare(roms, fs.readFileSync(SINE_PLOT, 'utf8'));
+  for (const hooks of [0, ALL_HOOKS]) {
+    const r = run({ speed: 1, read: 0, write: 0, hook: 0, hooks });
+    assert.equal(r.bitmap, expected, `hooks ${hooks}`);
   }
 });

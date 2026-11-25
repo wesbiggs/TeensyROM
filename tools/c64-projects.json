@@ -189,6 +189,15 @@
       "headers": []
     },
     {
+      "name": "EmuBench",
+      "description": "Times, on hardware, the TR+ running BASIC on the Teensy in BasicAccel/BasicEmu.h, through IOH_Debug's emulator benchmark. Run with the Special IO set to Debug. Not embedded in the firmware, so it has no header.",
+      "dir": "Source/C64/EmuBench",
+      "steps": [
+        { "assembler": "acme", "source": "source/EmuBench.asm", "output": "EmuBench.prg", "format": "cbm", "labels": "EmuBench.labels" }
+      ],
+      "headers": []
+    },
+    {
       "name": "FloatHandoff",
       "description": "Times, on hardware, the TR+ answering BASIC float routines through IOH_Debug's float hand-off test, and checks its results against the ROM. Run with the Special IO set to Debug. Not embedded in the firmware, so it has no header.",
       "dir": "Source/C64/FloatHandoff",
