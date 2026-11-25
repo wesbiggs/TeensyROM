@@ -284,6 +284,16 @@ static FLASHMEM void FTPut16(uint8_t Reg, uint32_t Cycles)
 static const uint8_t FTSpanFirst[2] PROGMEM = { 0x22, 0x56 };
 static const uint8_t FTSpanLen[2] PROGMEM = { 9, 27 };
 
+// The C64 is already held when this runs: DMA_S_StartImmediate asserted on the read cycle after
+// its write to $DEF0. PerformDMA would start over with the safe freeze, which waits for a write
+// then a read the held 6510 never makes, and so sits out DMA_TIMEOUT_CYCLES (5 mS) per span.
+static FLASHMEM bool FTTransfer(DMA_Trans_RnW RnW, uint8_t First, uint8_t *Buffer, uint8_t Len)
+{
+   SetUpDMA(RnW, First, Buffer, Len, DMA_ADDR_INCREMENT);
+   DMA_State = DMA_S_TransferReady;
+   return FinishDMA();
+}
+
 static FLASHMEM uint8_t FTRunRoutine(uint32_t *ComputeCyc)
 {
    uint8_t Routine = FTRegs[FTReg_Routine - FTReg_First];
@@ -293,7 +303,7 @@ static FLASHMEM uint8_t FTRunRoutine(uint32_t *ComputeCyc)
    uint8_t Before[256];
    memset(&Cpu, 0, sizeof Cpu);
    for (int i = 0; i < 2; i++)
-      if (!PerformDMA(DMA_READ, FTSpanFirst[i], &Cpu.Zp[FTSpanFirst[i]], FTSpanLen[i], DMA_ADDR_INCREMENT)) return FTSt_DMAFailed;
+      if (!FTTransfer(DMA_READ, FTSpanFirst[i], &Cpu.Zp[FTSpanFirst[i]], FTSpanLen[i])) return FTSt_DMAFailed;
    memcpy(Before, Cpu.Zp, sizeof Before);
 
    // The caller leaves A = $61 with N/Z from it, as at the ROM entries
@@ -307,7 +317,7 @@ static FLASHMEM uint8_t FTRunRoutine(uint32_t *ComputeCyc)
 
    for (int i = 0; i < 2; i++)
       if (memcmp(&Cpu.Zp[FTSpanFirst[i]], &Before[FTSpanFirst[i]], FTSpanLen[i]) &&
-          !PerformDMA(DMA_WRITE, FTSpanFirst[i], &Cpu.Zp[FTSpanFirst[i]], FTSpanLen[i], DMA_ADDR_INCREMENT)) return FTSt_DMAFailed;
+          !FTTransfer(DMA_WRITE, FTSpanFirst[i], &Cpu.Zp[FTSpanFirst[i]], FTSpanLen[i])) return FTSt_DMAFailed;
 
    uint8_t *Out = (uint8_t *)&FTRegs[FTReg_A - FTReg_First];
    Out[0] = Cpu.A; Out[1] = Cpu.X; Out[2] = Cpu.Y; Out[3] = Cpu.P;
