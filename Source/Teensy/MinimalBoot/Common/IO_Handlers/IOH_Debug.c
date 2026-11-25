@@ -287,16 +287,117 @@ static const uint8_t FTSpanLen[2] PROGMEM = { 9, 27 };
 // The C64 is already held when this runs: DMA_S_StartImmediate asserted on the read cycle after
 // its write to $DEF0. PerformDMA would start over with the safe freeze, which waits for a write
 // then a read the held 6510 never makes, and so sits out DMA_TIMEOUT_CYCLES (5 mS) per span.
-static FLASHMEM bool FTTransfer(DMA_Trans_RnW RnW, uint8_t First, uint8_t *Buffer, uint8_t Len)
+static FLASHMEM bool FTTransfer(DMA_Trans_RnW RnW, uint16_t First, uint8_t *Buffer, uint32_t Len)
 {
    SetUpDMA(RnW, First, Buffer, Len, DMA_ADDR_INCREMENT);
    DMA_State = DMA_S_TransferReady;
    return FinishDMA();
 }
 
+// The emulator benchmark: $DEF1 = 6 (no hooks) or 7 (every float hook), then command 3. With the
+// C64 held, it reads the C64's BASIC and KERNAL ROMs by DMA, boots them in BasicAccel/EmuBench.h,
+// runs SinePlot.bas there to the end, and writes what it took to $C000 + 32 x (routine - 6)
+// (FTBench below). It is the work tools/basic-accel/emu_model.c does with --speed 1 --read 0
+// --write 0 --hook 0, so the two compare directly. The C64 stays held for the whole run, a few
+// seconds, and loop() with it: USB, TCP and the rest wait. The ~96 KB of state is on the heap
+// (RAM2) for the run only.
+#define BASIC_EMU_ON_HEAP
+#define CPU6502_FN       FLASHMEM
+#define BASIC_EMU_FN     FLASHMEM
+#define BASIC_EMU_CONST  PROGMEM
+#define EMU_BENCH_FN     FLASHMEM
+#include "../../../BasicAccel/EmuBench.h"
+#include "../../../BasicAccel/SinePlotPrg.h"
+
+#define FTBenchRoutine  6        // and 7, with the hooks
+#define FTBenchResults  0xc000
+#define FTBenchMaxNs    60000000000ull
+
+enum FTBenchStatuses { FTBench_Done, FTBench_TimeLimit, FTBench_Stopped, FTBench_NoMemory };
+
+// What the C64 reads at FTBenchResults, 32 bytes a run
+struct FTBench
+{
+   uint8_t Status, Pad;
+   uint16_t ElapsedmS;
+   uint16_t Speed;           // emulated 6502 cycles per uS, whole part...
+   uint8_t SpeedHundredths;  // ...and hundredths: the speed against a 1 MHz 6502
+   uint8_t MipsHundredths;
+   uint16_t Mips;            // emulated instructions per uS
+   uint16_t HookCalls;       // to 65535
+   uint32_t Bitmap;          // EmuBenchChecksum of $2000-$3F3F
+   uint16_t BasicSum, KernalSum;  // the ROMs read from the C64, summed
+   uint16_t StopPc;
+   uint8_t Pad2[10];
+};
+static_assert(sizeof(struct FTBench) == 32, "the C64 reads 32 bytes a run");
+
+// The DWT counter widened to 64 bits, kept on the heap with the rest of the run; EmuBenchRun
+// asks for it every slice, well inside a wrap
+CPU6502_INLINE uint64_t EmuBenchNowNs(void)
+{
+   uint32_t Now = ARM_DWT_CYCCNT;
+   EmuBenchC64.ClockTicks += (uint32_t)(Now - EmuBenchC64.ClockLast);
+   EmuBenchC64.ClockLast = Now;
+   return EmuBenchC64.ClockTicks * 1000 / (F_CPU_ACTUAL / 1000000);
+}
+
+static FLASHMEM uint16_t FTBenchSum(const uint8_t *Data, uint32_t Len)
+{
+   uint16_t Sum = 0;
+   while (Len--) Sum += *Data++;
+   return Sum;
+}
+
+static FLASHMEM uint8_t FTEmuBench(bool Hooks)
+{
+   struct FTBench Out;
+   memset(&Out, 0, sizeof Out);
+   uint8_t *Roms = (uint8_t *)malloc(0x4000);
+   BasicEmuHeap = (BasicEmuState *)malloc(sizeof(BasicEmuState));
+   EmuBenchHeap = (EmuBenchState *)malloc(sizeof(EmuBenchState));
+   uint8_t Status = FTSt_Done;
+   if (!Roms || !BasicEmuHeap || !EmuBenchHeap) Out.Status = FTBench_NoMemory;
+   else if (!FTTransfer(DMA_READ, 0xa000, Roms, 0x2000) || !FTTransfer(DMA_READ, 0xe000, Roms + 0x2000, 0x2000))
+      Status = FTSt_DMAFailed;
+   else
+   {
+      Out.BasicSum = FTBenchSum(Roms, 0x2000);
+      Out.KernalSum = FTBenchSum(Roms + 0x2000, 0x2000);
+      BasicEmuInit(NULL, Roms, Roms + 0x2000, NULL, Hooks ? (1u << BasicEmuHook_Count) - 1 : 0);
+      free(Roms);
+      Roms = NULL;
+
+      EmuBenchOptions Opt = { 1, 0, 0, 0, false, 1e12, FTBenchMaxNs };
+      EmuBenchResult R;
+      EmuBenchRun(SinePlotPrg, sizeof SinePlotPrg, &Opt, &R);
+      Out.Status = R.Status == EmuBench_Done ? FTBench_Done : R.Status == EmuBench_TimeLimit ? FTBench_TimeLimit : FTBench_Stopped;
+      Out.StopPc = R.StopPc;
+      uint64_t Ns = R.RunNs ? R.RunNs : 1;
+      uint64_t Ms = Ns / 1000000;
+      Out.ElapsedmS = Ms > 0xffff ? 0xffff : Ms;
+      uint64_t Speed = R.CpuCycles * 100000 / Ns, Mips = R.Instructions * 100000 / Ns;
+      Out.Speed = Speed / 100;
+      Out.SpeedHundredths = Speed % 100;
+      Out.Mips = Mips / 100;
+      Out.MipsHundredths = Mips % 100;
+      Out.HookCalls = R.HookCalls > 0xffff ? 0xffff : R.HookCalls;
+      Out.Bitmap = R.Bitmap;
+   }
+   free(Roms);
+   free(BasicEmuHeap);
+   free(EmuBenchHeap);
+   BasicEmuHeap = NULL;
+   EmuBenchHeap = NULL;
+   if (Status == FTSt_Done && !FTTransfer(DMA_WRITE, FTBenchResults + 32 * Hooks, (uint8_t *)&Out, sizeof Out))
+      Status = FTSt_DMAFailed;
+   return Status;
+}
+
 static FLASHMEM uint8_t FTRunRoutine(uint32_t *ComputeCyc)
 {
    uint8_t Routine = FTRegs[FTReg_Routine - FTReg_First];
+   if (Routine == FTBenchRoutine || Routine == FTBenchRoutine + 1) return FTEmuBench(Routine == FTBenchRoutine + 1);
    if (Routine >= sizeof FTRoutines / sizeof FTRoutines[0]) return FTSt_BadCommand;
 
    CbmCpu Cpu;
