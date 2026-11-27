@@ -1,0 +1,1875 @@
+// The TDrive Special IOs: the virtual IEC drive and its SD / USB glue. On the TeensyROM+ (Fab04_TDrive) "TDrive KERNAL" and its
+// combined handlers serve a replacement KERNAL; on both boards (TDrive_Agent) IOH_TDriveAgent.c reaches the same drive through the
+// KERNAL's RAM vectors and a 6502 agent (docs/DESIGN.md 53). The KERNAL-only parts are under Fab04_TDrive.
+// "TDrive" Special IO for TeensyROM+: replacement KERNAL + virtual IEC drive.
+//   unit 0 = SD card, unit 1 = USB drive. Device numbers are automatic by default: the first free numbers from 8 up
+//   (the KERNAL probes the real serial bus on the first disk access of a run, see tdrive_io.h), so 8 (SD) and 9 (USB) when
+//   no other drive is attached. A number can be fixed from BASIC with  OPEN15,8,15,"U0>"+CHR$(10):CLOSE15  (this drive becomes
+//   device 10, kept in EEPROM; CHR$(0) makes it automatic again). Each unit serves a mounted .d64 / .d71 / .d81 (or lists the host
+//   directory so one can be picked with  OPEN15,8,15,"CD:GAME.D64"  /  "CD:_" to unmount, or  LOAD"$/GAMES/GAME.D64",8).
+// Uses the KERNAL bus hook from IOH_KernalReplace.c with its own image (TD_KernalImage below: /TDrive/kernal.bin on the SD card, else
+// the C64's own KERNAL patched in memory; the <Shift-K> file stays the plain Kernal Replace's) and adds the IO1/IO2 mailbox the
+// patched KERNAL talks to.
+//
+// This file is included from IOHandlers.h like the other handlers (unity build, compiled as C++).
+
+// Optional bring-up aid: define TD_TRACE (e.g. at the top of this file) to log every mailbox command on the USB serial
+// port. Off by default: the print runs right after the answer is published, i.e. while the C64 is still reading ST / DATA,
+// and the USB serial interrupts then make the bus handler answer late (the C64 reads $00 / the previous bus byte).
+
+#include <strings.h>               // strcasecmp
+#define VD_COLD FLASHMEM          // everything except the bus-ISR register accessors lives in flash
+#include "../../../DiskImage/DiskImage.h"   // the D64/D71/D81 engine shared with GEOS, the TR block device and the menu
+#include "../../../DiskImage/WriteBack.h"   // when an image's writes are synced to the card (shared with the TR block device)
+#include "../tdrive/tdrive.c"
+#include "../tdrive/tdrive_io.c"
+
+void TDrive_PreStart(bool agent = false);   // called from KERNALPreStart(), see StatusFunctions.c; agent: for IOH_TDriveAgent
+uint8_t TDriveSwift_Remap(uint8_t ioh);   // IOH_TDriveSwift.c (IOH_TDriveAgent.c on the plain TR); used by KERNALPreStart() and IOHandlerSelectInit()
+void IO2Hndlr_TDrive(uint8_t Address, bool R_Wn);
+void TDrive_NoteLaunch();   // KERNALPreStart(), before anything there can free the menu's listing (below)
+
+#ifdef Fab04_TDrive
+#include "../tdrive/td_kpatch.h"   // TD_KernalPatch[]: patches/*.s as runs (tools/build.py --table)
+bool TD_KernalImage(uint8_t *img);   // KernalImageSource for InitHndlr_KERNALReplace_PreStart() (IOH_KernalReplace.c), set by KERNALPreStart()
+bool TDrive_ProbeStep();  // likewise, first: the menu's bus probe (below)
+void InitHndlr_TDrive();
+void PollingHndlr_TDrive();
+void IO1Hndlr_TDrive(uint8_t Address, bool R_Wn);
+
+stcIOHandlers IOHndlr_TDrive =
+{
+  "TDrive KERNAL",          //Name of handler (IOHNameLength max)
+  &InitHndlr_TDrive,        //Called once at handler startup
+  &IO1Hndlr_TDrive,         //IO1 R/W handler: mailbox registers
+  &IO2Hndlr_TDrive,         //IO2 R/W handler: 128-byte data window at $DF80
+  NULL,                     //ROML Read handler, in addition to any ROM data sent
+  NULL,                     //ROMH Read handler, in addition to any ROM data sent
+  &PollingHndlr_TDrive,     //Polled in main routine: does all file system work
+  NULL,                     //called at the end of EVERY c64 cycle
+};
+#endif
+
+// The TDrive Special IOs: the remote control and the listings while a program runs treat them all alike. TD_IsKernalHandler: the
+// ones that serve a KERNAL (PreStart loads it).
+#if defined(Fab04_TDrive) && defined(Fab04_REU)
+   #define TD_IsKernalHandler(h) ((h) == IOH_TDrive || (h) == IOH_TDriveSwift || (h) == IOH_TDriveSwiftREU || (h) == IOH_TDriveREU)
+#elif defined(Fab04_TDrive)
+   #define TD_IsKernalHandler(h) ((h) == IOH_TDrive || (h) == IOH_TDriveSwift)
+#else
+   #define TD_IsKernalHandler(h) false
+#endif
+#define TD_IsHandler(h) (TD_IsKernalHandler(h) || (h) == IOH_TDriveAgent)
+
+#define TD_MboxBase    0x10  // mailbox at $DE10-$DE1A: $DE00-$DE07 stays free for the SwiftLink ACIA (see IOH_TDriveSwift.c)
+#define TD_CwdLen      96
+#define TD_PathLen     (2 * TD_CwdLen + 4)   // folder + '/' + a host name (imgName: under TD_CwdLen characters)
+
+struct stcVDUnit
+{
+   FS      *fs;              // SD or USB file system
+   FsVolume *vol;            // the same file system's SdFat volume, for img
+   FsFile   img;             // mounted .d64: an FsFile, not an SD.h File, whose flush() discards whether the sync reached the card
+   File     dir;             // host directory being listed
+   File     plain;           // plain file being read with nothing mounted (LOAD"GAME.PRG")
+   d64_t    d;
+   uint8_t *errTab;          // the image's error table (malloc, RAM2) when it marks any sector bad; NULL = none
+   bool     mounted;
+   struct ImageWriteBack wb; // img's unsynced writes (DiskImage/WriteBack.h)
+   bool     quiet;           // temporary selection for a listing by path: leave the /.tdrive sidecar alone
+   char     imgName[TD_CwdLen];   // host (ASCII) name of the mounted image, in cwd (the C64 may have used its alias)
+   char     snapCwd[TD_CwdLen];   // folder / image selected before a listing by path (push / pop)
+   char     snapImg[TD_CwdLen];   // "" = nothing was mounted
+   char     cwd[TD_CwdLen];  // "" = root
+};
+
+// The drive state (~4.6 KB, see VIO_RAM_BUDGET in tests/test_vio.py) is a plain static (RAM1/DTCM, which has room), like every
+// other buffer here: never DMAMEM. RAM2's statics shrink the malloc heap the REU takes its banks from, and ours (~9.4 KB) left the
+// "512KB REU" at 63 banks, rounded down to 256 KB (REUTEST, 2026-11-09). Define TD_ALLOC_HEAP to take it from the heap instead.
+#ifndef TD_ALLOC_HEAP
+static vio_t vioStore;
+#endif
+// DMA LOAD (VIO_FLOAD_DMA, docs/DESIGN.md 49), SAVE and VERIFY (VIO_FSAVE_DMA, VIO_FVERIFY_OPEN, 51), only with Fab04_TDriveDMALoad
+// (Common_Defs.h; needs Fab04_FullDMACapable): one part of a file at a time, read here and then written into C64 RAM by DMA (or read
+// from C64 RAM by DMA, then saved or compared). 2 KB halts the CPU for about 2.5 ms per part (IRQs and NMIs wait that long); RAM1, like
+// the rest (see vioStore). Without the flag no DMA hook is set: the drive answers every LOAD part through the 128-byte window, SAVE goes
+// by window blocks and VERIFY the KERNAL's stock way, the same KERNAL included.
+#ifdef Fab04_TDriveDMALoad
+#ifndef TD_DmaPart
+#define TD_DmaPart 2048
+#endif
+static uint8_t tdDmaBuf[TD_DmaPart];
+#endif
+static vio_hot_t  vioHot;           // registers + window: the ONLY memory the bus ISR touches. Plain static = RAM1/DTCM, fast
+static vio_t     *vio = NULL;       // everything else (main loop only; vioStore, or the heap with TD_ALLOC_HEAP)
+static volatile bool vioReady = false;
+static uint32_t   lastActivityMs = 0;
+static void     (*tdDrivePoll)() = NULL;   // the running TDrive handler's drive poll (set by its init; the remote control's waits call it)
+static stcVDUnit  tdUnit[2];
+
+// ---- PETSCII <-> ASCII (names are uppercase on the C64 side) -------------------------------
+FLASHMEM static char TD_ToAscii(uint8_t c)
+{
+   if (c >= 0x41 && c <= 0x5a) return c + 0x20;   // unshifted PETSCII letters -> lower case
+   if (c >= 0xc1 && c <= 0xda) return c - 0x80;   // shifted -> upper case
+   return c;
+}
+FLASHMEM static uint8_t TD_ToPetscii(char c) { return (c >= 'a' && c <= 'z') ? c - 0x20 : c; }
+
+FLASHMEM static void TD_Squeeze(char *p)      // "//a///b" -> "/a/b" (the TR menu hands USB paths over with a doubled slash)
+{
+   char *w = p;
+   for (const char *r = p; *r; r++) if (!(*r == '/' && w > p && w[-1] == '/')) *w++ = *r;
+   *w = 0;
+}
+
+FLASHMEM static void TD_PathFor(stcVDUnit *u, const char *name, char *out, size_t cap)
+{
+   size_t n = snprintf(out, cap, "%s", u->cwd);
+   while (n > 0 && n < cap && out[n - 1] == '/') n--;                 // cwd "/" must not give "//name"
+   if (n + 1 < cap) out[n++] = '/';
+   for (; *name && n + 1 < cap; name++) out[n++] = TD_ToAscii((uint8_t)*name);
+   out[n] = 0;
+}
+
+FLASHMEM static void TD_HostPath(stcVDUnit *u, const char *host, char *out, size_t cap)   // host = ASCII name in cwd
+{
+   snprintf(out, cap, "%s/%s", u->cwd, host);
+}
+
+// ---- aliases: host names the C64 can't use as they are (over 16 characters, or characters it can't type) ------------------
+// td_alias() (tdrive.c) makes the C64 spelling. An alias holds only while no other entry of the folder shows the same name
+// (a real name or another alias); otherwise it is dropped (not listed, not found), never numbered. Every alias holds a '^',
+// so a name without one never costs a folder scan.
+FLASHMEM static int TD_Shown(const char *host, char out[17])   // 0 = real name, 1 = alias, -1 = not shown
+{
+   if (IsDotfile(host) || strlen(host) >= TD_CwdLen) return -1;   // imgName must hold any name we mount
+   return td_alias(host, out);
+}
+
+// How many entries of folder dir (host path, "" = root) show as `shown`; the host name of the last one goes to host (if given).
+FLASHMEM static int TD_CountShownIn(FS *fs, const char *dir, const char *shown, char *host, size_t cap, int *alias)
+{
+   File d = fs->open(dir[0] ? dir : "/");
+   if (!d) return 0;
+   int n = 0;
+   while (File e = d.openNextFile())
+   {
+      char s[17];
+      int r = TD_Shown(e.name(), s);
+      if (r >= 0 && strcmp(s, shown) == 0) { n++; if (host) strlcpy(host, e.name(), cap); if (alias) *alias = r; }
+      e.close();
+   }
+   d.close();
+   return n;
+}
+
+FLASHMEM static int TD_CountShown(stcVDUnit *u, const char *shown, char *host, size_t cap, int *alias)
+{
+   return TD_CountShownIn(u->fs, u->cwd, shown, host, cap, alias);
+}
+
+// A whole host path (ASCII, from /tdrive-config.txt or a remote set) whose components may be C64 aliases: TDrive Config writes the
+// names its browser showed, e.g. "/long folder^name/the-pu^side1.d64". Every component that does not exist as written and holds a
+// '^' becomes the host name it is the alias of (when exactly one entry shows as it); anything else is copied unchanged.
+FLASHMEM static void TD_ResolvePath(FS *fs, const char *in, char *out, size_t cap)
+{
+   size_t n = 0;
+   out[0] = 0;
+   for (const char *s = in; *s && n + 1 < cap; )
+   {
+      if (*s == '/') { if (!n || out[n - 1] != '/') out[n++] = '/'; s++; out[n] = 0; continue; }   // "//" squeezed, as TD_MountPath does
+      size_t l = strcspn(s, "/"), base = n;
+      if (base + l >= cap) { strlcpy(out + n, s, cap - n); return; }
+      memcpy(out + n, s, l); n += l; out[n] = 0;
+      if (l <= 16 && memchr(s, '^', l) && !fs->exists(out))
+      {
+         char shown[17], dir[TD_PathLen], host[TD_CwdLen];
+         for (size_t i = 0; i < l; i++) shown[i] = (char)TD_ToPetscii(s[i]);   // the C64 spelling: upper-case letters
+         shown[l] = 0;
+         size_t dl = base > 1 ? base - 1 : 0;                           // "/a/" -> "/a"; "/" -> "" (the root)
+         if (dl >= sizeof dir) dl = 0;
+         memcpy(dir, out, dl); dir[dl] = 0;
+         int alias = 0;
+         if (TD_CountShownIn(fs, dir, shown, host, sizeof host, &alias) == 1 && alias == 1 && base + strlen(host) < cap)
+         { strcpy(out + base, host); n = base + strlen(host); }
+      }
+      s += l;
+   }
+}
+
+// The C64 spelling of a host path: each component as the drive lists it (its alias when it has one), for "!STATE", whose first line
+// TDrive Config compares with the paths of its list (written from its browser, so in aliases).
+FLASHMEM static void TD_C64Path(const char *in, char *out, size_t cap)
+{
+   size_t n = 0;
+   out[0] = 0;
+   for (const char *s = in; *s && n + 1 < cap; )
+   {
+      if (*s == '/') { out[n++] = *s++; out[n] = 0; continue; }
+      size_t l = strcspn(s, "/");
+      char comp[TD_CwdLen], shown[17];
+      const char *w = s;
+      size_t wl = l;
+      if (l < sizeof comp)
+      {
+         memcpy(comp, s, l); comp[l] = 0;
+         if (TD_Shown(comp, shown) >= 0) { w = shown; wl = strlen(shown); }
+      }
+      if (n + wl >= cap) wl = cap - 1 - n;
+      memcpy(out + n, w, wl); n += wl; out[n] = 0;
+      s += l;
+   }
+}
+
+// The host path for a C64 name in the unit's folder: the name itself or, when that does not exist, the entry it is the alias of.
+FLASHMEM static void TD_Resolve(stcVDUnit *u, const char *name, char *out, size_t cap)
+{
+   TD_PathFor(u, name, out, cap);
+   if (!strchr(name, '^') || u->fs->exists(out)) return;
+   char host[TD_CwdLen];
+   int alias = 0;
+   if (TD_CountShown(u, name, host, sizeof host, &alias) == 1 && alias == 1) TD_HostPath(u, host, out, cap);
+}
+
+// ---- d64 sector backend ---------------------------------------------------------------------
+static int TD_ReadSector(void *ctx, uint8_t t, uint8_t s, uint8_t *buf)
+{
+   stcVDUnit *u = (stcVDUnit *)ctx;
+   long off = d64_sector_offset(&u->d, t, s);
+   if (off < 0 || !u->img.seekSet((uint32_t)off)) return -1;
+   return u->img.read(buf, D64_SECTOR) == D64_SECTOR ? 0 : -1;
+}
+
+static int TD_WriteSector(void *ctx, uint8_t t, uint8_t s, const uint8_t *buf)
+{
+   stcVDUnit *u = (stcVDUnit *)ctx;
+   long off = d64_sector_offset(&u->d, t, s);
+   if (off < 0 || !u->img.seekSet((uint32_t)off)) return -1;
+   if (u->img.write(buf, D64_SECTOR) != D64_SECTOR) return -1;
+   ImageWriteBackWrote(&u->wb, millis());
+   return 0;
+}
+
+// A sync the card fails leaves the image dirty, so the next idle period tries again; the first failure in a row is reported
+FLASHMEM static void TD_Flush(stcVDUnit *u)
+{
+   if (!u->mounted || !u->wb.Dirty) return;
+   if (ImageWriteBackSynced(&u->wb, u->img.sync(), millis()))
+      Serial.printf("TDrive %d: writes are not reaching the card; retrying\n", (int)(u - tdUnit) + 8);
+}
+
+FLASHMEM static void TD_CloseImage(stcVDUnit *u)
+{
+   if (u->img.isOpen() && !u->img.close()) Serial.printf("TDrive %d: last writes did not reach the card\n", (int)(u - tdUnit) + 8);
+   ImageWriteBackForget(&u->wb);
+}
+
+// ---- remembered mount: "/.tdrive" on each unit's own file system holds the last mounted image's path --------
+// Dot-named, so the TR menu (0.9+) and our own host listing hide it. Written on every successful mount, removed on unmount.
+#define TD_Sidecar "/.tdrive"
+
+FLASHMEM static void TD_SidecarClear(stcVDUnit *u)
+{
+   if (u->quiet) return;
+   if (u->fs->exists(TD_Sidecar)) u->fs->remove(TD_Sidecar);
+}
+
+FLASHMEM static void TD_SidecarSave(stcVDUnit *u, const char *path)
+{
+   if (u->quiet) return;
+   TD_SidecarClear(u);                                   // FILE_WRITE appends: start from an empty file
+   File f = u->fs->open(TD_Sidecar, FILE_WRITE);
+   if (!f) return;
+   f.write(path, strlen(path));
+   f.close();
+}
+
+// ---- host services for tdrive.c (CD:, host directory listing) --------------------------------
+// Bad sectors: an image with one error byte per sector after the data (175,531 / 197,376 / 351,062 / 822,400 bytes) gets the
+// table copied to the heap when any byte in it is a read error, so a bad sector costs no extra card access; all-OK tables
+// (the usual case) are dropped. No memory: the image mounts without it.
+FLASHMEM static void TD_LoadErrTab(stcVDUnit *u, uint32_t size)
+{
+   u->errTab = NULL; u->d.errtab = NULL;
+   long off = d64_errtab_offset(&u->d, size);
+   if (off < 0 || !u->img.seekSet((uint32_t)off)) return;
+   int n = d64_sectors(&u->d), nbad = 0;
+   uint8_t *t = (uint8_t *)malloc(n);
+   if (!t) return;
+   if (u->img.read(t, n) != n) { free(t); return; }
+   for (int i = 0; i < n; i++) if (d64_errcode(t[i])) nbad++;
+   if (!nbad) { free(t); return; }
+   u->errTab = t; u->d.errtab = t;
+   Printf_dbg("TDrive: error table, %d bad sectors\n", nbad);
+}
+
+FLASHMEM static void TD_Unmount(void *ctx, int unit)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   TD_CloseImage(u);                                     // close() syncs: any unsynced writes go to the card now
+   u->mounted = false;
+   free(u->errTab); u->errTab = NULL; u->d.errtab = NULL;
+   TD_SidecarClear(u);                                   // an explicit unmount forgets the image (a new mount re-writes it)
+}
+
+// Mount the image at path (host spelling); imgName keeps its host name.
+FLASHMEM static int TD_MountHost(int unit, const char *path, d64_t **out)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   const char *slash = strrchr(path, '/');
+   const char *leaf = slash ? slash + 1 : path;
+   if (strlen(leaf) >= sizeof u->imgName) return 33;
+   if (!image_kind(leaf)) return 74;                                              // only .d64/.d71/.d81: the format comes from the size alone
+   TD_Unmount(NULL, unit);
+   // Check existence and size with a read-only open first: FILE_WRITE creates missing files on SD/USB, and a mistyped
+   // CD: must never litter the card with empty "images".
+   File probe = u->fs->open(path, FILE_READ);
+   if (!probe || probe.isDirectory()) { if (probe) probe.close(); return 62; }   // FILE NOT FOUND
+   uint32_t size = probe.size();
+   probe.close();
+   if (size < 174848) return 74;                                                  // DRIVE NOT READY: not a D64
+   bool writable = true;
+   if (!u->img.open(u->vol, path, O_RDWR))                                        // no O_CREAT: nothing is created
+   { writable = false; if (!u->img.open(u->vol, path, O_RDONLY)) return 62; }
+   if (d64_open_size(&u->d, TD_ReadSector, u, size)) { u->img.close(); return 74; }   // format (d64 / d71 / d81) comes from the size
+   u->d.write = writable ? TD_WriteSector : NULL;
+   TD_LoadErrTab(u, size);
+   u->mounted = true; ImageWriteBackForget(&u->wb);
+   strlcpy(u->imgName, leaf, sizeof u->imgName);
+   *out = &u->d;
+   TD_SidecarSave(u, path);
+   Printf_dbg("TDrive %d: mounted %s%s\n", unit + 8, path, writable ? "" : " (read-only)");
+   return 0;
+}
+
+FLASHMEM static int TD_Mount(void *ctx, int unit, const char *name, d64_t **out)   // name = C64 (PETSCII) name or alias
+{
+   char path[TD_PathLen];
+   TD_Resolve(&tdUnit[unit], name, path, sizeof path);
+   return TD_MountHost(unit, path, out);
+}
+
+// "N:NAME.D64,ID" with nothing mounted: a new all-zero image file in the current folder, then mounted (tdrive.c formats it).
+// Written in 4 KB pieces: a D81 is 800 KB and the whole command must finish inside the KERNAL's ~1.6 s mailbox wait.
+FLASHMEM static int TD_Create(void *ctx, int unit, const char *name, uint32_t size, d64_t **out)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   char path[TD_PathLen];
+   TD_Resolve(u, name, path, sizeof path);
+   if (u->fs->exists(path)) return 63;                                            // FILE EXISTS (or an alias of one): never replaced
+   File f = u->fs->open(path, FILE_WRITE);
+   if (!f) return 26;                                                             // card write-protected / not writable
+   static const uint32_t chunk = 4096;
+   uint8_t *zero = (uint8_t *)calloc(1, chunk);
+   bool ok = zero != NULL;
+   for (uint32_t n = 0; ok && n < size; n += chunk) {
+      uint32_t k = size - n < chunk ? size - n : chunk;
+      ok = f.write(zero, k) == k;
+   }
+   free(zero);
+   f.close();
+   if (!ok) { u->fs->remove(path); return 72; }                                   // DISK FULL (the card)
+   Printf_dbg("TDrive %d: created %s (%lu bytes)\n", unit + 8, path, (unsigned long)size);
+   return TD_MountHost(unit, path, out);
+}
+
+// Plain files in the current folder, read with nothing mounted: LOAD"GAME.PRG" (tdrive.c tries NAME.PRG and patterns itself).
+FLASHMEM static void TD_PlainClose(void *ctx, int unit)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   if (u->plain) u->plain.close();
+}
+
+FLASHMEM static int TD_PlainOpen(void *ctx, int unit, const char *name, uint32_t *size)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   char path[TD_PathLen];
+   TD_Resolve(u, name, path, sizeof path);
+   TD_PlainClose(ctx, unit);
+   u->plain = u->fs->open(path, FILE_READ);                                       // FILE_READ: a missing file is not created
+   if (!u->plain) return 62;
+   if (u->plain.isDirectory()) { u->plain.close(); return 62; }
+   *size = u->plain.size();
+   return 0;
+}
+
+FLASHMEM static int TD_PlainRead(void *ctx, int unit, uint8_t *buf, uint16_t n)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   return u->plain ? u->plain.read(buf, n) : -1;
+}
+
+// MD:NAME / RD:NAME with nothing mounted: folders on the card
+FLASHMEM static int TD_MkDir(void *ctx, int unit, const char *name)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   char path[TD_PathLen];
+   TD_Resolve(u, name, path, sizeof path);
+   if (u->fs->exists(path)) return 63;                                            // FILE EXISTS (a file or a folder, or an alias of one)
+   return u->fs->mkdir(path) ? 0 : 26;
+}
+
+FLASHMEM static int TD_RmDir(void *ctx, int unit, const char *name)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   char path[TD_PathLen];
+   TD_Resolve(u, name, path, sizeof path);
+   File d = u->fs->open(path, FILE_READ);
+   if (!d || !d.isDirectory()) { if (d) d.close(); return 62; }
+   File first = d.openNextFile();
+   bool empty = !first;
+   if (first) first.close();
+   d.close();
+   if (!empty) return 63;                                                         // not empty: nothing is removed
+   return u->fs->rmdir(path) ? 0 : 26;
+}
+
+// S:NAME.D64 with nothing mounted: delete an image file (tdrive.c checks the name). A file with the FAT read-only attribute
+// cannot be opened for writing (SdFat), so it stays: 26 WRITE PROTECT ON.
+FLASHMEM static int TD_Scratch(void *ctx, int unit, const char *name)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   char path[TD_PathLen];
+   TD_Resolve(u, name, path, sizeof path);
+   File probe = u->fs->open(path, FILE_READ);                                     // FILE_READ first: FILE_WRITE would create it
+   if (!probe || probe.isDirectory()) { if (probe) probe.close(); return 62; }
+   probe.close();
+   File w = u->fs->open(path, FILE_WRITE);
+   if (!w) return 26;
+   w.close();
+   if (!u->fs->remove(path)) return 26;
+   Printf_dbg("TDrive %d: scratched %s\n", unit + 8, path);
+   return 0;
+}
+
+// A listing by path (LOAD"$/GAMES/G.D64") must not change what is selected: remember folder and image, put them back afterwards.
+FLASHMEM static void TD_Push(void *ctx, int unit)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   strlcpy(u->snapCwd, u->cwd, sizeof u->snapCwd);
+   strlcpy(u->snapImg, u->mounted ? u->imgName : "", sizeof u->snapImg);
+   u->quiet = true;                                       // the sidecar keeps naming the real selection meanwhile
+}
+
+FLASHMEM static int TD_Pop(void *ctx, int unit, d64_t **out)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   if (!out)                                              // keep what the walk selected (a file is being loaded through the path)
+   {
+      u->quiet = false;
+      if (u->mounted)
+      {
+         char path[TD_PathLen];
+         TD_HostPath(u, u->imgName, path, sizeof path);
+         TD_SidecarSave(u, path);
+      }
+      else TD_SidecarClear(u);
+      return 0;
+   }
+   TD_Unmount(ctx, unit);
+   strlcpy(u->cwd, u->snapCwd, sizeof u->cwd);
+   *out = NULL;
+   int r = 0;
+   if (u->snapImg[0])
+   {
+      char path[TD_PathLen];
+      TD_HostPath(u, u->snapImg, path, sizeof path);
+      r = TD_MountHost(unit, path, out);
+   }
+   if (r) *out = NULL;
+   u->quiet = false;
+   return r;
+}
+
+FLASHMEM static int TD_ChDir(void *ctx, int unit, const char *name)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   if (strcmp(name, "/") == 0) { u->cwd[0] = 0; return 0; }   // card root
+   if (strcmp(name, "..") == 0 || strcmp(name, "_") == 0)
+   {
+      char *slash = strrchr(u->cwd, '/');
+      if (slash) *slash = 0; else u->cwd[0] = 0;
+      return 0;
+   }
+   char path[TD_PathLen];
+   TD_Resolve(u, name, path, sizeof path);
+   size_t l = strlen(path); if (l > 1 && path[l - 1] == '/') path[l - 1] = 0;   // drop trailing '/'
+   File d = u->fs->open(path);
+   if (!d || !d.isDirectory()) { if (d) d.close(); return 62; }
+   d.close();
+   if (strlen(path) >= TD_CwdLen) return 74;
+   strcpy(u->cwd, path);
+   return 0;
+}
+
+// Hash bits of the names a folder shows, per unit: a first pass in TD_DirOpen marks names seen twice, so the listing counts
+// an alias's twins (a folder scan) only when its bit says there may be one.
+static uint8_t tdSeen[2][128], tdDup[2][128];
+FLASHMEM static unsigned TD_NameHash(const char *s)
+{
+   uint32_t h = 2166136261u;
+   while (*s) h = (h ^ (uint8_t)*s++) * 16777619u;
+   return h & 1023;
+}
+
+FLASHMEM static int TD_DirOpen(void *ctx, int unit, char title[17])
+{
+   stcVDUnit *u = &tdUnit[unit];
+   if (u->dir) u->dir.close();
+   memset(tdSeen[unit], 0, sizeof tdSeen[unit]); memset(tdDup[unit], 0, sizeof tdDup[unit]);
+   File d = u->fs->open(u->cwd[0] ? u->cwd : "/");
+   while (d) {
+      File e = d.openNextFile();
+      if (!e) break;
+      char s[17];
+      if (TD_Shown(e.name(), s) >= 0)
+      {
+         unsigned h = TD_NameHash(s); uint8_t b = (uint8_t)(1 << (h & 7));
+         if (tdSeen[unit][h >> 3] & b) tdDup[unit][h >> 3] |= b;
+         tdSeen[unit][h >> 3] |= b;
+      }
+      e.close();
+   }
+   if (d) d.close();
+   u->dir = u->fs->open(u->cwd[0] ? u->cwd : "/");
+   if (!u->dir) return 1;
+   snprintf(title, 17, "%s:%s", unit == 0 ? "SD" : "USB", u->cwd[0] ? u->cwd : "/");
+   for (char *p = title; *p; p++) *p = TD_ToPetscii(*p);
+   return 0;
+}
+
+FLASHMEM static int TD_DirNext(void *ctx, int unit, char name[17], uint32_t *size, int *is_dir)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   while (File e = u->dir.openNextFile())
+   {
+      int r = TD_Shown(e.name(), name);                       // upper-case ASCII = PETSCII
+      if (r == 1)
+      {
+         unsigned h = TD_NameHash(name);
+         if ((tdDup[unit][h >> 3] & (1 << (h & 7))) && TD_CountShown(u, name, NULL, 0, NULL) > 1) r = -1;   // a twin: no alias
+      }
+      if (r < 0) { e.close(); continue; }
+      *is_dir = e.isDirectory();
+      *size = *is_dir ? 0 : e.size();
+      e.close();
+      return 1;
+   }
+   u->dir.close();
+   return 0;
+}
+
+// ---- host text files for the configuration utility (TDrive Config.prg): OPEN n,d,n,"!CONFIG[,W]" and "!STATE" ---------------------
+// !CONFIG is the unit's /tdrive-config.txt (see the Alt button section below), !STATE three lines: the mounted image's path, the
+// folder and the TR menu's colour references (IO1[rwRegColorRefStart..], NumColorRefs hex digits, so the utility matches the menu).
+// Text crosses as PETSCII with CR line ends. One file at a time; opening another (or closing the channel) ends the first.
+#define TD_ConfigName "/tdrive-config.txt"
+extern volatile uint8_t* IO1;     // defined in IOH_TeensyROM.c, which is included after this file
+static File       hfFile;
+static int        hfKind = -1;
+static bool       hfWriting = false;
+static char       hfText[TD_PathLen + TD_CwdLen + NumColorRefs + 6];
+static size_t     hfTextPos = 0, hfTextLen = 0;
+
+FLASHMEM static void TD_HfClose(void *ctx, int unit, int write)
+{
+   if (hfFile) { if (write) hfFile.flush(); hfFile.close(); }
+   hfKind = -1; hfWriting = false;
+}
+
+FLASHMEM static int TD_HfOpen(void *ctx, int unit, int kind, int write)
+{
+   TD_HfClose(NULL, unit, 0);
+   stcVDUnit *u = &tdUnit[unit];
+   if (kind == TD_HF_STATE)
+   {
+      char host[TD_PathLen], path[TD_PathLen];
+      path[0] = 0;
+      if (u->mounted) { TD_HostPath(u, u->imgName, host, sizeof host); TD_C64Path(host, path, sizeof path); }   // aliases, as the browser showed them
+      hfTextLen = snprintf(hfText, sizeof hfText, "%s\n%s\n", path, u->cwd[0] ? u->cwd : "/");
+      if (hfTextLen > sizeof hfText - NumColorRefs - 2) hfTextLen = sizeof hfText - NumColorRefs - 2;
+      for (int i = 0; i < NumColorRefs; i++) hfText[hfTextLen++] = "0123456789ABCDEF"[IO1[rwRegColorRefStart + i] & 15];
+      hfText[hfTextLen++] = '\n';
+      hfText[hfTextLen] = 0;
+      hfTextPos = 0; hfKind = kind;
+      return 0;
+   }
+   if (write)
+   {
+      if (u->fs->exists(TD_ConfigName)) u->fs->remove(TD_ConfigName);   // FILE_WRITE appends: start from an empty file
+      hfFile = u->fs->open(TD_ConfigName, FILE_WRITE);
+      if (!hfFile) return 74;
+   }
+   else
+   {
+      hfFile = u->fs->open(TD_ConfigName, FILE_READ);
+      if (!hfFile || hfFile.isDirectory()) { if (hfFile) hfFile.close(); return 62; }
+   }
+   hfKind = kind; hfWriting = write != 0;
+   return 0;
+}
+
+FLASHMEM static int TD_HfRead(void *ctx, int unit, uint8_t *buf, int n)
+{
+   int got = 0;
+   if (hfKind == TD_HF_STATE)
+   {
+      for (; got < n && hfTextPos < hfTextLen; got++, hfTextPos++)
+         buf[got] = hfText[hfTextPos] == '\n' ? '\r' : TD_ToPetscii(hfText[hfTextPos]);
+      return got;
+   }
+   if (hfKind != TD_HF_CONFIG || !hfFile || hfWriting) return 0;
+   while (got < n)
+   {
+      uint8_t c;
+      if (hfFile.read(&c, 1) != 1) break;
+      if (c == '\r') continue;                                          // CRLF files: the CR of the pair is dropped
+      buf[got++] = c == '\n' ? '\r' : TD_ToPetscii((char)c);
+   }
+   return got;
+}
+
+FLASHMEM static int TD_HfWrite(void *ctx, int unit, const uint8_t *buf, int n)
+{
+   if (hfKind != TD_HF_CONFIG || !hfFile || !hfWriting) return 1;
+   for (int i = 0; i < n; i++)
+   {
+      char c = buf[i] == '\r' ? '\n' : TD_ToAscii(buf[i]);
+      if (buf[i] == '\n') continue;                                      // a stray LF (PRINT# to device 10 / 13) adds nothing
+      if (hfFile.write(&c, 1) != 1) return 1;
+   }
+   return 0;
+}
+
+// ---- fixed device numbers in EEPROM (0 / out of range = automatic, see tdrive_set_devices) --------------------
+FLASHMEM static void TD_SaveDevices(void *ctx, uint8_t pin0, uint8_t pin1)
+{
+   EEPROM.write(eepAdTDriveDevs, pin0);        // written by "U0>"+CHR$(n) on the drive's command channel
+   EEPROM.write(eepAdTDriveDevs + 1, pin1);
+}
+
+FLASHMEM static void TD_LoadDevices()
+{
+   tdrive_set_devices(&vio->vd, EEPROM.read(eepAdTDriveDevs), EEPROM.read(eepAdTDriveDevs + 1));   // validates: unset / garbage / duplicate = automatic
+}
+
+// ---- mount at start-up: the image opened in the TeensyROM menu, else the one remembered in the sidecar ------------------
+// Opening a .d64 in the menu makes DriveDirPath "<dir>/<image>.d64*" (trailing '*' = inside an image). When a program is
+// launched from there, that image is mounted on the unit of the same storage (SD = unit 0, USB = unit 1) so the program's own
+// LOAD from device 8/9 finds its files. Any other launch re-mounts what the unit had mounted last.
+extern char DriveDirPath[];
+extern volatile uint8_t BtnPressed;   // Teensy.ino: the menu button; loop() then resets the C64 into the TR menu
+
+// path = "/a/b/X.D64" (ASCII, no trailing '*'): folder becomes the unit's cwd, then the image is mounted.
+FLASHMEM static int TD_MountPath(int unit, const char *rawPath)   // 0 ok, else a DOS error code
+{
+   stcVDUnit *u = &tdUnit[unit];
+   char sq[TD_PathLen];
+   if (strlen(rawPath) >= sizeof sq) return 33;
+   strlcpy(sq, rawPath, sizeof sq);
+   TD_Squeeze(sq);
+   const char *path = sq;
+   const char *slash = strrchr(path, '/');
+   const char *file = slash ? slash + 1 : path;
+   size_t dl = slash ? (size_t)(slash - path) : 0;                 // "/a/b/X.D64" -> cwd "/a/b"; root -> ""
+   if (dl >= TD_CwdLen || !*file) return 33;
+   memcpy(u->cwd, path, dl); u->cwd[dl] = 0;
+   d64_t *d = NULL;
+   int r = TD_MountHost(unit, path, &d);
+   if (r == 0) tdrive_attach(&vio->vd, unit, d, 1);
+   else u->cwd[0] = 0;
+   return r;
+}
+
+// The menu source and DriveDirPath of this launch, noted by TDrive_NoteLaunch() before KERNALPreStart() frees the menu's listing
+// for an REU Special IO (docs/DESIGN.md 50): upstream's FreeDriveDirMenu() turns the menu back to the Teensy one and DriveDirPath to
+// "/", so TDrive_PreStart() read "not from an image" and mounted the remembered one (0.9.0.55-0.9.0.57).
+static uint8_t tdLaunchMenu = 0xFF;          // 0xFF: nothing noted, PreStart reads the live values
+static char tdLaunchPath[TD_PathLen];
+
+FLASHMEM void TDrive_NoteLaunch()
+{
+   tdLaunchMenu = IO1[rWRegCurrMenuWAIT];
+   size_t n = strlen(DriveDirPath);
+   if (n < sizeof tdLaunchPath) memcpy(tdLaunchPath, DriveDirPath, n + 1);
+   else tdLaunchPath[0] = 0;                 // too long to mount anyway (TD_StartupMount)
+}
+
+FLASHMEM static void TD_StartupMount(int unit, bool menuUnit, const char *dirPath)
+{
+   stcVDUnit *u = &tdUnit[unit];
+   if (!vio->vd.unit[unit].present) return;
+   char path[TD_PathLen];
+   if (menuUnit)
+   {
+      size_t n = strlen(dirPath);
+      if (n >= 2 && dirPath[n - 1] == '*' && n < sizeof path)
+      {
+         memcpy(path, dirPath, n - 1); path[n - 1] = 0;
+         TD_MountPath(unit, path);
+         return;
+      }
+   }
+   File f = u->fs->open(TD_Sidecar, FILE_READ);
+   if (!f) return;
+   int n = f.read(path, sizeof path - 1);
+   f.close();
+   if (n <= 0) return;
+   path[n] = 0;
+   TD_MountPath(unit, path);
+}
+
+// ---- handler ---------------------------------------------------------------------------------
+extern bool SDFullInit();
+extern bool USBFileSystemWait();
+#ifdef Fab04_TDrive
+void InitHndlr_KernalReplace();   // re-stages the KERNAL bus hook (IOH_KernalReplace.c)
+#endif
+
+// All storage access (SD/USB probing, sizing) happens here, called from KERNALPreStart() while the C64 is still
+// waiting for the TR ("WaitForTRDots"). Doing it later is unsafe: SD reads mask interrupts, and once the replacement
+// KERNAL is live every C64 instruction fetch from $E000-$FFFF depends on the bus ISR running.
+#ifdef Fab04_TDrive
+FLASHMEM static void TD_ProbeBegin();
+void TD_BannerUnits(uint8_t *img, int size, bool settled);   // below
+void TD_BannerRegs(bool on, bool settled);
+
+// DMA releases go through upstream's CloseDMA() (TeensyROM #106): while the release is pending it holds the bus snoop off, so with
+// the screen blanked and the sprites off KernalCheck no longer takes every cycle and keeps the release from coming (docs/DESIGN.md 62;
+// 0.9.0.73-0.9.0.76 did the same here, in their own TD_CloseDMA()).
+
+#ifdef Fab04_TDriveDMALoad
+// Every DMA of the drive: how many, how they failed and the longest, in the remote get's "dbg" JSON ("dma"; docs/DESIGN.md 62).
+struct stcVDDmaDbg { uint32_t n, startFail, closeFail, maxUs, lastFailMs; uint16_t lastFailAddr; };
+static stcVDDmaDbg tdDmaDbg;
+FLASHMEM static int TD_DmaDo(DMA_Trans_RnW rnw, uint16_t addr, uint8_t *buf, uint16_t len)
+{
+   uint32_t t0 = micros();
+   tdDmaDbg.n++;
+   bool ok = PerformDMA(rnw, addr, buf, len, DMA_ADDR_INCREMENT);
+   if (!ok) tdDmaDbg.startFail++;
+   else if (!CloseDMA()) { tdDmaDbg.closeFail++; ok = false; }
+   uint32_t us = micros() - t0;
+   if (us > tdDmaDbg.maxUs) tdDmaDbg.maxUs = us;
+   if (!ok) { tdDmaDbg.lastFailMs = millis(); tdDmaDbg.lastFailAddr = addr; }
+   return ok;
+}
+// vio's DMA write: the CPU waits in the KERNAL's mailbox loop meanwhile (vcall), and the bus ISR skips the snoop for the transfer.
+FLASHMEM static int TD_DmaWrite(void *, uint16_t addr, const uint8_t *buf, uint16_t len)
+{
+   return TD_DmaDo(DMA_WRITE, addr, (uint8_t *)buf, len);
+}
+// vio's DMA read (SAVE, VERIFY, and the KERNAL's pointers in zero page): only $0000-$CFFF is asked for (vio_dma_rd_ok and the
+// VIO_DMA_* zero-page bytes), where a DMA read sees what the CPU sees; never the served KERNAL's $E000-$FFFF.
+FLASHMEM static int TD_DmaRead(void *, uint16_t addr, uint8_t *buf, uint16_t len)
+{
+   return TD_DmaDo(DMA_READ, addr, buf, len);
+}
+#endif
+#endif
+
+static bool tdNoMenuProbe = false;  // TD_KernalImage: the C64 keeps a KERNAL that is not this build's TDrive one (see there); one PreStart
+
+static void TD_TraceReport();     // the Alt-button trace from before a reboot (below)
+FLASHMEM void TDrive_PreStart(bool agent)
+{
+   TD_TraceReport();
+#ifdef TD_ALLOC_HEAP
+   if (vio == NULL) vio = (vio_t *)malloc(sizeof(vio_t));
+#else
+   vio = &vioStore;                 // vio_init() clears it on every start
+#endif
+   if (vio == NULL) { Serial.println("TDrive: out of memory"); return; }
+   vioReady = false;
+   vio_init(vio, &vioHot);
+#ifdef Fab04_TDriveDMALoad
+   vio_set_dma(vio, TD_DmaWrite, TD_DmaRead, NULL, tdDmaBuf, sizeof tdDmaBuf);
+#endif
+
+   td_host_t host;
+   memset(&host, 0, sizeof host);
+   host.mount = TD_Mount;  host.unmount = TD_Unmount;  host.chdir = TD_ChDir;
+   host.dir_open = TD_DirOpen;  host.dir_next = TD_DirNext;  host.save_devices = TD_SaveDevices;
+   host.push = TD_Push;  host.pop = TD_Pop;  host.create = TD_Create;
+   host.hf_open = TD_HfOpen;  host.hf_read = TD_HfRead;  host.hf_write = TD_HfWrite;  host.hf_close = TD_HfClose;
+   host.plain_open = TD_PlainOpen;  host.plain_read = TD_PlainRead;  host.plain_close = TD_PlainClose;
+   host.mkdir = TD_MkDir;  host.rmdir = TD_RmDir;  host.scratch = TD_Scratch;
+   if (hfFile) hfFile.close();        // the drive state (and with it any open channel) was just reset
+   hfKind = -1;
+   tdrive_set_host(&vio->vd, &host);
+   TD_LoadDevices();
+
+   for (int i = 0; i < 2; i++) { TD_CloseImage(&tdUnit[i]); tdUnit[i].mounted = false; tdUnit[i].quiet = false; tdUnit[i].cwd[0] = 0;
+                                 free(tdUnit[i].errTab); tdUnit[i].errTab = NULL; }
+   tdUnit[0].fs = &SD;              tdUnit[0].vol = &SD.sdfs;
+   tdUnit[1].fs = &firstPartition;  tdUnit[1].vol = &firstPartition.mscfs;
+   tdrive_attach(&vio->vd, 0, NULL, SDFullInit());
+   tdrive_attach(&vio->vd, 1, NULL, USBFileSystemWait());
+   uint8_t menu = tdLaunchMenu != 0xFF ? tdLaunchMenu : IO1[rWRegCurrMenuWAIT];
+   const char *dirPath = tdLaunchMenu != 0xFF ? tdLaunchPath : DriveDirPath;
+   TD_StartupMount(0, menu == rmtSD, dirPath);
+   TD_StartupMount(1, menu == rmtUSBDrive, dirPath);
+   tdLaunchMenu = 0xFF;             // one launch only
+   int scanPending = vio_arm_scan(vio);   // automatic numbers: probed by the menu next (else on the first disk access, by the KERNAL
+   vio_publish_devices(vio);              //   or, with the agent, by the vector engine: docs/DESIGN.md 53)
+#ifdef Fab04_TDrive
+   if (!agent) {
+      TD_BannerUnits(KernalBin, 8192, false);   // the image InitHndlr_KERNALReplace_PreStart() just loaded, before the C64 prints its banner
+      TD_BannerRegs(true, false);                // and the same for a TDrive KERNAL the C64 holds itself
+   }
+#endif
+   vioReady = true;                 // only now may the bus handlers answer
+   Serial.printf("TDrive: dev %d (SD) %s, dev %d (USB) %s%s\n",
+                 vio->vd.dev[0], vio->vd.unit[0].present ? "ready" : "absent",
+                 vio->vd.dev[1], vio->vd.unit[1].present ? "ready" : "absent",
+                 !scanPending ? "" : agent ? " (numbers are settled on the first disk access)"
+                 : !tdNoMenuProbe ? " (numbers are settled by the bus probe)"
+                 : " (no bus probe in the menu: the C64's own KERNAL is not this build's; the KERNAL scans on its first disk access)");
+#ifdef Fab04_TDrive
+   if (scanPending && !agent && !tdNoMenuProbe) TD_ProbeBegin();   // the agent leaves rwRegScratch at 0: the menu skips its probe, the engine scans
+#endif
+   tdNoMenuProbe = false;
+}
+
+#ifdef Fab04_TDrive
+// ---- the menu's bus probe before launch (MainMenu.asm, TDriveProbe; docs/DESIGN.md 37) -------------------------------------
+// Only the 6502 can see which numbers real drives hold. The TR menu probes the bus right after this PreStart, so DEV0/DEV1
+// are right from the program's first instruction (the KERNAL's own scan, on the first disk access, is the fallback and is
+// not asked for after this one). It probes with the C64's own KERNAL: the replacement is held back until the probe ends,
+// since its serial hooks would talk to the mailbox, which is not live while the menu runs.
+// The menu clears rwRegScratch before PreStart; a nonzero answer there asks for the probe. For each number from 8 up that
+// no drive answers, the menu writes it to rwRegScratch and runs PreStart again; the answer is how many units still wait
+// (0: done). TD_ProbeEnd (0xff: the menu ran out of numbers) also ends it. Every end hooks the replacement KERNAL back in.
+#define TD_ProbeEnd 0xff
+static bool tdProbing = false;
+static bool (*tdProbeSnoop)(uint16_t Address, bool R_Wn) = NULL;
+
+FLASHMEM static void TD_ProbeBegin()
+{
+   int need = vio_probe_begin(vio);
+   IO1[rwRegScratch] = (uint8_t)need;
+   if (!need) return;
+   tdProbeSnoop = fBusSnoop;        // the KERNAL check InitHndlr_KERNALReplace_PreStart() just hooked (NULL if no image)
+   fBusSnoop = NULL;
+   tdProbing = true;
+}
+
+FLASHMEM static void TD_ProbeFinish()
+{
+   tdProbing = false;
+   KDS_State = KDS_Idle;            // the C128's DMA HIRAM sense: the check was unhooked, no sense can be in flight
+   KDS_Read01Valid = false;
+   fBusSnoop = tdProbeSnoop ? KernalCheckArm() : NULL;   // the C64's or the C128's check, with HIRAM_State set for it
+   TD_BannerUnits(KernalBin, 8192, true);   // the probed numbers, so the banner need not probe again
+   TD_BannerRegs(true, true);
+   Serial.printf("TDrive: bus probe gave dev %d (SD), %d (USB)\n", vio->vd.dev[0], vio->vd.dev[1]);
+}
+
+// true: this PreStart call was a probe step, answered in rwRegScratch; false: an ordinary PreStart (rwRegScratch = 0)
+FLASHMEM bool TDrive_ProbeStep()
+{
+   uint8_t dev = IO1[rwRegScratch];
+   if (!tdProbing || dev == 0)                // a new launch (any Special IO): a probe left over from a reset is dropped,
+   {                                         // and so are the banner registers of an earlier TDrive launch
+      tdProbing = false;
+      TD_BannerRegs(false, false);
+      return false;
+   }
+   int left = (dev == TD_ProbeEnd) ? 0 : vio_probe_free(vio, dev);
+   if (!left) TD_ProbeFinish();
+   IO1[rwRegScratch] = (uint8_t)left;
+   return true;
+}
+
+// The power-on banner's second line ends in "TDRIVE SD 8 USB 9" (patches/tdbanner.s). The C64 prints it before this handler owns the
+// mailbox, so the numbers travel in the KERNAL image being served: the two bytes after the tag "TDUNITS:" (not printed) say per unit
+// (SD, USB) $FE = absent or no number ("NOSD" / "NOUSB"), 8-30 = the number, $FF = automatic and not settled yet; 0 / 0, as built,
+// means "not written" and prints the stock line. PreStart writes the pinned numbers and $FF for automatic units; when the menu's bus
+// probe finishes (settled), the numbers it gave replace the $FF. Without that probe (another launch path, or a menu without it) the
+// KERNAL probes the real bus for the $FF units itself, the way the run's first disk access will (bus_scan), so the banner shows the
+// numbers that scan is going to give. An image without the tag (an older kernal-tr.bin, another KERNAL) is left alone. Runs while
+// the C64 still waits in the TR menu, so nothing reads them yet.
+#define TD_BannerRegBase 60   // IO1 offset of the banner registers under the TR menu's handler ($DE3C)
+static_assert(TD_BannerRegBase + 4 <= IO1Size, "the banner registers must lie inside the menu's IO1 array");
+static const uint8_t TD_BannerTag[8] = { 'T', 'D', 'U', 'N', 'I', 'T', 'S', ':' };
+
+FLASHMEM static bool TD_HasBannerTag(const uint8_t *img)   // in an 8 KB image: a TDrive KERNAL from 0.9.0.36 on
+{
+   for (int a = 0; a + (int)sizeof TD_BannerTag <= 8192; a++)
+      if (memcmp(img + a, TD_BannerTag, sizeof TD_BannerTag) == 0) return true;
+   return false;
+}
+
+FLASHMEM static uint8_t TD_BannerByte(int i, bool settled)
+{
+   uint8_t d = vio->vd.dev[i];
+   return !vio->vd.unit[i].present ? 0xFE : !vio->vd.pin[i] && !settled ? 0xFF : d ? d : 0xFE;
+}
+
+FLASHMEM void TD_BannerUnits(uint8_t *img, int size, bool settled)
+{
+   for (int a = 0; a + (int)sizeof TD_BannerTag + 2 <= size; a++)
+      if (memcmp(img + a, TD_BannerTag, sizeof TD_BannerTag) == 0)
+      {
+         for (int i = 0; i < 2; i++) img[a + sizeof TD_BannerTag + i] = TD_BannerByte(i, settled);
+         return;
+      }
+}
+
+// The same two bytes for a TDrive KERNAL the C64 holds itself (an EPROM, a MEGA65 core: docs/DESIGN.md 46), which the firmware
+// cannot write into. The menu prints the banner itself after PreStart (MainMenu.asm, XferCopyRun: the KERNAL's init routines and
+// INITMS, no reset) while the menu's own handler still answers IO1, and it answers a plain read with IO1[n]. Offsets 60-63
+// ($DE3C-$DE3F) lie inside IO1Size between rwRegPwrUpDefaults3 (52) and StartSIDRegs (64), used by nothing: the tag $D6 $64, then SD,
+// USB. Cleared by every other PreStart (TDrive_ProbeStep), so a launch with another Special IO never shows a stale TDRIVE field.
+FLASHMEM void TD_BannerRegs(bool on, bool settled)
+{
+   IO1[TD_BannerRegBase + 0] = on ? 0xD6 : 0;
+   IO1[TD_BannerRegBase + 1] = on ? 0x64 : 0;
+   IO1[TD_BannerRegBase + 2] = on ? TD_BannerByte(0, settled) : 0;
+   IO1[TD_BannerRegBase + 3] = on ? TD_BannerByte(1, settled) : 0;
+}
+
+// ---- the KERNAL image (docs/DESIGN.md 40) ---------------------------------------------------------------------------------
+// The TDrive Special IOs serve their own image, not the <Shift-K> file (that one stays the plain Kernal Replace's, so another ROM
+// there does not take the drives away): /TDrive/kernal.bin on the SD card when it is there (8192 bytes, served as it is: a
+// kernal-tr.bin built on a PC from any base ROM), else the C64's own KERNAL, read by DMA while the menu waits in PreStart and
+// patched here with TD_KernalPatch. Only ROMs the patch was tested on are patched (TD_KnownKernals, by CRC-32): our code calls into
+// the stock routines, so a ROM that differs there (JiffyDOS, ...) would crash. Anything else, or a failed read, serves nothing:
+// the C64 runs its own KERNAL and the drives stay silent (the serial console says why).
+#define TD_KernalFile "/TDrive/kernal.bin"
+struct stcVDKnownKernal { uint32_t crc; const char *name; };
+static const stcVDKnownKernal TD_KnownKernals[] = {   // each checked in VICE with tools/tdrive_mock.py ... variants
+   { 0xdbe3e7c7, "901227-03" },                       // C64 (also the C128's C64 mode on some boards)
+   { 0xa5c687b3, "901227-02" },                       // early C64
+   { 0x2c5965d4, "251104-04 (SX-64)" },
+   { 0xdd2976d2, "325179-01 (C128 C64 mode)" },
+   { 0xf10c2c25, "325182-01 (C128DCR C64 mode)" },
+};
+
+FLASHMEM uint32_t TD_Crc32(const uint8_t *p, size_t n)   // the zip / zlib CRC-32
+{
+   uint32_t c = 0xffffffff;
+   while (n--) { c ^= *p++; for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xedb88320 & (0 - (c & 1))); }
+   return ~c;
+}
+
+// true: every run of TD_KernalPatch is in img already, byte for byte: the C64 holds this build's TDrive KERNAL itself (burnt into a
+// ROM in the socket, a MEGA65 C64 core's KERNAL file). A table run outside $E000-$FFFF: false.
+FLASHMEM bool TD_KernalPatchPresent(const uint8_t *img)
+{
+   for (const uint8_t *r = TD_KernalPatch; ; )
+   {
+      uint16_t addr = (r[0] << 8) | r[1], len = (r[2] << 8) | r[3];
+      if (!len) return true;
+      if (addr < 0xE000 || addr + len > 0x10000 || memcmp(img + (addr - 0xE000), r + 4, len) != 0) return false;
+      r += 4 + len;
+   }
+}
+
+// Lays TD_KernalPatch over an 8 KB image at $E000; false (image untouched) if a run would leave it, which would be a build error.
+FLASHMEM bool TD_KernalPatchApply(uint8_t *img)
+{
+   for (int pass = 0; pass < 2; pass++)              // check every run first, then write
+      for (const uint8_t *r = TD_KernalPatch; ; )
+      {
+         uint16_t addr = (r[0] << 8) | r[1], len = (r[2] << 8) | r[3];
+         if (!len) break;
+         if (addr < 0xE000 || addr + len > 0x10000) return false;
+         if (pass) memcpy(img + (addr - 0xE000), r + 4, len);
+         r += 4 + len;
+      }
+   return true;
+}
+
+// The image the C64 holds at $E000-$FFFF: in the menu HIRAM is set and nothing answers ROMH reads there, so a DMA read sees the chip.
+FLASHMEM static bool TD_KernalRead(uint8_t *img)
+{
+   for (uint32_t off = 0; off < 8192; off += 1024)   // in pieces, well inside DMATransferCeilingmS each
+      if (!PerformDMA(DMA_READ, 0xE000 + off, img + off, 1024, DMA_ADDR_INCREMENT) || !CloseDMA()) return false;
+   return true;
+}
+
+// Nothing served (false) leaves the mailbox live all the same: a TDrive KERNAL the C64 holds itself still has its drives. Only this
+// build's one gets the menu's bus probe (tdNoMenuProbe): the probe runs through the C64's own KERNAL under the menu's IO1 handler,
+// and a TDrive KERNAL older than the mailbox gate (td_here in patches/tdrive.s) would write the menu's EEPROM-backed registers
+// at $DE11 / $DE15 there (MIDI settings, timezone). Without the probe the KERNAL's own scan settles the numbers.
+FLASHMEM bool TD_KernalImage(uint8_t *img)
+{
+   tdNoMenuProbe = true;
+   if (SDFullInit())
+   {
+      File f = SD.open(TD_KernalFile, FILE_READ);
+      if (f)
+      {
+         bool ok = !f.isDirectory() && f.size() == 8192 && f.read(img, 8192) == 8192;
+         f.close();
+         Serial.printf("TDrive: KERNAL %s%s\n", TD_KernalFile, ok ? "" : ": not 8192 bytes, not used");
+         if (ok) { tdNoMenuProbe = false; return true; }
+      }
+   }
+   if (!TD_KernalRead(img)) { Serial.println("TDrive: could not read the C64's KERNAL (DMA), drives off"); return false; }
+   uint32_t crc = TD_Crc32(img, 8192);
+   for (const stcVDKnownKernal &k : TD_KnownKernals)
+      if (k.crc == crc)
+      {
+         if (!TD_KernalPatchApply(img)) { Serial.println("TDrive: bad KERNAL patch table, drives off"); return false; }
+         Serial.printf("TDrive: the C64's KERNAL %s, patched (%d bytes)\n", k.name, TD_KernalPatchBytes);
+         tdNoMenuProbe = false;
+         return true;
+      }
+   if (TD_KernalPatchPresent(img))
+   {
+      Serial.println("TDrive: the C64's own KERNAL is this build's TDrive KERNAL (a ROM, a MEGA65 core): nothing served, the drives answer it");
+      tdNoMenuProbe = false;
+      return false;
+   }
+   if (TD_HasBannerTag(img))
+   {
+      Serial.printf("TDrive: the C64's own KERNAL is another build's TDrive KERNAL (CRC-32 %08lx): nothing served, the drives answer it, "
+                    "no bus probe in the menu; rebuild it from this revision\n", (unsigned long)crc);
+      return false;
+   }
+   Serial.printf("TDrive: the C64's KERNAL (CRC-32 %08lx) is not one the patch knows, drives off: put a patched image in " TD_KernalFile "\n",
+                 (unsigned long)crc);
+   return false;
+}
+
+// Handler start (the C64 is already running): only re-stage the KERNAL bus hook. No storage access here.
+void TD_AltButtonInit();          // alt-button disk switching, below
+void TD_AltPoll();
+
+FLASHMEM void InitHndlr_TDrive()
+{
+   if (tdProbing)                   // the menu did not finish the probe (not with this menu): numbers back, the KERNAL's own scan
+   {                                // settles them; InitHndlr_KernalReplace() below hooks the replacement KERNAL in
+      tdProbing = false;
+      TD_LoadDevices();
+      vio_arm_scan(vio);
+      vio_publish_devices(vio);
+   }
+   InitHndlr_KernalReplace();
+   TD_AltButtonInit();
+   tdDrivePoll = &PollingHndlr_TDrive;
+}
+#else
+void TD_AltPoll();
+#endif // Fab04_TDrive
+
+// ---- drive LED: the TR's LED blinks while the drives are busy (by ziggystar12, from his Mean Hamster Engine TDrive build) ----
+// Each serviced mailbox command for our units restarts a short hold; while it runs the LED blinks against the state it had
+// before (the TR keeps it on while a program runs, a pause or some cartridges turn it off), and gets that state back after.
+#define TD_LedPin      34    // SetLEDOn / SetLEDOff (Common_Defs.h)
+#define TD_LedBlinkMs  75
+#define TD_LedHoldMs   180
+
+static bool     tdLedActive = false, tdLedIdleHigh = false;
+static uint32_t tdLedStartedMs = 0, tdLedLastAccessMs = 0;
+
+FLASHMEM static void TD_LedPoll()
+{
+   if (!tdLedActive) return;
+   uint32_t now = millis();
+   if (now - tdLedLastAccessMs >= TD_LedHoldMs)
+   {
+      digitalWriteFast(TD_LedPin, tdLedIdleHigh);
+      tdLedActive = false;
+      return;
+   }
+   bool oddPhase = ((now - tdLedStartedMs) / TD_LedBlinkMs) & 1u;
+   digitalWriteFast(TD_LedPin, oddPhase ? tdLedIdleHigh : !tdLedIdleHigh);
+}
+
+FLASHMEM static void TD_LedAccess()
+{
+   uint32_t now = millis();
+   if (!tdLedActive)
+   {
+      tdLedIdleHigh = digitalReadFast(TD_LedPin) != 0;
+      tdLedStartedMs = now;
+      tdLedActive = true;
+   }
+   tdLedLastAccessMs = now;
+   TD_LedPoll();
+}
+
+// what every TDrive handler polls; did = a mailbox command was answered just now (vio_poll, or the agent's vvec_poll)
+FLASHMEM static void TD_PollCommon(bool did)
+{
+   TD_AltPoll();
+   TD_LedPoll();
+   if (did)
+   {
+      lastActivityMs = millis();
+      if (vioHot.stat != VIO_NOTMINE) TD_LedAccess();     // not for a command handed back to a real drive on the bus
+#ifdef TD_TRACE   // bring-up aid: one line per mailbox command on the USB serial port (see docs/BRINGUP.md)
+      Serial.printf("vd cmd=%u arg=%02x len=%u -> stat=%02x data=%02x st=%02x\n",
+                    vioHot.cmd, vioHot.arg, vioHot.len, vioHot.stat, vioHot.data, vioHot.st);
+#endif
+   }
+   if (vio_take_menu(vio))          // VIO_MENU (TDrive Config's Q): write back what is unsaved, then the main loop resets into the menu
+   {
+      for (int i = 0; i < 2; i++) TD_Flush(&tdUnit[i]);
+      BtnPressed = true;
+   }
+   // Write back only when both the last sector write and the last mailbox command are old: SD access can mask
+   // interrupts, and the C64 must not be mid-LOAD (reading our registers) when that happens.
+   uint32_t now = millis();
+   for (int i = 0; i < 2; i++)
+      if (ImageWriteBackDue(&tdUnit[i].wb, now) && now - lastActivityMs > IMAGE_WRITEBACK_IDLE_MS)
+         TD_Flush(&tdUnit[i]);
+}
+
+#ifdef Fab04_TDrive
+// The last TD_CmdLogN mailbox commands with the time each was answered (ms since the handler started), the answer, and the
+// Kernal Replace HIRAM state then (HIRAM_State, KDS_Guess, KDS_State: the C128's DMA sense); counters of the DEVICE NOT PRESENT
+// paths: FLOAD_OPEN answered not mine, FLOAD_OPEN answered 5, FLOAD_DMA answered not mine. In the remote get's "dbg" JSON
+// (docs/DESIGN.md 62). Main loop only: nothing here runs in the bus ISR.
+#define TD_CmdLogN 16
+struct stcVDCmdLog { uint32_t ms; uint8_t cmd, arg, len, stat, data, st, hiram; };
+static stcVDCmdLog tdCmdLog[TD_CmdLogN];
+static uint32_t tdCmdLogNext = 0, tdCmdT0 = 0;
+static uint32_t tdOpenNotMine = 0, tdOpen5 = 0, tdBlkNotMine = 0, tdOpens = 0;
+FLASHMEM void PollingHndlr_TDrive()
+{
+   if (vio == NULL) return;
+   uint8_t cmd = vioHot.cmd, arg = vioHot.arg, len = vioHot.len;
+   bool did = vio_poll(vio) != 0;
+   if (did)
+   {
+      stcVDCmdLog &e = tdCmdLog[tdCmdLogNext++ % TD_CmdLogN];
+      e.ms = millis() - tdCmdT0; e.cmd = cmd; e.arg = arg; e.len = len;
+      e.stat = vioHot.stat; e.data = vioHot.data; e.st = vioHot.st;
+#ifdef Fab04_TDrive
+      e.hiram = (uint8_t)(HIRAM_State | KDS_Guess << 2 | KDS_State << 4);
+#else
+      e.hiram = 0;
+#endif
+      if (cmd == VIO_FLOAD_OPEN)
+      {
+         tdOpens++;
+         if (vioHot.stat == VIO_NOTMINE) tdOpenNotMine++;
+         else if (vioHot.data == 5) tdOpen5++;
+      }
+      if ((cmd == VIO_FLOAD_DMA || cmd == VIO_FLOAD_BLK) && vioHot.stat == VIO_NOTMINE) tdBlkNotMine++;
+   }
+   TD_PollCommon(did);
+}
+FLASHMEM static int TD_CmdLogJson(char *out, size_t cap)
+{
+   int n = snprintf(out, cap, ",\"ld\":[%lu,%lu,%lu,%lu],\"now\":%lu,\"log\":\"",
+                    (unsigned long)tdOpens, (unsigned long)tdOpenNotMine, (unsigned long)tdOpen5, (unsigned long)tdBlkNotMine,
+                    (unsigned long)(millis() - tdCmdT0));
+   if (n <= 0 || (size_t)n >= cap) return 0;
+   uint32_t k = tdCmdLogNext > TD_CmdLogN ? tdCmdLogNext - TD_CmdLogN : 0;
+   for (; k < tdCmdLogNext; k++)
+   {
+      const stcVDCmdLog &e = tdCmdLog[k % TD_CmdLogN];
+      int m = snprintf(out + n, cap - n, "%lu:%u,%02x,%02x>%02x,%02x,%02x,%02x ", (unsigned long)e.ms, e.cmd, e.arg, e.len,
+                       e.stat, e.data, e.st, e.hiram);
+      if (m <= 0 || (size_t)(n + m) + 4 >= cap) break;
+      n += m;
+   }
+   out[n++] = '"'; out[n] = 0;
+   return n;
+}
+
+#endif
+
+// ---- remote control: the get / set commands on the TCP 2112 / USB serial port (SerUSBIO.ino) ------------------------------
+// Both run in the main loop, between polls, so they never see a half-processed mailbox command. A change of disk waits for a
+// quiet moment first (the C64 may be in the middle of a LOAD or SAVE); TD_Quiet() says when.
+#define TD_QuietMs      40     // no mailbox command for this long, and no LOAD / SAVE / bus transaction open
+#define TD_StaleMs      1000   // ... or nothing at all for this long: whatever was open has been abandoned
+#define TD_SwapWaitMs   3000   // give up waiting for a quiet moment after this long
+
+FLASHMEM static bool TD_Quiet()
+{
+   uint32_t idle = millis() - lastActivityMs;
+   if (idle >= TD_StaleMs) return true;
+   return idle >= TD_QuietMs && !vioHot.pending && tdrive_active(&vio->vd) < 0 && !vio->fl_active && !vio->fs_active;
+}
+
+static bool TD_RemoteReady(int unit)
+{
+   return vio != NULL && vioReady && unit >= 0 && unit <= 1 && vio->vd.unit[unit].present;
+}
+
+// The border flash's debug counters as `,"dbg":{...}` (see tdBorderDbg); 0 when they do not fit or there are none.
+static int TD_DbgJson(char *out, size_t cap);   // defined with the counters, below
+
+// One-line JSON for a unit; returns its length (0 = no such unit or TDrive not running).
+FLASHMEM size_t TDrive_RemoteStatus(int unit, char *out, size_t cap)
+{
+   if (!TD_RemoteReady(unit)) return 0;
+   stcVDUnit *u = &tdUnit[unit];
+   char path[TD_PathLen];
+   path[0] = 0;
+   if (u->mounted) TD_HostPath(u, u->imgName, path, sizeof path);
+   for (char *p = path; *p; p++) if (*p == '"' || *p == '\\') *p = '?';      // FAT cannot hold either; keep the JSON valid regardless
+   char cwd[TD_CwdLen];
+   strlcpy(cwd, u->cwd, sizeof cwd);
+   for (char *p = cwd; *p; p++) if (*p == '"' || *p == '\\') *p = '?';
+   int n = snprintf(out, cap,
+      "{\"unit\":%d,\"storage\":\"%s\",\"device\":%u,\"fixed\":%u,\"mounted\":%s,\"writable\":%s,\"path\":\"%s\",\"cwd\":\"%s\"",
+      unit, unit == 0 ? "sd" : "usb", vio->vd.dev[unit], vio->vd.pin[unit], u->mounted ? "true" : "false",
+      (u->mounted && u->d.write) ? "true" : "false", path, cwd[0] ? cwd : "/");
+   if (n <= 0 || (size_t)n >= cap) return 0;
+   n += TD_DbgJson(out + n, cap - n);
+   if ((size_t)n + 1 >= cap) return 0;
+   out[n++] = '}'; out[n] = 0;
+   return (size_t)n;
+}
+
+// Wait (up to TD_SwapWaitMs) for a quiet moment, polling the mailbox meanwhile, so the caller may touch the card: 0 = quiet now,
+// 2 = the C64 kept the drive busy (reason in msg). Used by the swap below and by the remote directory listing.
+FLASHMEM int TDrive_RemoteQuiet(char *msg, size_t cap)
+{
+   if (vio == NULL || !vioReady) { snprintf(msg, cap, "TDrive is not running"); return 1; }
+   uint32_t began = millis();
+   while (!TD_Quiet())
+   {
+      if (millis() - began > TD_SwapWaitMs) { snprintf(msg, cap, "C64 is busy with the drive"); return 2; }
+      if (tdDrivePoll) tdDrivePoll();  // keep answering the C64 while we wait
+   }
+   msg[0] = 0;
+   return 0;
+}
+
+// 0 = a readable .d64/.d71/.d81 file of at least D64 size; else 62 (not found) / 74 (not a disk image), reason in msg.
+FLASHMEM static int TD_CheckImage(FS *fs, const char *path, char *msg, size_t cap)
+{
+   File probe = fs->open(path, FILE_READ);
+   if (!probe) { snprintf(msg, cap, "file not found"); return 62; }
+   const char *slash = strrchr(path, '/');
+   bool bad = probe.isDirectory() || probe.size() < 174848 || !image_kind(slash ? slash + 1 : path);
+   probe.close();
+   if (bad) { snprintf(msg, cap, "not a disk image"); return 74; }
+   return 0;
+}
+
+// Select the disk image for a unit: path = "/dir/IMAGE.D64" (ASCII, on that unit's own card), "" = unmount (the folder stays).
+// Waits for a quiet moment (up to TD_SwapWaitMs, polling the mailbox meanwhile), then closes every channel on the unit and
+// mounts, exactly as CD: would. Returns 0, or a DOS error code with a short reason in msg; 1 = no such unit, 2 = not quiet in time.
+FLASHMEM int TDrive_RemoteSet(int unit, const char *aliasPath, char *msg, size_t cap)
+{
+   if (!TD_RemoteReady(unit)) { snprintf(msg, cap, "no such drive"); return 1; }
+   stcVDUnit *u = &tdUnit[unit];
+   if (aliasPath[0] && aliasPath[0] != '/') { snprintf(msg, cap, "path must start with /"); return 33; }
+   char path[TD_PathLen];
+   TD_ResolvePath(u->fs, aliasPath, path, sizeof path);                 // components may be C64 aliases (THE-PU^SIDE1.D64)
+   if (path[0])   // check the image before disturbing anything: a mistyped path must leave the current disk mounted
+   {
+      int r = TD_CheckImage(u->fs, path, msg, cap);
+      if (r) return r;
+   }
+   if (TDrive_RemoteQuiet(msg, cap)) return 2;
+   tdrive_close_unit(&vio->vd, unit);   // first, while the image they were opened on is still open: closing them after the swap wrote an
+                                        // open file's last block, BAM and entry into the new image (0.9.0.8-0.9.0.68)
+   if (!path[0])
+   {
+      TD_Unmount(NULL, unit);
+      tdrive_attach(&vio->vd, unit, NULL, 1);
+      vio_publish_devices(vio);
+      msg[0] = 0;
+      return 0;
+   }
+   char oldCwd[TD_CwdLen], oldImg[TD_CwdLen];
+   strlcpy(oldCwd, u->cwd, sizeof oldCwd);
+   strlcpy(oldImg, u->mounted ? u->imgName : "", sizeof oldImg);
+   int r = TD_MountPath(unit, path);
+   if (r)
+   {
+      strlcpy(u->cwd, oldCwd, sizeof u->cwd);                       // put the previous disk back
+      d64_t *d = NULL;
+      char old[TD_PathLen];
+      TD_HostPath(u, oldImg, old, sizeof old);
+      if (oldImg[0] && TD_MountHost(unit, old, &d) == 0) tdrive_attach(&vio->vd, unit, d, 1);
+      else tdrive_attach(&vio->vd, unit, NULL, 1);
+      snprintf(msg, cap, "cannot mount (DOS error %d)", r);
+      return r;
+   }
+   msg[0] = 0;
+   return 0;
+}
+
+// ---- remote control while TDrive is NOT running (the TR menu is showing) ------------------------------------------------------
+// Nothing is mounted then; what a unit will mount at the next start is its /.tdrive sidecar (unless the launch comes from a disk image
+// opened in the menu). So "get" reports that remembered image and "set" rewrites the sidecar: no handler, no mailbox, only the card.
+FLASHMEM static FS *TD_IdleFS(int unit)
+{
+   if (unit == 0) return &SD;
+   if (unit == 1 && USBFileSystemWait()) return &firstPartition;     // waits up to 1.5 s, as the other remote commands do
+   return NULL;
+}
+
+FLASHMEM size_t TDrive_RemoteIdleStatus(int unit, char *out, size_t cap)
+{
+   if (unit < 0 || unit > 1) return 0;
+   FS *fs = TD_IdleFS(unit);
+   char path[TD_PathLen];
+   path[0] = 0;
+   if (fs)
+   {
+      File f = fs->open(TD_Sidecar, FILE_READ);
+      if (f) { int n = f.read(path, sizeof path - 1); f.close(); path[n > 0 ? n : 0] = 0; }
+      TD_Squeeze(path);
+      if (path[0])
+      {
+         File probe = fs->open(path, FILE_READ);
+         bool ok = probe && !probe.isDirectory();
+         if (probe) probe.close();
+         if (!ok) path[0] = 0;                                        // remembered image is gone: it will start unmounted
+      }
+   }
+   for (char *p = path; *p; p++) if (*p == '"' || *p == '\\') *p = '?';
+   char cwd[TD_PathLen];
+   const char *slash = strrchr(path, '/');
+   size_t cl = slash ? (size_t)(slash - path) : 0;
+   memcpy(cwd, path, cl); cwd[cl] = 0;
+   uint8_t pin = EEPROM.read(eepAdTDriveDevs + unit);                 // 0 = automatic
+   if (pin < 8 || pin > 30) pin = 0;
+   int n = snprintf(out, cap,
+      "{\"unit\":%d,\"storage\":\"%s\",\"running\":false,\"device\":%u,\"fixed\":%u,\"mounted\":%s,\"writable\":true,\"path\":\"%s\",\"cwd\":\"%s\"}",
+      unit, unit == 0 ? "sd" : "usb", pin, pin, path[0] ? "true" : "false", path, cl ? cwd : "/");
+   return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
+// Same arguments and return codes as TDrive_RemoteSet (1 = no such unit / card, 33, 62, 74), but only the sidecar changes.
+FLASHMEM int TDrive_RemoteIdleSet(int unit, const char *path, char *msg, size_t cap)
+{
+   FS *fs = (unit >= 0 && unit <= 1) ? TD_IdleFS(unit) : NULL;
+   if (!fs) { snprintf(msg, cap, "no such drive"); return 1; }
+   char sq[TD_PathLen];
+   if (strlen(path) >= sizeof sq) { snprintf(msg, cap, "path too long"); return 33; }
+   char raw[TD_PathLen];
+   strlcpy(raw, path, sizeof raw);
+   TD_Squeeze(raw);
+   if (raw[0] && raw[0] != '/') { snprintf(msg, cap, "path must start with /"); return 33; }
+   TD_ResolvePath(fs, raw, sq, sizeof sq);                              // components may be C64 aliases
+   if (sq[0])
+   {
+      int r = TD_CheckImage(fs, sq, msg, cap);
+      if (r) return r;
+   }
+   if (fs->exists(TD_Sidecar)) fs->remove(TD_Sidecar);                // FILE_WRITE appends: start from an empty file
+   if (sq[0])
+   {
+      File f = fs->open(TD_Sidecar, FILE_WRITE);
+      if (!f) { snprintf(msg, cap, "cannot write /.tdrive"); return 74; }
+      f.write(sq, strlen(sq));
+      f.close();
+   }
+   msg[0] = 0;
+   return 0;
+}
+
+// ---- alt button: cycle through the disk images listed in /tdrive-config.txt ----------------------------------------------------
+// One tap picks the next image of the SD card's list, two taps within TD_TapWindowMs the USB drive's list; each list is the file
+// /tdrive-config.txt in the root of its own drive. One image per line:   /path/IMAGE.D64, colour, flashes
+// (colour = C64 colour 0..15 for the border, default 1; flashes = how many times, default 1; '#' starts a comment line). After the
+// change the border flashes that way (250 ms on, 750 ms off) so the switch can be seen without a screen full of text; a card or
+// stick that is missing, an unreadable list or no usable image in it flashes red quickly for 2 s. An image that has disappeared is
+// skipped. With nothing mounted (or an image that is not in the list) the first usable image is picked.
+// Wired to the TR's Alt button only when its setting (TR menu, settings) is "None": a chosen action is never taken over.
+// The border change itself is done by DMA (TD_BorderDMA below), under every handler: the KERNAL handlers and the agent alike
+// (docs/DESIGN.md 58; until 0.9.0.63 the KERNAL handlers' IRQ routine did it from a BORDER mailbox register).
+#define TD_CfgBufSize    2048
+#define TD_CfgMaxEntries 32
+#define TD_TapWindowMs   1000
+#define TD_FlashOnMs     250
+#define TD_FlashOffMs    750
+#define TD_ErrFlashMs    100    // red error flash: 100 ms on / 100 ms off for 2 s
+#define TD_ErrFlashes    10
+#define TD_SettleMs      100    // pause after SAVE and after the last RESTORE (kept from the IRQ-routine flash: same rhythm)
+#define TD_ColorRed      2
+
+struct stcVDCfgEntry { char *path; uint8_t color, flashes; };
+
+static char          tdCfgBuf[TD_CfgBufSize];
+static stcVDCfgEntry tdCfg[TD_CfgMaxEntries];
+
+// "...,  12 " -> 12 and the line cut before the comma; false (line untouched) when the last field is not a plain number
+FLASHMEM static bool TD_TrailingNumber(char *line, int *val)
+{
+   char *comma = strrchr(line, ',');
+   if (!comma) return false;
+   const char *p = comma + 1;
+   while (*p == ' ' || *p == '\t') p++;
+   if (!*p) return false;
+   int v = 0, digits = 0;
+   for (; *p >= '0' && *p <= '9'; p++) { v = v * 10 + (*p - '0'); if (++digits > 3) return false; }
+   while (*p == ' ' || *p == '\t') p++;
+   if (digits == 0 || *p) return false;
+   *comma = 0;
+   *val = v;
+   return true;
+}
+
+// Parses the text in place; returns the number of usable entries (lines that are not a "/path" are skipped).
+FLASHMEM static int TD_ParseConfig(char *text, stcVDCfgEntry *out, int max)
+{
+   int n = 0;
+   while (*text && n < max)
+   {
+      char *line = text;
+      while (*text && *text != '\n') text++;
+      if (*text) *text++ = 0;
+      char *end = line + strlen(line);
+      while (end > line && (end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+      while (*line == ' ' || *line == '\t') line++;
+      if (*line != '/') continue;                                 // comment, blank or not a path
+      int a = -1, b = -1;
+      if (TD_TrailingNumber(line, &a) && TD_TrailingNumber(line, &b)) { int t = a; a = b; b = t; }   // "path, colour, flashes"
+      else if (a >= 0) { b = -1; }                                // "path, colour"
+      end = line + strlen(line);
+      while (end > line && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+      if (end == line) continue;
+      out[n].path = line;
+      out[n].color = (a < 0) ? 1 : (uint8_t)(a & 0x0F);
+      out[n].flashes = (b < 0) ? 1 : (uint8_t)(b > 20 ? 20 : b);
+      n++;
+   }
+   return n;
+}
+
+// ---- Alt-button trace (docs/DESIGN.md 60): every step from the button to the border write ----
+// Printed on the serial console as it happens (flushed; never while the C64 is held), and kept in the Teensy core's six CrashReport
+// breadcrumbs (0x2027FFC0, the top of RAM2, not cleared by a reboot). TD_TraceBoot() copies them, and the core's fault record, at
+// power-up before upstream's CrashReport print; the next TDrive PreStart prints them, when a serial monitor is listening again.
+//   crumb 1: last step << 24 | its detail       crumb 2: millis() at it      crumb 3: the last four steps, newest in the low byte
+//   crumb 4: Alt setting (rpud2AltBtn* bits) | TDrive owns the button << 8 | a handler is hooked << 9 | DMA_State << 24
+//   crumb 5: border requests << 16 | $D020 writes                crumb 6: holds that failed << 16 | not the VIC (low 16)
+// A line "!nodma" in the config file skips the border write (no hold at all): the disk still switches, so the two can be told apart.
+#ifdef Fab04_TDrive
+#ifndef TD_TRACE_BC
+#define TD_TRACE_BC    ((volatile uint32_t *)0x2027FFC0)   // crashreport_breadcrumbs_struct: bitmask, value[6], checksum
+#define TD_TRACE_FAULT ((volatile uint32_t *)0x2027FF80)   // arm_fault_info_struct: len, ipsr, cfsr, hfsr, mmfar, bfar, ret, xpsr, temp, time, crc
+#define TD_TRACE_SRSR  (SRC_SRSR)
+#endif
+enum { TDT_Button = 1, TDT_Tap, TDT_Switch, TDT_Mounted, TDT_SwitchFail, TDT_Flash, TDT_Request, TDT_Hold, TDT_Read, TDT_Write,
+       TDT_Released, TDT_NoDma, TDT_Count };
+static const char *const tdTraceName[TDT_Count] = { "?", "button", "tap", "switch unit", "mounted entry", "switch failed (reason)",
+   "flash colour|count<<8", "border request", "held", "VIC read ($D020|ok<<8)", "$D020 written", "released (us)", "no DMA (!nodma)" };
+static uint32_t tdTraceHist = 0;
+static bool     tdNoDma = false;
+static uint32_t tdBorderTries = 0;   // attempts at the current request (retried while I/O is banked out): print the 1st and every 1000th
+static struct { bool valid, fault; uint32_t mask, bc[6], cfsr, hfsr, ret, srsr; } tdTraceBoot;
+extern void (*fSpecialBtnChange)(bool Up_nDn);
+FLASHMEM void SpecialBtn_TDrive(bool Up_nDn);
+
+static uint32_t TD_BcSum(volatile const uint32_t *bc)   // CrashReportClass::checksum(bc, 28)
+{
+   volatile const uint16_t *p = (volatile const uint16_t *)bc;
+   uint32_t a = 1, b = 0;
+   for (int i = 0; i < 14; i++) { a += p[i]; b += a; }
+   return (a & 0xFFFF) | ((b & 0xFFFF) << 16);
+}
+
+static void TD_Crumb(int n, uint32_t v)   // CrashReport.breadcrumb(n, v), n = 1..6
+{
+   volatile uint32_t *bc = TD_TRACE_BC;
+   bc[n] = v;
+   bc[0] |= 1u << (n - 1);
+   bc[7] = TD_BcSum(bc);
+   arm_dcache_flush((void *)bc, 32);
+}
+
+FLASHMEM static void TD_Trace(uint8_t step, uint32_t detail, bool print = true)
+{
+   tdTraceHist = (tdTraceHist << 8) | step;
+   const uint32_t now = millis();
+   TD_Crumb(1, (uint32_t)step << 24 | (detail & 0xFFFFFF));
+   TD_Crumb(2, now);
+   TD_Crumb(3, tdTraceHist);
+   TD_Crumb(4, (IO1[rwRegPwrUpDefaults2] & rpud2AltBtnActionMask) | (fSpecialBtnChange == &SpecialBtn_TDrive) << 8 |
+               (fSpecialBtnChange != NULL) << 9 | (uint32_t)(int)DMA_State << 24);
+   if (!print) return;
+   Serial.printf("TDrive trace %lu ms: %s %lu (0x%lx)\n", (unsigned long)now, tdTraceName[step < TDT_Count ? step : 0],
+                 (unsigned long)detail, (unsigned long)detail);
+   Serial.flush();
+}
+
+// Teensy.ino's loop, before it calls fSpecialBtnChange: which action the press goes to (the Alt setting must be "None" for TDrive's)
+FLASHMEM void TD_TraceButton(bool Up_nDn)
+{
+   TD_Trace(TDT_Button, (Up_nDn ? 1 : 0) | (fSpecialBtnChange != NULL) << 1 | (fSpecialBtnChange == &SpecialBtn_TDrive) << 2 |
+                        (uint32_t)(IO1[rwRegPwrUpDefaults2] & rpud2AltBtnActionMask) << 8);
+}
+
+// setup(), ahead of upstream's `if (CrashReport) Serial.print(CrashReport)`, which clears the record (and is printed before a serial
+// monitor has reconnected): keep a copy for TD_TraceReport(), and clear our crumbs so an old trace does not come back.
+FLASHMEM void TD_TraceBoot()
+{
+   volatile uint32_t *bc = TD_TRACE_BC, *f = TD_TRACE_FAULT;
+   tdTraceBoot.mask = (bc[0] & 0x3F) && bc[7] == TD_BcSum(bc) ? bc[0] & 0x3F : 0;
+   for (int i = 0; i < 6; i++) tdTraceBoot.bc[i] = bc[1 + i];
+   uint32_t crc = 0xFFFFFFFF;                                       // the core's isvalid(): len 11 words, CRC-32 over the first 10
+   for (int w = 0; w < 10; w++) { crc ^= f[w]; for (int i = 0; i < 32; i++) crc = (crc >> 1) ^ (crc & 1) * 0xEDB88320; }
+   tdTraceBoot.fault = f[0] == 11 && crc == f[10];
+   tdTraceBoot.cfsr = f[2]; tdTraceBoot.hfsr = f[3]; tdTraceBoot.ret = f[6];
+   tdTraceBoot.srsr = TD_TRACE_SRSR;
+   tdTraceBoot.valid = tdTraceBoot.mask != 0 || tdTraceBoot.fault;
+   bc[0] = 0; bc[7] = TD_BcSum(bc);
+   arm_dcache_flush((void *)bc, 32);
+}
+
+FLASHMEM static void TD_TraceReport()
+{
+   if (!tdTraceBoot.valid) return;
+   tdTraceBoot.valid = false;
+   Serial.printf("TDrive trace from before the last reboot (SRC_SRSR 0x%lx):\n", (unsigned long)tdTraceBoot.srsr);
+   if (tdTraceBoot.fault)
+      Serial.printf("  CPU fault: return address 0x%08lx, CFSR 0x%08lx, HFSR 0x%08lx\n", (unsigned long)tdTraceBoot.ret,
+                    (unsigned long)tdTraceBoot.cfsr, (unsigned long)tdTraceBoot.hfsr);
+   else Serial.println("  no CPU fault recorded");
+   const uint32_t *b = tdTraceBoot.bc, m = tdTraceBoot.mask;
+   if (m & 1)
+   {
+      uint8_t st = b[0] >> 24;
+      Serial.printf("  last step: %s %lu (0x%lx)", tdTraceName[st < TDT_Count ? st : 0], (unsigned long)(b[0] & 0xFFFFFF), (unsigned long)(b[0] & 0xFFFFFF));
+      if (m & 2) Serial.printf(" at %lu ms", (unsigned long)b[1]);
+      Serial.println("");
+   }
+   if (m & 4)
+   {
+      Serial.printf("  steps, newest first:%s", "");
+      for (int i = 0; i < 4; i++) { uint8_t st = b[2] >> (8 * i); if (st) Serial.printf(" [%s]", tdTraceName[st < TDT_Count ? st : 0]); }
+      Serial.println("");
+   }
+   if (m & 8) Serial.printf("  Alt setting 0x%02lx (0x20 = None), TDrive owns the button %lu, a handler hooked %lu, DMA_State %lu\n",
+                            (unsigned long)(b[3] & 0xFF), (unsigned long)(b[3] >> 8 & 1), (unsigned long)(b[3] >> 9 & 1), (unsigned long)(b[3] >> 24));
+   if (m & 16) Serial.printf("  border requests %lu, $D020 writes %lu\n", (unsigned long)(b[4] >> 16), (unsigned long)(b[4] & 0xFFFF));
+   if (m & 32) Serial.printf("  holds failed %lu, not the VIC %lu\n", (unsigned long)(b[5] >> 16), (unsigned long)(b[5] & 0xFFFF));
+   Serial.flush();
+}
+
+// a line "!nodma" (alone, any case) in the list
+FLASHMEM static bool TD_HasNoDmaLine(const char *t)
+{
+   for (const char *l = t; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL)
+   {
+      while (*l == ' ' || *l == '\t') l++;
+      if (strncasecmp(l, "!nodma", 6) == 0 && (l[6] == 0 || l[6] == '\r' || l[6] == '\n' || l[6] == ' ')) return true;
+   }
+   return false;
+}
+#else
+static inline void TD_Trace(uint8_t, uint32_t, bool = true) {}
+static inline void TD_TraceReport() {}
+static bool tdNoDma = false;   // never read without the TR+'s border write
+static inline bool TD_HasNoDmaLine(const char *) { return false; }
+enum { TDT_Button = 1, TDT_Tap, TDT_Switch, TDT_Mounted, TDT_SwitchFail, TDT_Flash, TDT_Request, TDT_Hold, TDT_Read, TDT_Write, TDT_Released, TDT_NoDma };
+#endif
+
+// ---- the border write: by DMA (TR+), docs/DESIGN.md 57-58 ----
+// One hold of the CPU per request: read $D020-$D03F and write $D020 only if those bytes are the VIC's (the colour registers read
+// back with their top nibble set, $D031-$D03F read $FF; the same on a C64 and on a C128's VIC-IIe). A program with I/O banked out at
+// that moment (the RAM or the character ROM at $D000) is not written to: the request is tried again from TD_AltPoll(). Nothing can
+// change the banks between the check and the write, since the CPU stays held. 80 columns (the VDC) are not flashed.
+// Requests are the VIO_BRD_* codes. false = not done now (I/O not mapped in, the C64 held by the host, ...).
+static uint8_t tdBorderSaved = 0xFF;   // the colour saved by VIO_BRD_SAVE; 0xFF = none
+#ifdef Fab04_TDrive
+extern bool isFrozen;               // Teensy.ino: the host holds the C64 (a hold of ours would end theirs)
+
+// The border flash's counters (docs/DESIGN.md 60), in the remote get's JSON ("dbg"; trlib's vdrive_get shows it, trvdrive does not)
+// and in the Alt-button trace below. Counted since the handler started.
+//   brd:   requests, HoldC64 failed, transfer timed out, not the VIC (I/O banked out), $D020 writes, CloseDMA failed, longest request (us)
+struct stcVDBorderDbg { uint32_t req, holdFail, xferFail, notVIC, written, closeFail, maxUs; };
+static stcVDBorderDbg tdBorderDbg;
+
+FLASHMEM static bool TD_HeldDMA(DMA_Trans_RnW RnW, uint16_t addr, uint8_t *buf, uint32_t len)
+{  // one transfer inside HoldC64() ... CloseDMA(): what FinishDMA() does after its start handshake
+   SetUpDMA(RnW, addr, buf, len, DMA_ADDR_INCREMENT);
+   DMA_State = DMA_S_TransferExecuting;
+   uint32_t t0 = millis();
+   while (DMA_State != DMA_S_TransferComplete) if (millis() - t0 > 50) return false;
+   return true;
+}
+
+FLASHMEM static bool TD_LooksLikeVIC(const uint8_t *r)   // r = $D020-$D03F
+{
+   for (int i = 0; i <= 0x0E; i++) if ((r[i] & 0xF0) != 0xF0) return false;     // $D020-$D02E: colour registers
+   for (int i = 0x11; i < 0x20; i++) if (r[i] != 0xFF) return false;           // $D031-$D03F: unused
+   return true;
+}
+
+FLASHMEM static bool TD_BorderDMA(uint8_t reg)
+{
+   if (isFrozen) return false;
+   uint8_t color;
+   if (reg == VIO_BRD_RESTORE) { if (tdBorderSaved == 0xFF) return true; color = tdBorderSaved; }
+   else if ((reg & 0xF0) == VIO_BRD_SET) { if (tdBorderSaved == 0xFF) return true; color = reg & 0x0F; }   // not saved: never flash
+   else if (reg != VIO_BRD_SAVE) return true;
+   if (tdNoDma) { TD_Trace(TDT_NoDma, reg); return true; }   // "!nodma" in the list: switch without the flash
+   uint8_t vic[0x20];
+   const uint32_t t0 = micros();
+   tdBorderDbg.req++;
+   bool ok = HoldC64();
+   if (!ok) tdBorderDbg.holdFail++;
+   else
+   {  // crumbs only while the C64 is held: no serial output until it runs again
+      TD_Trace(TDT_Hold, reg, false);
+      if (!TD_HeldDMA(DMA_READ, 0xD020, vic, sizeof vic)) { ok = false; tdBorderDbg.xferFail++; }
+      else
+      {
+         const bool vicOk = TD_LooksLikeVIC(vic);
+         TD_Trace(TDT_Read, vic[0] | (vicOk ? 0x100 : 0), false);
+         if (!vicOk) { ok = false; tdBorderDbg.notVIC++; }
+      }
+   }
+   if (ok)
+   {
+      if (reg == VIO_BRD_SAVE) tdBorderSaved = vic[0] & 0x0F;
+      else if (!TD_HeldDMA(DMA_WRITE, 0xD020, &color, 1)) { ok = false; tdBorderDbg.xferFail++; }
+      else { tdBorderDbg.written++; TD_Trace(TDT_Write, color, false); }
+   }
+   if (!CloseDMA()) tdBorderDbg.closeFail++;
+   const uint32_t us = micros() - t0;
+   if (us > tdBorderDbg.maxUs) tdBorderDbg.maxUs = us;
+   TD_Crumb(5, tdBorderDbg.req << 16 | (tdBorderDbg.written & 0xFFFF));
+   TD_Crumb(6, tdBorderDbg.holdFail << 16 | (tdBorderDbg.notVIC & 0xFFFF));
+   const bool say = ++tdBorderTries == 1 || tdBorderTries % 1000 == 0;
+   TD_Trace(TDT_Released, us, say);
+   if (say) Serial.printf("  hold %s: held %u, failed: hold %lu, transfer %lu, not VIC %lu, release %lu; longest %lu us\n",
+                 ok ? "done" : "not done (retried)", (unsigned)(tdBorderDbg.req - tdBorderDbg.holdFail), (unsigned long)tdBorderDbg.holdFail,
+                 (unsigned long)tdBorderDbg.xferFail, (unsigned long)tdBorderDbg.notVIC, (unsigned long)tdBorderDbg.closeFail,
+                 (unsigned long)tdBorderDbg.maxUs);
+   if (say) Serial.flush();
+   return ok;                       // the saved colour stays for the next flash of the sequence; the next SAVE replaces it
+}
+
+FLASHMEM static int TD_DbgJson(char *out, size_t cap)
+{
+   const stcVDBorderDbg &b = tdBorderDbg;
+   int n = snprintf(out, cap, ",\"dbg\":{\"brd\":[%lu,%lu,%lu,%lu,%lu,%lu,%lu]",
+                    (unsigned long)b.req, (unsigned long)b.holdFail, (unsigned long)b.xferFail, (unsigned long)b.notVIC,
+                    (unsigned long)b.written, (unsigned long)b.closeFail, (unsigned long)b.maxUs);
+   if (n <= 0 || (size_t)n >= cap) return 0;
+#ifdef Fab04_TDriveDMALoad
+   const stcVDDmaDbg &d = tdDmaDbg;   // DMAs, PerformDMA failed, CloseDMA failed, longest (us), last failure (ms), its address
+   int m = snprintf(out + n, cap - n, ",\"dma\":[%lu,%lu,%lu,%lu,%lu,%u]", (unsigned long)d.n, (unsigned long)d.startFail,
+                    (unsigned long)d.closeFail, (unsigned long)d.maxUs, (unsigned long)(d.lastFailMs ? d.lastFailMs - tdCmdT0 : 0),
+                    d.lastFailAddr);
+   if (m <= 0 || (size_t)(n + m) >= cap) return 0;
+   n += m;
+#endif
+   n += TD_CmdLogJson(out + n, cap - n);
+   if ((size_t)n + 2 >= cap) return 0;
+   out[n++] = '}'; out[n] = 0;
+   return n;
+}
+#else
+static bool TD_BorderDMA(uint8_t) { return true; }   // the plain TR has no Alt button: never called
+static int TD_DbgJson(char *, size_t) { return 0; }
+#endif
+
+// ---- border flash sequencer (main loop, driven from PollingHndlr_TDrive) ----
+enum { TDF_Idle, TDF_Save, TDF_On, TDF_Off, TDF_Restore };
+struct stcVDFlash
+{
+   uint8_t  phase, color, left;
+   uint16_t onMs, offMs;
+   uint32_t since;
+   bool     queued;            // a new sequence waits for the running one to give the colour back
+   uint8_t  qColor, qCount;
+   uint16_t qOnMs, qOffMs;
+};
+static stcVDFlash tdFlash;
+static uint8_t tdBorderReq = VIO_BRD_IDLE;   // the current request (VIO_BRD_*)
+static bool tdBorderRetry = false;
+
+FLASHMEM static void TD_FlashPhase(uint8_t phase, uint8_t reg)
+{
+   tdFlash.phase = phase;
+   tdFlash.since = millis();
+   tdBorderReq = reg;
+#ifdef Fab04_TDrive
+   tdBorderTries = 0;
+#endif
+   if (reg != VIO_BRD_IDLE) TD_Trace(TDT_Request, reg);
+   tdBorderRetry = reg != VIO_BRD_IDLE && !TD_BorderDMA(reg);
+}
+
+FLASHMEM static void TD_FlashBegin(uint8_t color, uint8_t count, uint16_t onMs, uint16_t offMs)
+{
+   tdFlash.color = color; tdFlash.left = count; tdFlash.onMs = onMs; tdFlash.offMs = offMs;
+   if (count == 0) { TD_FlashPhase(TDF_Idle, VIO_BRD_IDLE); return; }
+   TD_FlashPhase(TDF_Save, VIO_BRD_SAVE);
+}
+
+FLASHMEM static void TD_Flash(uint8_t color, uint8_t count, uint16_t onMs, uint16_t offMs)
+{
+   TD_Trace(TDT_Flash, color | count << 8);
+   if (tdFlash.phase == TDF_Idle) { TD_FlashBegin(color, count, onMs, offMs); return; }
+   tdFlash.queued = true;                                         // saving now would remember the flash colour: restore first
+   tdFlash.qColor = color; tdFlash.qCount = count; tdFlash.qOnMs = onMs; tdFlash.qOffMs = offMs;
+   TD_FlashPhase(TDF_Restore, VIO_BRD_RESTORE);
+}
+
+FLASHMEM static void TD_FlashPoll()
+{
+   if (tdFlash.phase == TDF_Idle) return;
+   uint32_t held = millis() - tdFlash.since;
+   switch (tdFlash.phase)
+   {
+      case TDF_Save:
+         if (held >= TD_SettleMs) TD_FlashPhase(TDF_On, VIO_BRD_SET | tdFlash.color);
+         break;
+      case TDF_On:
+         if (held >= tdFlash.onMs) { tdFlash.left--; TD_FlashPhase(TDF_Off, VIO_BRD_RESTORE); }
+         break;
+      case TDF_Off:
+         if (tdFlash.left == 0 ? held >= TD_SettleMs : held >= tdFlash.offMs)
+         {
+            if (tdFlash.left == 0) TD_FlashPhase(TDF_Idle, VIO_BRD_IDLE);     // the last flash needs no pause behind it
+            else TD_FlashPhase(TDF_On, VIO_BRD_SET | tdFlash.color);
+         }
+         break;
+      case TDF_Restore:                                            // aborted sequence: colour given back, then the queued one
+         if (held >= TD_SettleMs)
+         {
+            TD_FlashPhase(TDF_Idle, VIO_BRD_IDLE);
+            if (tdFlash.queued) { tdFlash.queued = false; TD_FlashBegin(tdFlash.qColor, tdFlash.qCount, tdFlash.qOnMs, tdFlash.qOffMs); }
+         }
+         break;
+   }
+}
+
+FLASHMEM static void TD_FlashError() { TD_Flash(TD_ColorRed, TD_ErrFlashes, TD_ErrFlashMs, TD_ErrFlashMs); }
+
+// ---- the switch itself ----
+FLASHMEM static bool TD_SameImage(const char *a, const char *b)
+{
+   char x[TD_PathLen], y[TD_PathLen];
+   strlcpy(x, a, sizeof x); strlcpy(y, b, sizeof y);
+   TD_Squeeze(x); TD_Squeeze(y);
+   return strcasecmp(x, y) == 0;
+}
+
+// Select the next usable image of the unit's list; flashes the result. Returns true when an image was mounted.
+FLASHMEM static bool TD_SwitchNext(int unit)
+{
+   char msg[64];
+   if (!TD_RemoteReady(unit)) { TD_Trace(TDT_SwitchFail, 1); TD_FlashError(); return false; }           // no card / stick (or TDrive not running)
+   stcVDUnit *u = &tdUnit[unit];
+   if (TDrive_RemoteQuiet(msg, sizeof msg)) { TD_Trace(TDT_SwitchFail, 2); TD_FlashError(); return false; }   // card access only at a quiet moment
+   File f = u->fs->open(TD_ConfigName, FILE_READ);
+   if (!f || f.isDirectory()) { if (f) f.close(); TD_Trace(TDT_SwitchFail, 3); TD_FlashError(); return false; }
+   int len = f.read(tdCfgBuf, TD_CfgBufSize - 1);
+   f.close();
+   if (len <= 0) { TD_Trace(TDT_SwitchFail, 4); TD_FlashError(); return false; }
+   tdCfgBuf[len] = 0;
+   tdNoDma = TD_HasNoDmaLine(tdCfgBuf);
+   int n = TD_ParseConfig(tdCfgBuf, tdCfg, TD_CfgMaxEntries);
+   if (n == 0) { TD_Trace(TDT_SwitchFail, 5); TD_FlashError(); return false; }
+
+   int start = 0;                                                          // nothing mounted, or not in the list: the first one
+   if (u->mounted)
+   {
+      char cur[TD_PathLen];
+      TD_HostPath(u, u->imgName, cur, sizeof cur);
+      for (int i = 0; i < n; i++)
+      {
+         char host[TD_PathLen];                                            // TDrive Config writes aliases (THE-PU^SIDE1.D64): compare host names
+         if (TD_SameImage(cur, tdCfg[i].path)) { start = (i + 1) % n; break; }
+         if (!strchr(tdCfg[i].path, '^')) continue;
+         TD_ResolvePath(u->fs, tdCfg[i].path, host, sizeof host);
+         if (TD_SameImage(cur, host)) { start = (i + 1) % n; break; }
+      }
+   }
+   for (int k = 0; k < n; k++)
+   {
+      stcVDCfgEntry *e = &tdCfg[(start + k) % n];
+      char host[TD_PathLen];
+      TD_ResolvePath(u->fs, e->path, host, sizeof host);
+      if (TD_CheckImage(u->fs, host, msg, sizeof msg)) continue;          // gone (or not an image): next one
+      uint8_t color = e->color, count = e->flashes;
+      int r = TDrive_RemoteSet(unit, host, msg, sizeof msg);
+      if (r == 0) { TD_Trace(TDT_Mounted, (start + k) % n); TD_Flash(color, count, TD_FlashOnMs, TD_FlashOffMs); return true; }
+      if (r == 2) break;                                                   // the C64 never let go of the drive
+   }
+   TD_Trace(TDT_SwitchFail, 6);
+   TD_FlashError();
+   return false;
+}
+
+// ---- Alt button: tap counting ----
+static uint8_t  tdTaps = 0;
+static uint32_t tdTapFirstMs = 0;
+static bool     tdSwitching = false;
+
+FLASHMEM void SpecialBtn_TDrive(bool Up_nDn)
+{
+   if (Up_nDn) return;                                // act on the press
+   if (tdTaps == 0) tdTapFirstMs = millis();
+   if (tdTaps < 2) tdTaps++;
+   TD_Trace(TDT_Tap, tdTaps);
+}
+
+FLASHMEM void TD_AltPoll()
+{
+   if (tdBorderRetry) tdBorderRetry = !TD_BorderDMA(tdBorderReq);
+   TD_FlashPoll();
+   if (tdTaps == 0 || tdSwitching) return;
+   if (tdTaps < 2 && millis() - tdTapFirstMs < TD_TapWindowMs) return;     // a second tap may still come
+   int unit = tdTaps >= 2 ? 1 : 0;
+   tdTaps = 0;
+   tdSwitching = true;                                // TDrive_RemoteQuiet() polls: do not re-enter from there
+   TD_Trace(TDT_Switch, unit);
+   TD_SwitchNext(unit);
+   tdSwitching = false;
+}
+
+FLASHMEM void TD_AltButtonInit()
+{
+   tdTaps = 0; tdFlash.phase = TDF_Idle; tdFlash.queued = false; tdBorderRetry = false;
+   tdBorderReq = VIO_BRD_IDLE; tdBorderSaved = 0xFF;
+#ifdef Fab04_TDrive
+   memset(&tdBorderDbg, 0, sizeof tdBorderDbg);
+   memset(tdCmdLog, 0, sizeof tdCmdLog); tdCmdLogNext = 0; tdCmdT0 = millis();   // the command log and counters
+   tdOpenNotMine = tdOpen5 = tdBlkNotMine = tdOpens = 0;
+#ifdef Fab04_TDriveDMALoad
+   memset(&tdDmaDbg, 0, sizeof tdDmaDbg);
+#endif
+#endif
+#ifdef Fab04_SpecialButton
+   if ((IO1[rwRegPwrUpDefaults2] & rpud2AltBtnActionMask) == rpud2AltBtnNone) fSpecialBtnChange = &SpecialBtn_TDrive;
+#endif
+}
+
+static_assert(offsetof(vio_hot_t, cmd) == VIO_CMD && offsetof(vio_hot_t, arg) == VIO_ARG && offsetof(vio_hot_t, data) == VIO_DATA &&
+              offsetof(vio_hot_t, stat) == VIO_STAT && offsetof(vio_hot_t, st) == VIO_ST && offsetof(vio_hot_t, len) == VIO_LEN &&
+              offsetof(vio_hot_t, dev0) == VIO_DEV0 && offsetof(vio_hot_t, dev1) == VIO_DEV1 &&
+              offsetof(vio_hot_t, id0) == VIO_ID0 && offsetof(vio_hot_t, id1) == VIO_ID1, "register bytes must stay in register order");
+
+#ifdef Fab04_TDrive
+FASTRUN void IO1Hndlr_TDrive(uint8_t Address, bool R_Wn)
+{
+   Address -= TD_MboxBase;                                 // wraps for offsets below the base
+   if (!vioReady || Address >= VIO_NREGS) return;         // not mapped: open bus
+   // Read straight from the register bytes (cmd..dev1 are laid out in register order): every cycle before the data lines are
+   // driven eats into the 6510's setup time, and the call + switch of vio_io1_read() made this path the slowest one (about one
+   // wrong byte in 8000 reads on a real C64, see tests/asm/bustest.s).
+   if (R_Wn) DataPortWriteWaitLog(reinterpret_cast<volatile uint8_t *>(&vioHot)[Address]);
+   else
+   {
+      uint8_t Data = DataPortWaitRead();
+      TraceLogAddValidData(Data);
+      vio_io1_write(&vioHot, Address, Data);
+   }
+}
+#endif
+
+FASTRUN void IO2Hndlr_TDrive(uint8_t Address, bool R_Wn)
+{
+   Address -= VIO_WIN_OFS;                                 // window at $DF80-$DFFF; $DF00-$DF7F wraps past it: open bus
+   if (!vioReady || Address >= VIO_WIN) return;           // (the REU's registers in IOH_TDriveREU.c)
+   if (R_Wn) DataPortWriteWaitLog(vioHot.window[Address]);   // straight from the struct, as in IO1Hndlr_TDrive
+   else
+   {
+      uint8_t Data = DataPortWaitRead();
+      TraceLogAddValidData(Data);
+      vio_io2_write(&vioHot, Address, Data);
+   }
+}

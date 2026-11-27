@@ -14,9 +14,13 @@
    #define Fab04_REU                  //include REU  Special IO
    #define Fab04_Freezers             //include Freezer cart support
    #define Fab04_KernalReplace        //include Kernal Replacement support
+   #define Fab04_TDrive               //virtual IEC drive for the replacement KERNAL (needs Fab04_KernalReplace)
+   #define Fab04_TDriveDMALoad        //TDrive LOAD writes C64 RAM by DMA (needs Fab04_FullDMACapable); off: the 128-byte window only
    //#define Fab04_GlobalKernalReplace  //force kernal enable on all PRG launches, regardless of Special IO settings
    #define Fab04_DebugSignals         //For debug only
 #endif
+#define TDrive_Agent   //virtual IEC drive through the KERNAL's RAM vectors and a 6502 agent served from IO1 (no Kernal Replace)
+#define TDrive_Any     //any TDrive Special IO: the agent, and on the TR+ the replacement-KERNAL ones (Fab04_TDrive)
 
 #if defined(DbgSnoopTap) && defined(Fab04_FullDMACapable) && !defined(MinimumBuild)
    #define SnoopTapBuild              //the snoop tap's hooks in isrPHI2 and the data port waits
@@ -42,7 +46,7 @@
   // #define DbgSignalSenseReset
 
 
-#define TRVersion              "0.9.0.1"    //*VERSION*
+#define TRVersion              "0.9.0.1.78"    //*VERSION*  (stock 0.9.0.1 + TDrive rev 78)
 // Special builds: tools/build-firmware.mjs --tag <name> defines TRVersionSuffix as "-<name>",
 // and a build with uncommitted edits to the image sources adds "*". Arduino IDE builds have
 // none. Leave TRVersion to releases: it names the hex and the browser's User-Agent.
@@ -104,6 +108,8 @@ static_assert(sizeof(strVersionNumber) <= 41, "strVersionNumber must fit the 40-
 #define FWCheckToken      0x64E0  // Check firmware type
 #define FWMinimalToken    0x64E1  // Minimal firmware response
 #define FWFullToken       0x64E2  // Full firmware response
+#define TDriveGetToken    0x64E3  // TDrive: read what a unit has mounted
+#define TDriveSetToken    0x64E4  // TDrive: mount an image on a unit / unmount
 
 
 #define eepMagicNum         0xfeed6415 // 01: 6/22/23  net settings added 
@@ -155,7 +161,8 @@ enum InternalEEPROMmap
    eepAdMIDISettings2 = 4233, // (1:uint8_t)    MIDI Settings reg#2, see RegMIDISettingsMasks2
    eepAdPwrUpDefaults3= 4234, // (1:uint8_t)    power up default reg3, see bit mask defs RegPowerUpDefaultMasks3
    
-   eepAdNext          = 4235, // Next address to be used
+   eepAdTDriveDevs    = 4235, // (2:uint8_t x2)  TDrive KERNAL device numbers of the SD / USB units, 0 = default (TD_DEV0/1)
+   eepAdNext          = 4237, // Next address to be used
    eepAdUnused        = eepAdNext, // Reserved for future use, initialized to 0
    eepAdUnusedSize    = (4284-eepAdUnused), //Max size = 4284 (emulated in flash)
 };

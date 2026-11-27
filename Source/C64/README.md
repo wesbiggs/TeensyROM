@@ -48,6 +48,7 @@ What gets built, and how, is `tools/c64-projects.json`; the format is described 
 | `TRHelpScreens` | Help screens displayed from the TeensyROM menu |
 | `TRExtPortCheck` | External port check utility |
 | `ExpansionPortTest` | Expansion (cartridge) port test utility (TR+ only) |
+| `TDriveConfig` | TDrive Config: edits the Alt-button disk lists and the mounted images (TR menu, TDrive Special IOs). Its source is teensyrom-tdrive's `util/tdconfig.asm`, copied unchanged by that repository's `tools/make_tr_patch.sh` |
 | `C128PrgBoot` | C128 function ROM that streams a $1C01 BASIC program in and runs it in C128 mode |
 | `ASIDPlayer` | ASID (MIDI SID) player application |
 | `MIDI2SID` | MIDI-to-SID synthesizer application |

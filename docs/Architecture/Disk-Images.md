@@ -80,8 +80,9 @@ is the policy for when, so that every such caller does it the same way:
   `File::flush()` does not.
 * `ImageWriteBackForget` when the image is closed.
 
-The TR block device (`TRBlockIO.c`) uses it with an `FsFile`. VDrive takes it when it moves onto this tree: its
-units keep their own dirty flag and idle timer today, and flush through `File::flush()`, which drops a failed sync.
+The TR block device (`TRBlockIO.c`) and the TDrive units (`IOH_TDrive.c`, the firmware's name for VDrive) both use it with
+an `FsFile`: each unit keeps a `struct ImageWriteBack`, records its writes, and syncs through `FsFile::sync()` so a sync
+the card fails leaves the image dirty and is tried again.
 
 ## Tests
 

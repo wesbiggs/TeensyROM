@@ -91,6 +91,27 @@ loaded  lda prgEnd
 
         lda #SYSTEM_BANK
         sta MMU_CR
+        ; TDrive agent (teensyrom-tdrive, docs/DESIGN.md 56): let it hook the KERNAL's vectors now that the program is in memory
+        lda $df09
+        cmp #$d6
+        bne +
+        lda $df0a
+        cmp #$64
+        bne +
+        lda $de14
+        cmp #$20
+        bne +
+        lda #$a5
+        jsr $de14
++
+        lda prgEnd              ; an empty program (Exit to C128 BASIC with the agent): BASIC without RUN
+        cmp #<(BASIC_START + 2)
+        bne +
+        lda prgEnd + 1
+        cmp #>(BASIC_START + 2)
+        bne +
+        jmp (BASIC_RESTART)
++
         ldx #runKeysEnd - runKeys - 1
 -       lda runKeys,x
         sta KEYBOARD_BUFFER,x

@@ -121,6 +121,12 @@ struct stcIOHandlers
    #ifdef Fab04_KernalReplace
       #include "IO_Handlers/IOH_KernalReplace.c"
    #endif    
+   #ifdef TDrive_Any
+      #include "IO_Handlers/IOH_TDrive.c"
+   #endif    
+   #ifdef TDrive_Agent
+      #include "IO_Handlers/IOH_TDriveAgent.c"   //needs IOH_TDrive.c
+   #endif    
       #include "IO_Handlers/IOH_TeensyROM.c" 
    #ifdef Fab04_Freezers
       #include "IO_Handlers/IOH_SuperSnapshotV5.c"
@@ -130,6 +136,13 @@ struct stcIOHandlers
    #endif
       #include "IO_Handlers/IOH_TR_BASIC.c" 
       #include "IO_Handlers/IOH_Swiftlink.c"
+   #ifdef Fab04_TDrive
+      #include "IO_Handlers/IOH_TDriveSwift.c"   //needs IOH_TDrive.c and IOH_Swiftlink.c above
+   #ifdef Fab04_REU
+      #include "IO_Handlers/IOH_TDriveREU.c"        //needs IOH_TDrive.c and IOH_REU.c above
+      #include "IO_Handlers/IOH_TDriveSwiftREU.c"   //needs IOH_TDriveSwift.c and IOH_TDriveREU.c above
+   #endif
+   #endif
       #include "IO_Handlers/IOH_ASID.c"
 #endif
    #include "IO_Handlers/IOH_None.c"
@@ -169,6 +182,17 @@ stcIOHandlers* IOHandler[] =  //Synch order/qty with enum enumIOHandlers
    #endif
       &IOHndlr_GeoRAM,             //IOH_GeoRAM,
       &IOHndlr_USBMouse,           //IOH_USBMouse,
+   #ifdef Fab04_TDrive
+      &IOHndlr_TDrive,             //IOH_TDrive,
+      &IOHndlr_TDriveSwift,        //IOH_TDriveSwift,
+   #ifdef Fab04_REU
+      &IOHndlr_TDriveSwiftREU,     //IOH_TDriveSwiftREU,
+      &IOHndlr_TDriveREU,          //IOH_TDriveREU,
+   #endif
+   #endif  
+   #ifdef TDrive_Agent
+      &IOHndlr_TDriveAgent,        //IOH_TDriveAgent,
+   #endif  
       
    //*not* manually selectable, see LastSelectableIOH
                                    
